@@ -49,8 +49,8 @@ cedar-policy = "4"
 # builder
 oci-spec = "0.10.0"
 oci-distribution = "0.11"
-blake3 = "1"
-opendal = "0.58.1"
+blake3 = "1.8.7"
+opendal = "0.58.2"
 zstd = "0.13"
 
 # app-data — libsql or redb per app, plus a secret broker

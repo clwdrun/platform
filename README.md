@@ -12,3 +12,4 @@ dependency — never a path dependency across the two checkouts.
 - `builder` — bundle -> content-addressed artifact
 - `app-data` — per-app DB/blob/secret broker
 - `shared` — wire types, tracing/otel setup
+- `schedular` — node orchestration
