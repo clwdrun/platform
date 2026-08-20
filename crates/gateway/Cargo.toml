@@ -1,0 +1,21 @@
+[package]
+name = "gateway"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+pingora = { workspace = true }
+instant-acme = { workspace = true }
+moka = { workspace = true }
+tower-cookies = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+shared = { path = "../shared" }

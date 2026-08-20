@@ -1,0 +1,17 @@
+[package]
+name = "identity"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+openidconnect = { workspace = true }
+oauth2 = { workspace = true }
+jsonwebtoken = { workspace = true }
+cedar-policy = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+shared = { path = "../shared" }

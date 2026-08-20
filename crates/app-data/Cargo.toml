@@ -1,0 +1,17 @@
+[package]
+name = "app-data"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+libsql = { workspace = true }
+redb = { workspace = true }
+opendal = { workspace = true }
+age = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+shared = { path = "../shared" }

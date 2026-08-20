@@ -1,0 +1,29 @@
+# build
+/target
+**/*.rs.bk
+.DS_Store
+
+# env / secrets
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+
+# local databases
+*.sqlite
+*.sqlite3
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.db
+
+# terraform state & local backends
+infra/**/.terraform/
+infra/**/*.tfstate
+infra/**/*.tfstate.*
+infra/**/*.tfvars
+infra/**/*.tfvars.json
+infra/**/.terraform.lock.hcl
+crash.log

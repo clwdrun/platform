@@ -1,0 +1,64 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace.dependencies]
+# shared
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2.0.20"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+opentelemetry = "0.32.0"
+opentelemetry-otlp = "0.32.0"
+
+# control-plane
+axum = "0.8.9"
+sqlx = { version = "0.9.0", features = [
+  "runtime-tokio",
+  "postgres",
+  "uuid",
+  "chrono",
+  "migrate",
+] }
+tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+utoipa = "5"
+apalis = "0.7.4"
+
+# gateway
+pingora = "0.8.1"
+instant-acme = "0.8.5"
+moka = { version = "0.12", features = ["future"] }
+tower-cookies = "0.11.0"
+
+# identity — share grants modeled as Cedar entities from day one
+openidconnect = "4.0.1"
+oauth2 = "5.0.0"
+jsonwebtoken = "11.0.0"
+cedar-policy = "4"
+
+# builder
+oci-spec = "0.10.0"
+oci-distribution = "0.11"
+blake3 = "1"
+opendal = "0.58.1"
+zstd = "0.13"
+
+# app-data — libsql or redb per app, plus a secret broker
+libsql = "0.9.30"
+redb = "4.2.0"
+age = "0.12.1"
+
+# clwd-sdk comes from the public repo via a tag-pinned git dependency,
+# never a path dependency (that's how private types leak into public
+# crates). Move to crates.io once clwd-sdk is stable.
+# clwd-sdk = { git = "https://github.com/clwdrun/clwd", tag = "v0.1.0" }
