@@ -1,4 +1,4 @@
-# CLAUDE.md — platform (private)
+# Development notes — platform (private)
 
 Private workspace for clwd: control plane, gateway, identity/sharing, builder, and
 per-app data brokering. Nothing here is published; `publish = false` at the
