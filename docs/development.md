@@ -48,6 +48,12 @@ database is needed to produce an image. It runs as uid 10001, not root.
 **Deploy by SHA tag, not by `main`.** Every image gets both; `main` moves, and a
 rollback needs a name that does not.
 
+`.github/workflows/images.yml` builds both images without pushing, on pull requests
+that touch `Dockerfile`, `.dockerignore`, or a manifest. It is not part of `just
+check`: two release builds inside Docker are minutes that no ordinary change needs,
+and taxing every pull request for a file most of them do not touch is how a gate
+teaches people to skip it. The paths filter is what keeps it honest.
+
 There is no deploy step, and that is deliberate: nothing describes a target yet.
 `infra/` is empty and #31 owns filling it. Until then this workflow produces
 deployable artifacts and stops.
