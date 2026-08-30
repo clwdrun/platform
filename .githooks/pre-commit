@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Secret scan over staged changes only. This is the half that replaces GitHub
+# push protection, which is unavailable on a private repository without
+# Advanced Security.
+#
+# Enable with `just hooks` (sets core.hooksPath); .git/hooks is not tracked.
+#
+# `protect --staged` is the pre-commit form on gitleaks 8.x. Newer builds spell
+# it `git --pre-commit --staged`; both scan the index and neither touches
+# history.
+set -uo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "pre-commit: gitleaks is not installed — refusing to pass silently."
+  echo "            install it, or commit with --no-verify if you have checked by hand."
+  exit 1
+fi
+
+gitleaks protect --staged --no-banner --redact
