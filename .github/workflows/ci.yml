@@ -1,0 +1,126 @@
+# The gate, in CI.
+#
+# This runs `just check` and nothing else. The gate is defined in the justfile
+# so that what CI enforces and what a developer can run before pushing are the
+# same list — a CI-only check is one nobody can reproduce, and a local-only
+# check is one nobody runs.
+#
+# Third-party actions are pinned to a commit SHA rather than a tag. A tag is
+# mutable: whoever controls the action repository can move it, and a workflow
+# with write access to this repository is not a place to accept that. The
+# comment after each SHA records which release it was, because a bare SHA tells
+# a reader nothing about whether it is current.
+#
+# What this deliberately does NOT do is #8's job: no standalone build of the
+# public repository, no separate path-dependency check, no documented process
+# for bumping the pinned clwd tag. Those are that issue's, and `seam` inside
+# `just check` is the part that exists today.
+
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Read-only. Nothing here comments, pushes, or publishes; a token that cannot
+# write is a token that cannot be turned against the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail rather than hang when crates.io is unreachable.
+  CARGO_NET_RETRY: 3
+  GITLEAKS_VERSION: 8.30.1
+  GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+  SQLX_CLI_VERSION: 0.9.0
+
+jobs:
+  gate:
+    name: just check
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:18
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgres://postgres:postgres@localhost:5432/clwd_platform
+
+    steps:
+      # Full history: `just secrets` runs `gitleaks detect`, which walks every
+      # commit rather than the working tree. A shallow clone would let it pass
+      # while a credential sits three commits back.
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+
+      # rust-toolchain.toml pins the version and components. Installing via
+      # rustup rather than an action keeps one source of truth for which
+      # compiler this workspace builds with.
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install just and cargo-deny
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: just,cargo-deny
+
+      # sqlx-cli has no prebuilt release, so it is built once and cached on its
+      # version. `--locked` so a transitive bump cannot change what the gate
+      # runs without a visible cache miss.
+      - name: Cache sqlx-cli
+        id: sqlx-cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/sqlx
+          key: sqlx-cli-${{ env.SQLX_CLI_VERSION }}-${{ runner.os }}
+
+      - name: Install sqlx-cli
+        if: steps.sqlx-cache.outputs.cache-hit != 'true'
+        run: |
+          cargo install sqlx-cli \
+            --version "${SQLX_CLI_VERSION}" \
+            --no-default-features --features rustls,postgres \
+            --locked
+
+      # Downloaded from the pinned release and checksum-verified before it is
+      # unpacked. A secret scanner installed over an unverified pipe is a
+      # supply-chain hole in the tool whose whole job is to close one.
+      - name: Install gitleaks
+        run: |
+          set -euo pipefail
+          archive="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 -o "$archive" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/${archive}"
+          echo "${GITLEAKS_SHA256}  ${archive}" | sha256sum --check --strict
+          tar -xzf "$archive" gitleaks
+          install -m 0755 gitleaks /usr/local/bin/gitleaks
+          rm -f "$archive" gitleaks
+          gitleaks version
+
+      # One command, the same one a developer runs. Its steps are:
+      # secrets, fmt-check, seam, rollback-plans, migrate, clippy,
+      # sqlx-prepared, offline-build, migrate-roundtrip, test, deny.
+      - name: just check
+        run: just check

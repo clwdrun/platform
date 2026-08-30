@@ -9,6 +9,10 @@ publish = false
 license = "LicenseRef-Proprietary"
 
 [workspace.dependencies]
+# intra-workspace. Carries a version as well as a path so `cargo deny`'s
+# wildcard check stays meaningful; CLAUDE.md blesses the path dep itself.
+shared = { version = "0.1.0", path = "crates/shared" }
+
 # shared
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
@@ -20,6 +24,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"
 opentelemetry = "0.32.0"
 opentelemetry-otlp = "0.32.0"
+tonic = { version = "0.14.6", features = ["tls"] }
+prost = { version = "0.14.4", features = ["prost-derive"] }
+async-compression = { version = "0.4.43", features = ["tokio"] }
+tokio-stream = "0.1.19"
 
 # control-plane
 axum = "0.8.9"
@@ -33,12 +41,16 @@ sqlx = { version = "0.9.0", features = [
 tower-http = { version = "0.7.0", features = ["trace", "cors"] }
 utoipa = "5"
 apalis = "0.7.4"
-
+# Identifiers are UUIDv7, minted by the application — see migrations/.
+uuid = { version = "1.26.0", features = ["v7", "serde"] }
+chrono = { version = "0.4", default-features = false, features = ["serde", "std"] }
+async-nats = { version = "0.50.0", features = ["tokio"] }
 # gateway
 pingora = "0.8.1"
 instant-acme = "0.8.5"
 moka = { version = "0.12", features = ["future"] }
 tower-cookies = "0.11.0"
+governor = "0.4.0"
 
 # identity — share grants modeled as Cedar entities from day one
 openidconnect = "4.0.1"
@@ -52,11 +64,15 @@ oci-distribution = "0.11"
 blake3 = "1.8.7"
 opendal = "0.58.2"
 zstd = "0.13"
+mimalloc = "0.1.52"
+dashmap = "6.2.1"
+parking_lot = "0.12.1"
 
 # app-data — libsql or redb per app, plus a secret broker
 libsql = "0.9.30"
 redb = "4.2.0"
 age = "0.12.1"
+object_store = "0.14.1"
 
 # clwd-sdk comes from the public repo via a tag-pinned git dependency,
 # never a path dependency (that's how private types leak into public

@@ -14,4 +14,4 @@ tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-shared = { path = "../shared" }
+shared = { workspace = true }

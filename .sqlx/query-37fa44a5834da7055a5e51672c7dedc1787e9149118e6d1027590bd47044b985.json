@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update orgs set slug = 'acme2' where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "37fa44a5834da7055a5e51672c7dedc1787e9149118e6d1027590bd47044b985"
+}
