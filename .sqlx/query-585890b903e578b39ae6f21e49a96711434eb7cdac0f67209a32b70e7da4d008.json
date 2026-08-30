@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update apps set deleted_at = now() where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "585890b903e578b39ae6f21e49a96711434eb7cdac0f67209a32b70e7da4d008"
+}

@@ -1,16 +1,23 @@
 # platform workspace tasks
 #
-# Deliberately thin. Track A and Track B extend `check` as the crates gain
-# code and as CI lands; what is here is what is verified green on `main`
-# today. A gate that is red on a clean checkout teaches people to ignore it.
+# `check` grows as the crates gain code and as CI lands; what is in it is what
+# is verified green on `main`. A gate that is red on a clean checkout teaches
+# people to ignore it.
 
 set shell := ["bash", "-uc"]
 
 default:
     @just --list
 
+# ==========================================
+# 1. GATE
+# ==========================================
+
 # The gate. Ordered to fail cheapest first.
-check: secrets fmt-check
+# `migrate` runs before anything that compiles the workspace: sqlx checks its
+# queries against the live database at macro expansion, so a fresh `just db-up`
+# with no schema fails `clippy` rather than failing something about schema.
+check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test deny
 
 # Secret scan over full history. This repository is private, so GitHub's own
 # secret scanning and push protection — both Advanced Security features — are
@@ -19,6 +26,7 @@ check: secrets fmt-check
 #
 # Fails loudly when gitleaks is absent. A check that no-ops without its tool
 # is worse than no check: it reports green.
+[doc('secret scan over full history (needs gitleaks)')]
 secrets:
     #!/usr/bin/env bash
     set -uo pipefail
@@ -31,6 +39,7 @@ secrets:
 
 # Install the pre-commit hook. Catching a credential before the commit is a
 # non-event; catching it after a push is a rotation.
+[doc('install the gitleaks pre-commit hook')]
 hooks:
     git config core.hooksPath .githooks
     @echo "ok: core.hooksPath -> .githooks"
@@ -40,3 +49,120 @@ fmt:
 
 fmt-check:
     cargo fmt --all --check
+
+clippy:
+    cargo clippy --workspace --all-targets -- -D warnings
+
+# Needs a database: the schema tests run against a real Postgres, because a
+# CHECK constraint that is only asserted in Rust is not a constraint.
+[doc('cargo test --workspace (needs a database)')]
+test:
+    cargo test --workspace
+
+deny:
+    cargo deny check --hide-inclusion-graph
+
+# The public/private seam, as two greps.
+#
+# The first: no dependency may reach into a sibling clwd checkout. A path dep
+# across the two repositories works on a laptop, breaks CI, and lets private
+# types leak into public crates. Path deps *within* this workspace are fine and
+# expected — `../shared` does not match.
+#
+# The second: every git dependency must be pinned to a tag. Read from
+# Cargo.lock rather than the manifests, so it sees the resolved source and is
+# not defeated by a dependency spelled across several lines. `cargo deny`'s
+# `unknown-git = "deny"` covers the origin; this covers the pin. #8 owns
+# hardening both into CI.
+[doc('no path dep escapes the workspace; every git dep is tag-pinned')]
+seam:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if grep -rn --include='Cargo.toml' -E 'path *= *"[^"]*(\.\./\.\.|clwd)' Cargo.toml crates/; then
+      echo "error: a path dependency reaches outside this workspace — see docs/development.md"
+      exit 1
+    fi
+    unpinned=$(grep -n 'source = "git+' Cargo.lock | grep -v '?tag=' || true)
+    if [ -n "$unpinned" ]; then
+      echo "error: a git dependency is not pinned to a tag"
+      echo "$unpinned"
+      exit 1
+    fi
+    echo "ok: no path dependency escapes the workspace; every git dependency is tag-pinned"
+
+# Migrations are forward-only, so a destructive one has no `down` to run and
+# the plan has to be written down instead. Deliberately over-matches — a
+# migration that merely mentions dropping something still has to say what
+# reverting it would mean, and writing that sentence is cheaper than arguing
+# with the grep.
+[doc('every destructive migration carries a rollback plan')]
+rollback-plans:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    missing=""
+    for f in migrations/*.sql; do
+      if grep -qiE '\b(drop|truncate|rename)\b' "$f" && ! grep -q 'ROLLBACK PLAN' "$f"; then
+        missing="${missing}  ${f}"$'\n'
+      fi
+    done
+    if [ -n "$missing" ]; then
+      echo "error: destructive migration with no ROLLBACK PLAN comment:"
+      printf '%s' "$missing"
+      exit 1
+    fi
+    echo "ok: every destructive migration carries a rollback plan"
+
+# .sqlx is what lets CI build with no database. It rots silently the moment a
+# query changes, so the gate checks it rather than trusting it.
+[doc('.sqlx is current for every query, including the tests')]
+sqlx-prepared:
+    cargo sqlx prepare --workspace --check -- --all-targets
+
+# The claim that CI needs no database, proven by removing the variable rather
+# than by assertion.
+[doc('the workspace builds with no database reachable')]
+offline-build:
+    env -u DATABASE_URL SQLX_OFFLINE=true cargo check --workspace --all-targets
+
+# Empty to head against a throwaway database, then drop it. `sqlx migrate run`
+# on a database that already has the schema proves nothing.
+[doc('migrations run empty to head on a throwaway database')]
+migrate-roundtrip:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    : "${DATABASE_URL:?DATABASE_URL is unset — run \`just db-up\` first}"
+    scratch="${DATABASE_URL%/*}/clwd_migrate_check"
+    sqlx database drop -y --database-url "$scratch" >/dev/null 2>&1 || true
+    sqlx database create --database-url "$scratch"
+    sqlx migrate run --database-url "$scratch"
+    sqlx database drop -y --database-url "$scratch"
+    echo "ok: migrations run from empty to head"
+
+# ==========================================
+# 2. DATABASE
+# ==========================================
+
+# A throwaway Postgres for the tests. Nothing in it is worth keeping.
+[doc('start a throwaway Postgres for the tests')]
+db-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker rm -f clwd-pg >/dev/null 2>&1 || true
+    docker run -d --name clwd-pg \
+      -e POSTGRES_USER=postgres -e POSTGRES_PASSWORD=postgres \
+      -p 55432:5432 postgres:18 >/dev/null
+    until docker exec clwd-pg pg_isready -U postgres >/dev/null 2>&1; do sleep 0.2; done
+    echo 'DATABASE_URL=postgres://postgres:postgres@localhost:55432/clwd_platform'
+    echo 'export it, or put it in .env (gitignored)'
+
+db-down:
+    docker rm -f clwd-pg
+
+migrate:
+    sqlx migrate run
+
+# Re-record .sqlx after changing a query. --all-targets so the tests' queries
+# are cached too, or the offline build fails on them.
+[doc('re-record .sqlx after changing a query')]
+prepare:
+    cargo sqlx prepare --workspace -- --all-targets

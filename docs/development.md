@@ -8,18 +8,39 @@ workspace level. The sandbox runtime, CLI, and SDK are open source in
 ## Commands
 
 ```bash
-cargo build --workspace
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all
+just check                           # the gate — everything CI enforces
+just --list                          # the rest
 
-sqlx migrate run                     # needs DATABASE_URL
-cargo sqlx prepare --workspace       # regenerate offline query data after SQL changes
+cargo build --workspace
+cargo fmt --all
 ```
 
-`sqlx` macros are compile-time checked. After changing any query or migration, run
-`cargo sqlx prepare` and commit the generated `.sqlx/` directory, or CI will fail
-without a live database.
+`just check` runs, cheapest failure first: `secrets`, `fmt-check`, `seam`,
+`rollback-plans`, `migrate`, `clippy`, `sqlx-prepared`, `offline-build`,
+`migrate-roundtrip`, `test`, `deny`.
+
+`secrets` needs `gitleaks` and `just hooks` installs the matching pre-commit hook.
+Everything from `migrate` onward needs a database — `just db-up` first.
+
+### Database
+
+The schema tests run against a real Postgres, because a `CHECK` constraint only
+asserted in Rust is not a constraint.
+
+```bash
+just db-up                           # throwaway Postgres on :55432, prints the URL
+export DATABASE_URL=...              # or put it in .env, which is gitignored
+just migrate                         # sqlx migrate run
+just db-down
+```
+
+`sqlx` macros are compile-time checked, and `.sqlx/` is what lets CI build with no
+database at all. After changing any query or migration, run `just prepare` and
+commit `.sqlx/` — `just check` fails if it is stale, and `offline-build` proves the
+no-database claim by unsetting `DATABASE_URL` rather than by assertion.
+
+Migrations are forward-only. A destructive one has no `down` to run, so it carries
+a written `ROLLBACK PLAN` comment instead; `just rollback-plans` fails without one.
 
 ## Crates
 

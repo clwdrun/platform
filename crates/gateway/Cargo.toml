@@ -18,4 +18,4 @@ tokio = { workspace = true }
 serde = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
-shared = { path = "../shared" }
+shared = { workspace = true }

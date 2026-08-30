@@ -1,0 +1,103 @@
+# Platform is server-side only. clwd's deny.toml also graphs wasm32-wasip2 and
+# musl because it ships a guest SDK and a musl agent; nothing here targets
+# either, and a target we do not build is a dependency tree we would audit for
+# no reason.
+[graph]
+targets = [
+  { triple = "x86_64-unknown-linux-gnu" },
+  { triple = "aarch64-unknown-linux-gnu" },
+]
+all-features = true
+
+[advisories]
+# Explicit, not defaulted: the meaning of this key changed across cargo-deny
+# releases, and a control plane should not have its advisory scope quietly
+# widen or narrow on a tool upgrade.
+unmaintained = "all"
+
+# Every entry below is third-party debt reached through one dependency this
+# workspace cannot currently drop, attributed to the crate that pulls it and
+# the issue that will resolve it. None is reachable from `control-plane` or
+# `shared`. An entry here is not a silenced failure — it is a recorded
+# acceptance, and it must name an owner or it does not belong.
+ignore = [
+  # libsql pins hyper 0.14 / rustls 0.22 / hyper-rustls 0.25 through tonic.
+  # Resolved by #21 and #22 choosing the per-app storage backend; if libsql
+  # stays, it has to move off that tree first.
+  { id = "RUSTSEC-2026-0258", reason = "h2 0.3.27 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2026-0049", reason = "rustls-webpki 0.102.8 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2026-0098", reason = "rustls-webpki 0.102.8 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2026-0099", reason = "rustls-webpki 0.102.8 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2026-0104", reason = "rustls-webpki 0.102.8 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile 2.2.0 via libsql -> app-data; owned by #21" },
+  { id = "RUSTSEC-2025-0141", reason = "bincode 1.3.3 via libsql -> app-data; owned by #21" },
+
+  # pingora 0.8.1 brings all three. Resolved by #5 pinning a newer pingora or
+  # choosing a different edge.
+  { id = "RUSTSEC-2024-0437", reason = "protobuf 2.28.0 via pingora -> gateway; owned by #5" },
+  { id = "RUSTSEC-2024-0388", reason = "derivative 2.2.0 via pingora -> gateway; owned by #5" },
+  { id = "RUSTSEC-2025-0069", reason = "daemonize 0.5.0 via pingora -> gateway; owned by #5" },
+
+  # openidconnect 4.0.1 -> rsa 0.9.10. Marvin is a timing sidechannel in RSA
+  # decryption; the OIDC paths here verify signatures rather than decrypt, but
+  # that is a reason to track it, not to call it inapplicable. Owned by #9.
+  { id = "RUSTSEC-2023-0071", reason = "rsa 0.9.10 via openidconnect -> identity; owned by #9" },
+]
+
+[licenses]
+allow = [
+  "0BSD",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-1-Clause",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "BSL-1.0",
+  "CC0-1.0",
+  "ISC",
+  "MIT",
+  "MIT-0",
+  "Unicode-3.0",
+  "Unlicense",
+  "Zlib",
+  # webpki-roots / webpki-root-certs: the Mozilla CA store, shipped as data
+  # rather than code. CDLA-Permissive-2.0 governs the certificate set and
+  # imposes no obligation on what we redistribute around it.
+  "CDLA-Permissive-2.0",
+]
+confidence-threshold = 0.93
+
+# Every crate in this workspace is LicenseRef-Proprietary and publish = false.
+# There is no license to check on code we are not distributing.
+private = { ignore = true }
+
+# ring and aws-lc-sys carry hand-rolled multi-license text that no SPDX
+# expression matches cleanly. Both are fine to distribute; they just need
+# naming explicitly.
+[[licenses.exceptions]]
+name = "ring"
+allow = ["OpenSSL", "ISC", "MIT"]
+
+[[licenses.exceptions]]
+name = "aws-lc-sys"
+allow = ["OpenSSL", "ISC", "Apache-2.0"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+# clwd denies openssl-sys and native-tls outright, having committed to rustls.
+# Platform cannot: openidconnect and oauth2 reach reqwest with default features
+# on, which pulls native-tls and an OpenSSL build dependency into a workspace
+# whose selling point is auditability. Deliberately recorded rather than
+# banned, because banning it today fails the build instead of fixing it —
+# #9 owns turning reqwest's default features off and restoring the ban.
+deny = []
+
+[sources]
+unknown-registry = "deny"
+# The public/private seam, mechanically. A git dependency from anywhere other
+# than an explicitly allowed origin fails the build. There is no `allow-git`
+# entry yet because this workspace has no git dependency yet; #2 adds
+# clwdrun/clwd and the entry that permits it.
+unknown-git = "deny"
