@@ -1,0 +1,14 @@
+# The build runs `cargo build` inside the image; a host target directory would
+# be copied in for nothing and can hold gigabytes.
+target/
+.git/
+.github/
+.githooks/
+docs/
+infra/
+.env
+.env.*
+*.pem
+*.key
+Dockerfile
+.dockerignore

@@ -28,6 +28,30 @@ enforces and what you can run before pushing are the same list: a CI-only check 
 one nobody can reproduce, and a local-only check is one nobody runs. Third-party
 actions there are pinned to a commit SHA, not a tag — a tag is mutable.
 
+### Images
+
+`.github/workflows/cd.yml` builds one container image per binary on every push to
+`main` and pushes it to `ghcr.io/clwdrun/platform/{control-plane,gateway}`, with a
+build-provenance attestation. Authentication is the workflow's built-in
+`GITHUB_TOKEN`, so no registry credential is stored anywhere.
+
+```bash
+docker build --build-arg BIN=control-plane -t control-plane .
+docker build --build-arg BIN=gateway       -t gateway .
+```
+
+One Dockerfile with a `BIN` argument, because the two services differ only in which
+binary comes out — two near-identical Dockerfiles would be two places to forget the
+same fix. The build sets `SQLX_OFFLINE=true` and reads the committed `.sqlx`, so no
+database is needed to produce an image. It runs as uid 10001, not root.
+
+**Deploy by SHA tag, not by `main`.** Every image gets both; `main` moves, and a
+rollback needs a name that does not.
+
+There is no deploy step, and that is deliberate: nothing describes a target yet.
+`infra/` is empty and #31 owns filling it. Until then this workflow produces
+deployable artifacts and stops.
+
 ### Database
 
 The schema tests run against a real Postgres, because a `CHECK` constraint only

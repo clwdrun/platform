@@ -1,0 +1,101 @@
+# Build the deployable artifacts and publish them.
+#
+# This is the half of delivery that exists today: an immutable, addressable
+# container image per service, built from a commit that passed the gate. It
+# stops there deliberately. There is nothing to deploy to yet — infra/ is
+# empty, no cluster or host is described anywhere in this repository, and the
+# control plane has no routes until #2. Wiring a deploy step to a target that
+# does not exist would be a pipeline that cannot be tested, and #31 owns
+# describing the target first.
+#
+# Images are tagged by commit SHA as well as by branch. The SHA tag is the one
+# a deployment should reference: `main` moves, and a rollback needs a name that
+# does not.
+#
+# Third-party actions are pinned to a commit SHA, not a tag, for the reason
+# given in ci.yml: a tag is mutable and this workflow can write packages.
+
+name: cd
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  # Provenance attestation on the pushed image, so a deployment can tell which
+  # workflow run and which commit produced it.
+  attestations: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  images:
+    name: ${{ matrix.bin }} image
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two binaries in the workspace. They differ only in which one the
+        # Dockerfile builds, which is why there is one Dockerfile.
+        bin: [control-plane, gateway]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      # The built-in token, scoped to this repository's packages. No registry
+      # credential is stored anywhere, which is one fewer secret to rotate.
+      - name: Log in to ghcr.io
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.bin }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+          labels: |
+            org.opencontainers.image.title=${{ matrix.bin }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          build-args: BIN=${{ matrix.bin }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Layer cache scoped per binary: the two images share a dependency
+          # tree but not a final layer, and one scope would thrash.
+          cache-from: type=gha,scope=${{ matrix.bin }}
+          cache-to: type=gha,scope=${{ matrix.bin }},mode=max
+          provenance: mode=max
+
+      - name: Attest provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.bin }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
