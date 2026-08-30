@@ -22,6 +22,12 @@ cargo fmt --all
 `secrets` needs `gitleaks` and `just hooks` installs the matching pre-commit hook.
 Everything from `migrate` onward needs a database — `just db-up` first.
 
+`.github/workflows/ci.yml` runs `just check` and nothing else, on every pull
+request and every push to `main`. The gate lives in the justfile so that what CI
+enforces and what you can run before pushing are the same list: a CI-only check is
+one nobody can reproduce, and a local-only check is one nobody runs. Third-party
+actions there are pinned to a commit SHA, not a tag — a tag is mutable.
+
 ### Database
 
 The schema tests run against a real Postgres, because a `CHECK` constraint only

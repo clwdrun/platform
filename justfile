@@ -158,7 +158,12 @@ db-up:
 db-down:
     docker rm -f clwd-pg
 
+# `database create` first, and it is a no-op when the database is already
+# there. Without it the gate assumes a database someone made by hand, which is
+# exactly the assumption CI does not get to make.
+[doc('create the database if needed, then run migrations')]
 migrate:
+    sqlx database create
     sqlx migrate run
 
 # Re-record .sqlx after changing a query. --all-targets so the tests' queries
