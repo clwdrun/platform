@@ -10,12 +10,17 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG BIN
 WORKDIR /src
 
-# pkg-config and libssl-dev: openidconnect reaches reqwest with default
-# features on, which pulls native-tls. cmake: pingora's tree needs it.
-# Recorded here rather than discovered from a build failure — and both go away
-# with #9, which turns those default features off.
+# Native toolchain the dependency tree needs. Named individually, because
+# "build-essential" would hide which dependency wants what:
+#
+#   pkg-config, libssl-dev  openidconnect reaches reqwest with default features
+#                           on, which pulls native-tls. Goes away with #9.
+#   cmake, make, g++        pingora -> flate2 -> libz-ng-sys builds zlib-ng
+#                           with cmake, which needs a make program and a C++
+#                           compiler. rust:slim ships gcc but neither of those.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev cmake make g++ \
  && rm -rf /var/lib/apt/lists/*
 
 COPY . .
