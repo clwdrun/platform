@@ -38,7 +38,17 @@ sqlx = { version = "0.9.0", features = [
   "chrono",
   "migrate",
 ] }
-tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+# `timeout` and `catch-panic` are load-bearing for the error envelope: a
+# handler that hangs or panics must still produce one rather than dropping the
+# connection. `set-header` echoes the request id back.
+tower-http = { version = "0.7.0", features = [
+  "trace",
+  "cors",
+  "timeout",
+  "catch-panic",
+  "set-header",
+] }
+tower = "0.5"
 utoipa = "5"
 apalis = "0.7.4"
 # Identifiers are UUIDv7, minted by the application — see migrations/.
@@ -74,16 +84,4 @@ redb = "4.2.0"
 age = "0.12.1"
 object_store = "0.14.1"
 
-# The public repo, via a tag-pinned git dependency — never a path dependency
-# across the two checkouts, which is how private types leak into public crates.
-# `just seam` enforces the tag; deny.toml's [sources] enforces the origin.
-#
-# clwd-bundle only. clwd-sdk is the guest SDK app code links against: no_std,
-# wit-bindgen, built for wasm32-wasip2. It compiles on a host target, but
-# nothing here calls it, and adding it drags wit-parser/wit-component in as
-# build dependencies for zero call sites. It goes in when a crate needs it.
-# The version alongside the tag is not redundant: without it `cargo deny`
-# reads a git dependency as a wildcard, and cargo checks it against the
-# version the checkout actually declares — so a major bump upstream fails
-# here loudly instead of arriving unnoticed with a tag change.
-clwd-bundle = { version = "0.1.0", git = "https://github.com/clwdrun/clwd", tag = "v0.0.1" }
+clwd-bundle = { version = "0.0.1", git = "https://github.com/clwdrun/clwd", tag = "v0.0.1" }

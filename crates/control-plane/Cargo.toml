@@ -13,12 +13,17 @@ path = "src/lib.rs"
 name = "control-plane"
 path = "src/main.rs"
 
+[dev-dependencies]
+tower = { workspace = true, features = ["util"] }
+http-body-util = "0.1"
+
 [dependencies]
 axum = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 tower-http = { workspace = true }
+tower = { workspace = true }
 utoipa = { workspace = true }
 apalis = { workspace = true }
 tokio = { workspace = true }
