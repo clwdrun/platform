@@ -11,10 +11,21 @@
 # comment after each SHA records which release it was, because a bare SHA tells
 # a reader nothing about whether it is current.
 #
-# What this deliberately does NOT do is #8's job: no standalone build of the
-# public repository, no separate path-dependency check, no documented process
-# for bumping the pinned clwd tag. Those are that issue's, and `seam` inside
-# `just check` is the part that exists today.
+# The seam is enforced in three places, and they check different things:
+#
+#   deny.toml [sources]  WHERE a git dependency comes from. Does not care how
+#                        it is pinned.
+#   just seam            HOW it is pinned, read from Cargo.lock so a transitive
+#                        git dependency another crate introduces is caught too,
+#                        and so a dependency spelled across several lines
+#                        cannot slip past. Also rejects a path dependency that
+#                        reaches out of this workspace.
+#   the standalone job   That the public repository still builds WITHOUT this
+#                        one — the leak the two-repo split exists to prevent.
+#
+# The first two run inside `just check`. The third cannot: it needs a clean
+# machine with no platform checkout on it, which is a CI shape rather than a
+# recipe a developer runs.
 
 name: ci
 
@@ -177,3 +188,87 @@ jobs:
       # sqlx-prepared, offline-build, migrate-roundtrip, test, deny.
       - name: just check
         run: just check
+
+  # Build the public repository on its own, with no platform checkout on the
+  # machine. `just seam` proves nothing private is REFERENCED from here; this
+  # proves nothing private is DEPENDED ON over there. A private type that
+  # reached a public crate compiles fine in a tree that contains both and fails
+  # the moment the public half is built alone — which is the failure this job
+  # exists to produce, and the whole reason the repositories are split.
+  standalone:
+    name: clwd builds standalone
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout platform
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: platform
+
+      # The tag comes from the manifest, never from a literal in this file. A
+      # hardcoded tag here keeps passing after someone bumps the pin, testing a
+      # version nothing uses and reporting green about it.
+      #
+      # Cargo.lock is asserted to agree, because the manifest states intent and
+      # the lock states what cargo actually fetches. A stale lock would
+      # otherwise have this job build one tag while the gate built another, and
+      # both would look fine.
+      - name: Read the pinned tag from the manifest
+        id: pin
+        working-directory: platform
+        run: |
+          set -euo pipefail
+          tag=$(sed -n 's/^clwd-bundle = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)
+          if [ -z "$tag" ]; then
+            echo "::error::no tag found on the clwd-bundle pin in Cargo.toml. If the dependency was renamed or respelled, this parser needs updating — it is what keeps the standalone build following the real pin."
+            exit 1
+          fi
+          locked=$(sed -n 's|^source = "git+https://github.com/clwdrun/clwd?tag=\([^#]*\)#.*|\1|p' Cargo.lock)
+          if [ "$tag" != "$locked" ]; then
+            echo "::error::Cargo.toml pins $tag but Cargo.lock resolved $locked. Run \`cargo update -p clwd-bundle\` and commit the lock; until then the gate and this job build different versions of the seam."
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ok: manifest and lock agree on $tag"
+
+      - name: Checkout clwd at the pinned tag
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: clwdrun/clwd
+          ref: ${{ steps.pin.outputs.tag }}
+          token: ${{ secrets.CLWD_READ_TOKEN }}
+          path: clwd
+
+      # The isolation this job is named for. Reading the tag needed the
+      # manifest; building must not see it. Removing the checkout makes that a
+      # property of the machine rather than a promise about the command.
+      - name: Remove the platform checkout
+        run: |
+          rm -rf platform
+          test ! -e platform && echo "ok: no platform checkout on this machine"
+
+      - name: Install Rust from clwd's rust-toolchain.toml
+        working-directory: clwd
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build clwd alone
+        working-directory: clwd
+        run: |
+          if ! cargo build --locked; then
+            echo "::error::clwd does not build on its own at ${{ steps.pin.outputs.tag }}. Either a private type leaked from platform into a public crate, or the pinned tag is not standalone-buildable. This is the failure the two-repo split exists to catch — do not fix it by adding a dependency here."
+            exit 1
+          fi
+          echo "ok: clwd builds standalone at ${{ steps.pin.outputs.tag }}"
+
+      # A build failing is the loud case. This is the quiet one: clwd could
+      # depend on something in clwdrun/platform over git and still build, since
+      # the token can read both. Nothing public may reach back across the seam.
+      - name: Assert nothing depends on clwdrun/platform
+        working-directory: clwd
+        run: |
+          if cargo tree --locked --prefix none --format "{p}" | grep -i "clwdrun/platform"; then
+            echo "::error::a public crate depends on clwdrun/platform. The seam is one-way: platform consumes clwd, never the reverse."
+            exit 1
+          fi
+          echo "ok: no dependency on clwdrun/platform"

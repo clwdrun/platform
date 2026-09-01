@@ -114,24 +114,80 @@ compiles on a host target, but nothing here calls it and it drags
 `wit-parser`/`wit-component` in as build dependencies for no call sites. Add it when
 a crate needs it, not to satisfy a rule about the seam.
 
-Two mechanisms enforce this, and neither is sufficient alone:
+Three mechanisms enforce this, and none is sufficient alone:
 
 - `deny.toml`'s `[sources]` — `unknown-git = "deny"` plus an `allow-git` naming
   exactly one origin. This checks *where* a dependency comes from. It does not care
   whether it is pinned to a tag, a branch, or a bare default ref.
 - `just seam` — reads the resolved source out of `Cargo.lock` and requires `?tag=`.
-  This checks *how* it is pinned. Reading the lock rather than the manifests means
-  it sees what cargo actually resolved.
+  This checks *how* it is pinned. Reading the lock rather than the manifests means it
+  sees what cargo actually resolved, so a transitive git dependency another crate
+  introduces is caught too, and a dependency spelled across several lines cannot slip
+  past. It also rejects a path dependency reaching out of this workspace.
+- **the `standalone` job in `ci.yml`** — clones the public repo at the pinned tag onto
+  a machine with no platform checkout and builds it. The first two prove nothing
+  private is *referenced* from here; this proves nothing private is *depended on* over
+  there. A private type that reached a public crate compiles fine in a tree containing
+  both and fails the moment the public half is built alone.
 
-Both were verified by breaking them on purpose rather than by assumption: removing
-`allow-git` exits 8, naming the wrong origin exits 8, and a `?branch=` source fails
-`seam`.
+The first two run inside `just check`. The third cannot — it needs a clean machine,
+which is a CI shape rather than a recipe anyone runs locally.
+
+All three were verified by breaking them on purpose rather than by assumption:
+removing `allow-git` exits 8, naming the wrong origin exits 8, a `?branch=` source
+fails `seam`, and a path dependency into a sibling checkout fails `seam`.
 
 A tag is a moving target on the publishing side — a deleted or retargeted tag makes
 `cargo` fail with `failed to find tag`, which is loud and correct. If that happens,
 confirm what the public repo actually publishes (`git ls-remote --tags`) before
 repinning; do not switch to a `rev` to make the error go away, because a `rev` is
 the pin that silently becomes branch-tracking when the next person edits it.
+
+### Bumping the pinned tag
+
+**Move forward to a new tag. Never move a published one.** A moved tag is a branch
+wearing a version-shaped name: two lockfiles fetched either side of the move record
+the same tag against different commits and silently disagree, and nothing in the
+build reports it. If a published tag is wrong, cut another.
+
+**Pins are annotated tags, never GitHub Releases.** The reasoning and the enforcement
+both live in the public repo — see *Seam pins are tags, never Releases* in `clwd`'s
+`docs/development.md`. In short: `gh release create` is reserved for MVP, and `clwd`'s
+`cd.yml` makes cutting one `workflow_dispatch`-only rather than trusting anyone to
+remember. Not restated here, because two copies of a rule drift.
+
+**The `version` key is load-bearing, and not for the reason it looks like.** It is not
+selecting anything — the tag does that. It exists because `deny.toml` sets
+`wildcards = "deny"`, and a git dependency with no version reads as `*` and fails the
+gate. Its value must equal the version the tag's crates actually declare, because
+cargo checks it as a constraint against the fetched manifest:
+
+```
+error: failed to select a version for the requirement `clwd-bundle = "^0.1.0"`
+candidate versions found which didn't match: 0.0.1
+```
+
+That is a hard resolution failure, not a silent fallback — which is the good case. The
+bad case is the one that happened: a wrong value stayed hidden because `Cargo.lock`
+still pinned the tag's previous commit. The full account is in the comment above the
+pin in `Cargo.toml`; do not delete it.
+
+To bump:
+
+```bash
+# 1. Change the tag and the version together, in [workspace.dependencies].
+# 2. Re-resolve, so a version/tag mismatch surfaces here rather than in CI.
+cargo update -p clwd-bundle
+
+# 3. Both halves of the seam, and the gate.
+just seam
+cargo deny check
+just check
+```
+
+Commit `Cargo.lock` with the manifest. The `standalone` job reads the tag from
+`Cargo.toml` and asserts `Cargo.lock` resolved the same one, so committing one without
+the other fails CI with that stated as the reason.
 
 **Private types stay private.** Nothing in this repo should be designed to be moved
 into the public repo later without an explicit review of what it exposes about the
