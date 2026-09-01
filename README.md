@@ -1,8 +1,9 @@
 # platform (private)
 
 Control plane, scheduler, identity/sharing, billing, and enterprise audit
-for clwd. Depends on the public `clwd-sdk` crate via a tag-pinned git
-dependency — never a path dependency across the two checkouts.
+for clwd. Depends on the public `clwd-bundle` crate via a tag-pinned git
+dependency — never a path dependency across the two checkouts. See
+`docs/development.md` for the seam rules and how to bump the pin.
 
 ## Crates
 
