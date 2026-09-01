@@ -117,12 +117,26 @@ jobs:
       # sqlx-cli has no prebuilt release, so it is built once and cached on its
       # version. `--locked` so a transitive bump cannot change what the gate
       # runs without a visible cache miss.
+      #
+      # Both binaries, not just `sqlx`. `cargo install sqlx-cli` produces two:
+      # `sqlx`, which `just migrate` uses, and `cargo-sqlx`, which backs
+      # `cargo sqlx prepare` in `just sqlx-prepared`. Caching only the first
+      # meant a cache hit skipped the install and left the second absent — so
+      # `migrate` passed with the cached binary and the gate then failed four
+      # minutes later on `error: no such command: sqlx`.
       - name: Cache sqlx-cli
         id: sqlx-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cargo/bin/sqlx
-          key: sqlx-cli-${{ env.SQLX_CLI_VERSION }}-${{ runner.os }}
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          # The `-2` is a cache generation, and it has to be bumped whenever the
+          # set of cached paths changes. Restore is keyed on this string alone,
+          # so widening `path` does not invalidate an archive saved under the
+          # old key — without the bump, the entry holding only `sqlx` would keep
+          # restoring and keep skipping the install.
+          key: sqlx-cli-${{ env.SQLX_CLI_VERSION }}-${{ runner.os }}-2
 
       - name: Install sqlx-cli
         if: steps.sqlx-cache.outputs.cache-hit != 'true'
@@ -131,6 +145,17 @@ jobs:
             --version "${SQLX_CLI_VERSION}" \
             --no-default-features --features rustls,postgres \
             --locked
+
+      # Cheap, and it fails where the cause is legible. A missing binary is
+      # otherwise discovered by whichever recipe happens to need it, minutes
+      # into the gate and looking like a problem with that recipe.
+      - name: Verify both sqlx binaries are present
+        run: |
+          for bin in sqlx cargo-sqlx; do
+            command -v "$bin" >/dev/null \
+              || { echo "::error::$bin is missing. If the cache was restored, its key needs bumping."; exit 1; }
+          done
+          echo "ok: sqlx and cargo-sqlx both present"
 
       # Downloaded from the pinned release and checksum-verified before it is
       # unpacked. A secret scanner installed over an unverified pipe is a
