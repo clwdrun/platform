@@ -36,6 +36,10 @@ env:
   CARGO_TERM_COLOR: always
   # Fail rather than hang when crates.io is unreachable.
   CARGO_NET_RETRY: 3
+  # The seam dependency lives in a private repository, so cargo must fetch it
+  # over a transport that can carry credentials. The built-in git library cannot;
+  # the git CLI can, and the step below configures it.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   GITLEAKS_VERSION: 8.30.1
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
   SQLX_CLI_VERSION: 0.9.0
@@ -78,8 +82,32 @@ jobs:
       - name: Install Rust from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
 
+      # `clwd` is private, so the default GITHUB_TOKEN — scoped to this
+      # repository — cannot read it. CLWD_READ_TOKEN is a fine-grained PAT with
+      # `Contents: read` on clwdrun/clwd and nothing else.
+      #
+      # A PAT is a person-scoped stopgap: it carries someone's identity and it
+      # expires. A GitHub App installation token is the durable answer, and is
+      # filed separately rather than solved here.
+      - name: Authenticate for the clwd seam dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.CLWD_READ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Isolated, and early. Every later step depends on this having worked, and
+      # a credential problem that first surfaces inside a compile reads as a
+      # build error three jobs deep rather than as the token problem it is.
+      - name: Fetch the seam dependency
+        run: |
+          if ! cargo fetch --locked; then
+            echo "::error::could not fetch dependencies. If clwd-bundle is the one that failed, CLWD_READ_TOKEN is missing, expired, or not scoped to clwdrun/clwd."
+            exit 1
+          fi
+          echo "ok: every dependency fetched, including the private seam"
 
       - name: Install just and cargo-deny
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
