@@ -38,7 +38,17 @@ sqlx = { version = "0.9.0", features = [
   "chrono",
   "migrate",
 ] }
-tower-http = { version = "0.7.0", features = ["trace", "cors"] }
+# `timeout` and `catch-panic` are load-bearing for the error envelope: a
+# handler that hangs or panics must still produce one rather than dropping the
+# connection. `set-header` echoes the request id back.
+tower-http = { version = "0.7.0", features = [
+  "trace",
+  "cors",
+  "timeout",
+  "catch-panic",
+  "set-header",
+] }
+tower = "0.5"
 utoipa = "5"
 apalis = "0.7.4"
 # Identifiers are UUIDv7, minted by the application — see migrations/.
@@ -74,7 +84,32 @@ redb = "4.2.0"
 age = "0.12.1"
 object_store = "0.14.1"
 
-# clwd-sdk comes from the public repo via a tag-pinned git dependency,
-# never a path dependency (that's how private types leak into public
-# crates). Move to crates.io once clwd-sdk is stable.
-# clwd-sdk = { git = "https://github.com/clwdrun/clwd", tag = "v0.1.0" }
+# The public repo, via a tag-pinned git dependency — never a path dependency.
+# `just seam` enforces the tag; deny.toml's [sources] enforces the origin.
+#
+# clwd-bundle only. clwd-sdk is the guest SDK app code links against: no_std,
+# wit-bindgen, built for wasm32-wasip2. It compiles on a host target, but
+# nothing here calls it, and adding it drags wit-parser/wit-component in as
+# build dependencies for zero call sites. It goes in when a crate needs it.
+#
+# `version` IS load-bearing, and not for the reason it looks like. The tempting
+# argument for dropping it — a tag is immutable, so nothing can drift beneath
+# the pin, so why state a version twice? — is true and beside the point. The
+# key exists for deny.toml's `wildcards = "deny"`: a git dependency with no
+# version reads as `*`, so removing it fails the gate with
+#
+#     error[wildcard]: found 2 wildcard dependencies for crate 'shared'
+#
+# This has now been rediscovered the hard way once. Do not drop it again.
+#
+# Keep the value equal to the version the tag's crates actually declare. It is
+# a constraint checked against the fetched manifest, not a selector, so a wrong
+# value is a hard resolution failure rather than a silent fallback:
+#
+#     error: failed to select a version for the requirement `clwd-bundle = "^0.1.0"`
+#     candidate versions found which didn't match: 0.0.1
+#
+# That is what `0.1.0` did here, and it stayed hidden only because Cargo.lock
+# still pinned the tag's previous commit. When bumping the tag, run
+# `cargo update -p clwd-bundle` so any mismatch surfaces now, not in CI.
+clwd-bundle = { version = "0.0.1", git = "https://github.com/clwdrun/clwd", tag = "v0.0.1" }

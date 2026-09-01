@@ -46,10 +46,8 @@ ignore = [
 
 [licenses]
 allow = [
-  "0BSD",
   "Apache-2.0",
   "Apache-2.0 WITH LLVM-exception",
-  "BSD-1-Clause",
   "BSD-2-Clause",
   "BSD-3-Clause",
   "BSL-1.0",
@@ -97,7 +95,13 @@ deny = []
 [sources]
 unknown-registry = "deny"
 # The public/private seam, mechanically. A git dependency from anywhere other
-# than an explicitly allowed origin fails the build. There is no `allow-git`
-# entry yet because this workspace has no git dependency yet; #2 adds
-# clwdrun/clwd and the entry that permits it.
+# than the one origin below fails the build — verified by removing the
+# `allow-git` line and watching this exit 8, not by assuming it.
+#
+# This allows the ORIGIN, not the pin: cargo-deny does not care whether the
+# dependency is on a tag, a branch, or a bare default ref. `just seam` is the
+# half that checks the pin, by reading the resolved source out of Cargo.lock.
+# Neither is complete without the other, and #8 owns wiring both into CI as
+# the seam's mechanical enforcement.
 unknown-git = "deny"
+allow-git = ["https://github.com/clwdrun/clwd"]

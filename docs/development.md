@@ -96,15 +96,42 @@ security reviews; if that branching spreads into the control plane or gateway, t
 cost compounds everywhere. When a change seems to require the control plane to know
 which backend is in use, the fix belongs in the `Sandbox` trait instead.
 
-**Depend on `clwd-sdk` via a tag-pinned git dependency, never a path dependency.**
+**Depend on the public repo via a tag-pinned git dependency, never a path
+dependency.** Declared once, in `[workspace.dependencies]`:
 
 ```toml
-clwd-sdk = { git = "https://github.com/clwdrun/clwd", tag = "v0.1.0" }
+clwd-bundle = { git = "https://github.com/clwdrun/clwd", tag = "v0.0.1" }
 ```
 
 A path dep across the two checkouts works on a laptop, breaks CI, and lets private
 types leak into public crates — the exact thing the split exists to prevent. Bump
 the tag deliberately; do not track a branch.
+
+Today that is `clwd-bundle` alone — the bundle format, which the builder decodes and
+whose rejection codes `shared::Error` passes through. `clwd-sdk` is the *guest* SDK
+app code links against: `no_std`, `wit-bindgen`, built for `wasm32-wasip2`. It
+compiles on a host target, but nothing here calls it and it drags
+`wit-parser`/`wit-component` in as build dependencies for no call sites. Add it when
+a crate needs it, not to satisfy a rule about the seam.
+
+Two mechanisms enforce this, and neither is sufficient alone:
+
+- `deny.toml`'s `[sources]` — `unknown-git = "deny"` plus an `allow-git` naming
+  exactly one origin. This checks *where* a dependency comes from. It does not care
+  whether it is pinned to a tag, a branch, or a bare default ref.
+- `just seam` — reads the resolved source out of `Cargo.lock` and requires `?tag=`.
+  This checks *how* it is pinned. Reading the lock rather than the manifests means
+  it sees what cargo actually resolved.
+
+Both were verified by breaking them on purpose rather than by assumption: removing
+`allow-git` exits 8, naming the wrong origin exits 8, and a `?branch=` source fails
+`seam`.
+
+A tag is a moving target on the publishing side — a deleted or retargeted tag makes
+`cargo` fail with `failed to find tag`, which is loud and correct. If that happens,
+confirm what the public repo actually publishes (`git ls-remote --tags`) before
+repinning; do not switch to a `rev` to make the error go away, because a `rev` is
+the pin that silently becomes branch-tracking when the next person edits it.
 
 **Private types stay private.** Nothing in this repo should be designed to be moved
 into the public repo later without an explicit review of what it exposes about the

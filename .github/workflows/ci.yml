@@ -36,6 +36,10 @@ env:
   CARGO_TERM_COLOR: always
   # Fail rather than hang when crates.io is unreachable.
   CARGO_NET_RETRY: 3
+  # The seam dependency lives in a private repository, so cargo must fetch it
+  # over a transport that can carry credentials. The built-in git library cannot;
+  # the git CLI can, and the step below configures it.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
   GITLEAKS_VERSION: 8.30.1
   GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
   SQLX_CLI_VERSION: 0.9.0
@@ -78,8 +82,32 @@ jobs:
       - name: Install Rust from rust-toolchain.toml
         run: rustup show active-toolchain || rustup toolchain install
 
+      # `clwd` is private, so the default GITHUB_TOKEN — scoped to this
+      # repository — cannot read it. CLWD_READ_TOKEN is a fine-grained PAT with
+      # `Contents: read` on clwdrun/clwd and nothing else.
+      #
+      # A PAT is a person-scoped stopgap: it carries someone's identity and it
+      # expires. A GitHub App installation token is the durable answer, and is
+      # filed separately rather than solved here.
+      - name: Authenticate for the clwd seam dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.CLWD_READ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
+
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      # Isolated, and early. Every later step depends on this having worked, and
+      # a credential problem that first surfaces inside a compile reads as a
+      # build error three jobs deep rather than as the token problem it is.
+      - name: Fetch the seam dependency
+        run: |
+          if ! cargo fetch --locked; then
+            echo "::error::could not fetch dependencies. If clwd-bundle is the one that failed, CLWD_READ_TOKEN is missing, expired, or not scoped to clwdrun/clwd."
+            exit 1
+          fi
+          echo "ok: every dependency fetched, including the private seam"
 
       - name: Install just and cargo-deny
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
@@ -89,12 +117,26 @@ jobs:
       # sqlx-cli has no prebuilt release, so it is built once and cached on its
       # version. `--locked` so a transitive bump cannot change what the gate
       # runs without a visible cache miss.
+      #
+      # Both binaries, not just `sqlx`. `cargo install sqlx-cli` produces two:
+      # `sqlx`, which `just migrate` uses, and `cargo-sqlx`, which backs
+      # `cargo sqlx prepare` in `just sqlx-prepared`. Caching only the first
+      # meant a cache hit skipped the install and left the second absent — so
+      # `migrate` passed with the cached binary and the gate then failed four
+      # minutes later on `error: no such command: sqlx`.
       - name: Cache sqlx-cli
         id: sqlx-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: ~/.cargo/bin/sqlx
-          key: sqlx-cli-${{ env.SQLX_CLI_VERSION }}-${{ runner.os }}
+          path: |
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          # The `-2` is a cache generation, and it has to be bumped whenever the
+          # set of cached paths changes. Restore is keyed on this string alone,
+          # so widening `path` does not invalidate an archive saved under the
+          # old key — without the bump, the entry holding only `sqlx` would keep
+          # restoring and keep skipping the install.
+          key: sqlx-cli-${{ env.SQLX_CLI_VERSION }}-${{ runner.os }}-2
 
       - name: Install sqlx-cli
         if: steps.sqlx-cache.outputs.cache-hit != 'true'
@@ -103,6 +145,17 @@ jobs:
             --version "${SQLX_CLI_VERSION}" \
             --no-default-features --features rustls,postgres \
             --locked
+
+      # Cheap, and it fails where the cause is legible. A missing binary is
+      # otherwise discovered by whichever recipe happens to need it, minutes
+      # into the gate and looking like a problem with that recipe.
+      - name: Verify both sqlx binaries are present
+        run: |
+          for bin in sqlx cargo-sqlx; do
+            command -v "$bin" >/dev/null \
+              || { echo "::error::$bin is missing. If the cache was restored, its key needs bumping."; exit 1; }
+          done
+          echo "ok: sqlx and cargo-sqlx both present"
 
       # Downloaded from the pinned release and checksum-verified before it is
       # unpacked. A secret scanner installed over an unverified pipe is a
