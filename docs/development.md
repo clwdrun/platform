@@ -175,3 +175,26 @@ The target shape is an org running ~500 apps, each with ~3 users, each idle ~99%
 the time. Anything with a meaningful per-app fixed cost — a always-warm process, a
 dedicated database instance, a per-app cert issuance — should be treated as a design
 problem, not an implementation detail. Scale-to-zero is the default assumption.
+
+## `gh pr edit` and Projects (classic)
+
+`gh pr edit` can fail against these repositories with
+
+```
+GraphQL: Projects (classic) is being deprecated in favor of the new Projects
+experience ... (repository.pullRequest.projectCards)
+```
+
+The important part is that it **fails silently from the caller's point of
+view**: the error goes to stderr, the exit status is easy to miss in a script,
+and the PR body is left unchanged. Anyone who does not re-read the PR afterwards
+will believe an edit landed that did not.
+
+Use the REST endpoint instead, which does not touch the deprecated field:
+
+```bash
+gh api -X PATCH repos/clwdrun/<repo>/pulls/<N> -F body=@body.md
+```
+
+Either way, read the body back after editing. The same applies to `gh issue
+edit`.
