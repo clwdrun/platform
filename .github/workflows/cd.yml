@@ -14,6 +14,30 @@
 #
 # Third-party actions are pinned to a commit SHA, not a tag, for the reason
 # given in ci.yml: a tag is mutable and this workflow can write packages.
+#
+# There is no GitHub build-provenance attestation step. One was written, and it
+# failed on every run:
+#
+#     Failed to persist attestation: Feature not available for the clwdrun
+#     organization. To enable this feature, please upgrade the billing plan,
+#     or make this repository public.
+#
+# The attestation API is an Advanced Security feature, unavailable on a private
+# repository on the current plan — the same constraint that put gitleaks in this
+# repository instead of GitHub secret scanning. It is removed rather than left
+# failing: a permanently red job trains people to ignore red, which costs more
+# than the attestation was worth.
+#
+# Deliberate omission, not an oversight. To enable it: GitHub Advanced Security
+# on the clwdrun organization, or make this repository public (which is not
+# happening). Restoring it is then `actions/attest-build-provenance` plus
+# `attestations: write` and `id-token: write`.
+#
+# Images are NOT unprovenanced in the meantime. `provenance: mode=max` on the
+# build step attaches SLSA provenance to the image manifest itself, which is
+# buildx's own mechanism and needs nothing from GitHub. What is lost is the
+# entry in GitHub's attestation store and `gh attestation verify`, not the
+# record of how the image was built.
 
 name: cd
 
@@ -29,10 +53,6 @@ concurrency:
 permissions:
   contents: read
   packages: write
-  # Provenance attestation on the pushed image, so a deployment can tell which
-  # workflow run and which commit produced it.
-  attestations: write
-  id-token: write
 
 env:
   REGISTRY: ghcr.io
@@ -84,6 +104,10 @@ jobs:
         with:
           context: .
           build-args: BIN=${{ matrix.bin }}
+          # The seam dependency is private. A secret, not a build argument:
+          # build arguments are readable in image history.
+          secrets: |
+            clwd_token=${{ secrets.CLWD_READ_TOKEN }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -91,11 +115,7 @@ jobs:
           # tree but not a final layer, and one scope would thrash.
           cache-from: type=gha,scope=${{ matrix.bin }}
           cache-to: type=gha,scope=${{ matrix.bin }},mode=max
+          # SLSA provenance built by buildx and attached to the image manifest.
+          # This is not the same thing as a GitHub attestation and needs no API
+          # of theirs — see the note above `permissions`.
           provenance: mode=max
-
-      - name: Attest provenance
-        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        with:
-          subject-name: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.bin }}
-          subject-digest: ${{ steps.push.outputs.digest }}
-          push-to-registry: true

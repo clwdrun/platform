@@ -58,6 +58,10 @@ jobs:
         with:
           context: .
           build-args: BIN=${{ matrix.bin }}
+          # The seam dependency is private. A secret, not a build argument:
+          # build arguments are readable in image history.
+          secrets: |
+            clwd_token=${{ secrets.CLWD_READ_TOKEN }}
           push: false
           # Shares a cache scope with cd.yml, so a merge reuses what the pull
           # request already built rather than compiling the same tree twice.
