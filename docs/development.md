@@ -78,6 +78,36 @@ no-database claim by unsetting `DATABASE_URL` rather than by assertion.
 Migrations are forward-only. A destructive one has no `down` to run, so it carries
 a written `ROLLBACK PLAN` comment instead; `just rollback-plans` fails without one.
 
+### A check that passes without checking is worse than no check
+
+The recurring failure in this repository is not a check that fails. It is a check that
+reports success while measuring nothing — because a green tick is taken as evidence, and
+the absent coverage is invisible precisely where someone believes it exists. This has now
+happened enough times to be a pattern rather than a run of bad luck:
+
+- The `sqlx` cache key covered one of the two binaries `cargo install sqlx-cli` produces.
+  A cache hit skipped the install, `just migrate` passed on the cached binary, and the
+  gate failed four minutes later on `error: no such command: sqlx`. The cache was working
+  perfectly; it was restoring the wrong thing.
+- A `run = []` in a workflow step: present, valid, and executing nothing.
+- The `standalone` job could read its tag from `Cargo.toml` while `Cargo.lock` resolved a
+  different one. Both jobs pass, both build a different version of the seam, and nothing
+  reports the disagreement. Hence the explicit assertion that manifest and lock agree —
+  the job asserts *what it is testing*, not just that a build succeeded.
+
+When adding a check, ask what it does when the thing it guards is absent or wrong, and
+make it fail there:
+
+- **Assert the precondition, not just the outcome.** `just secrets` fails when gitleaks
+  is missing rather than skipping — a scanner that silently no-ops reports clean.
+- **Prove the guard by breaking it.** Every seam guard here was verified by planting a
+  violation and watching it fail, then reverting. A guard nobody has seen fail is a guard
+  nobody knows works.
+- **Name the cause in the failure.** "Build failed" sends the reader to the compiler.
+  "A private type leaked, or the tag is not standalone-buildable" sends them to the seam.
+- **Read the log, not the tick.** Confirm the job did the work. That has caught real
+  problems twice.
+
 ## Crates
 
 | Crate | Role |
