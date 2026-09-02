@@ -1,0 +1,69 @@
+# Build both images without pushing, on pull requests that touch the build.
+#
+# This exists because a broken Dockerfile merged green once already. `ci.yml`
+# runs `just check`, which does not build images, and `cd.yml` only runs after
+# a merge to main — so the gateway image failing to build was invisible until
+# it had been pushed and reviewed. It failed at `libz-ng-sys`, wanting a make
+# program and a C++ compiler that `rust:slim` does not carry.
+#
+# Deliberately NOT part of `just check`. Two release builds inside Docker are
+# minutes of work that no ordinary change needs, and taxing every pull request
+# for a file most of them do not touch is how a gate teaches people to skip it.
+# The paths filter is what keeps it honest: it runs when it can catch
+# something, and stays out of the way otherwise.
+#
+# `push: false` — publishing is `cd.yml`'s job, after merge. This only answers
+# "does it build".
+
+name: images
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - Cargo.toml
+      - Cargo.lock
+      - 'crates/**/Cargo.toml'
+      - .github/workflows/images.yml
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.bin }} image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        bin: [control-plane, gateway]
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Build
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: .
+          build-args: BIN=${{ matrix.bin }}
+          # The seam dependency is private. A secret, not a build argument:
+          # build arguments are readable in image history.
+          secrets: |
+            clwd_token=${{ secrets.CLWD_READ_TOKEN }}
+          push: false
+          # Shares a cache scope with cd.yml, so a merge reuses what the pull
+          # request already built rather than compiling the same tree twice.
+          cache-from: type=gha,scope=${{ matrix.bin }}
+          cache-to: type=gha,scope=${{ matrix.bin }},mode=max

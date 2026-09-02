@@ -10,12 +10,21 @@ FROM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG BIN
 WORKDIR /src
 
-# pkg-config and libssl-dev: openidconnect reaches reqwest with default
-# features on, which pulls native-tls. cmake: pingora's tree needs it.
-# Recorded here rather than discovered from a build failure — and both go away
-# with #9, which turns those default features off.
+# Native toolchain the dependency tree needs. Named individually, because
+# "build-essential" would hide which dependency wants what:
+#
+#   pkg-config, libssl-dev  openidconnect reaches reqwest with default features
+#                           on, which pulls native-tls. Goes away with #9.
+#   cmake, make, g++        pingora -> flate2 -> libz-ng-sys builds zlib-ng
+#                           with cmake, which needs a make program and a C++
+#                           compiler. rust:slim ships gcc but neither of those.
+#   git, ca-certificates    the seam dependency is a private git repository, and
+#                           cargo's built-in fetcher cannot carry credentials.
+#                           CARGO_NET_GIT_FETCH_WITH_CLI hands the fetch to git,
+#                           which can — the same arrangement ci.yml uses.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends pkg-config libssl-dev cmake \
+ && apt-get install -y --no-install-recommends \
+      pkg-config libssl-dev cmake make g++ git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY . .
@@ -27,9 +36,25 @@ ENV SQLX_OFFLINE=true
 # --locked so the image is built from the resolved dependency set in the
 # repository, not whatever cargo would pick today. The target directory is a
 # cache mount, so the binary has to be copied out inside the same layer.
-RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
+#
+# The token arrives as a BuildKit secret, never a build argument: build
+# arguments are recorded in image history and readable by anyone who can pull
+# the image. A secret mount exists only for the life of this RUN and lands in
+# no layer.
+#
+# It is read from the mounted file inside the shell rather than interpolated
+# into the RUN text, so the credential never appears in the build record
+# either. GIT_CONFIG_* is used in preference to `git config --global`, which
+# would persist the token into the builder stage's filesystem — discarded here,
+# but still written, and still in the layer cache.
+RUN --mount=type=secret,id=clwd_token \
+    --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
-    cargo build --release --locked -p "$BIN" --bin "$BIN" \
+    export CARGO_NET_GIT_FETCH_WITH_CLI=true \
+ && export GIT_CONFIG_COUNT=1 \
+ && export GIT_CONFIG_KEY_0="url.https://x-access-token:$(cat /run/secrets/clwd_token)@github.com/.insteadOf" \
+ && export GIT_CONFIG_VALUE_0="https://github.com/" \
+ && cargo build --release --locked -p "$BIN" --bin "$BIN" \
  && cp "target/release/$BIN" /usr/local/bin/service
 
 FROM debian:bookworm-slim AS runtime
