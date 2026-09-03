@@ -1062,6 +1062,7 @@ dependencies = [
  "axum 0.8.9",
  "builder",
  "chrono",
+ "futures",
  "http-body-util",
  "serde",
  "serde_json",
