@@ -1060,7 +1060,6 @@ dependencies = [
  "anyhow",
  "apalis",
  "axum 0.8.9",
- "builder",
  "chrono",
  "futures",
  "http-body-util",

@@ -101,6 +101,10 @@ fn router_with(timeout: Duration) -> Router {
         // side exceeding its own budget.
         // The upload ceiling, applied to every route that reads a body.
         //
+        // The constant comes from `shared`, not from `builder`. Reaching into
+        // `builder` for it pulled 39 crates into the control plane — the whole
+        // opendal stack, zstd, a TLS implementation — to import one `usize`.
+        //
         // Axum's own default is 2 MiB, which is *below* what a bundle may
         // legitimately be. Left alone, a valid upload would be refused by a
         // limit nothing in this repository states, and `MAX_BUNDLE_BYTES` would
@@ -109,7 +113,7 @@ fn router_with(timeout: Duration) -> Router {
         // The rejection also arrives from an extractor rather than a handler,
         // so it carries no envelope of ours. `assign_request_id` gives it one;
         // see the 413 arm there.
-        .layer(DefaultBodyLimit::max(builder::MAX_BUNDLE_BYTES))
+        .layer(DefaultBodyLimit::max(shared::MAX_BUNDLE_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             timeout,
@@ -170,7 +174,7 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
             &Error::PayloadTooLarge {
                 what: format!(
                     "request body exceeds the {} byte limit",
-                    builder::MAX_BUNDLE_BYTES
+                    shared::MAX_BUNDLE_BYTES
                 ),
             },
             &id,
@@ -385,7 +389,7 @@ mod tests {
     /// would prove only that `render` renders.
     #[tokio::test]
     async fn an_oversized_body_becomes_an_envelope_not_a_bare_413() {
-        let oversized = vec![0u8; builder::MAX_BUNDLE_BYTES + 1];
+        let oversized = vec![0u8; shared::MAX_BUNDLE_BYTES + 1];
         let request = Request::builder()
             .method("POST")
             .uri("/v1/body")
@@ -403,7 +407,7 @@ mod tests {
         assert!(
             json["message"]
                 .as_str()
-                .is_some_and(|m| m.contains(&builder::MAX_BUNDLE_BYTES.to_string())),
+                .is_some_and(|m| m.contains(&shared::MAX_BUNDLE_BYTES.to_string())),
             "the caller should learn the limit from the response, got {:?}",
             json["message"]
         );
@@ -431,7 +435,7 @@ mod tests {
         // reports `size_hint` as unknown, which is what a chunked request looks
         // like to everything downstream of the transport.
         let chunk = vec![0u8; 1024 * 1024];
-        let chunks = (builder::MAX_BUNDLE_BYTES / chunk.len()) + 2;
+        let chunks = (shared::MAX_BUNDLE_BYTES / chunk.len()) + 2;
         let stream = futures::stream::iter(
             std::iter::repeat_n(chunk, chunks)
                 .map(Ok::<Vec<u8>, std::convert::Infallible>)
@@ -472,7 +476,7 @@ mod tests {
     #[tokio::test]
     async fn a_body_over_axums_default_but_under_ours_is_accepted() {
         // That our ceiling exceeds this is asserted at compile time, beside the
-        // constant in `builder::ingest`.
+        // constant in `shared::limits`.
         const AXUM_DEFAULT_LIMIT: usize = 2 * 1024 * 1024;
 
         let body = vec![0u8; AXUM_DEFAULT_LIMIT + 1];
