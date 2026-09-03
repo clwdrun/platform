@@ -33,4 +33,3 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
-builder = { workspace = true }

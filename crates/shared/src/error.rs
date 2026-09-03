@@ -184,16 +184,6 @@ define_error! {
         InvalidRequest { what: String } => "control-plane.invalid_request", 400, false,
             Some("check the request against the OpenAPI schema at /openapi.json");
 
-        /// A request body larger than the endpoint accepts.
-        ///
-        /// 413 rather than 400, because the distinction is actionable: a client
-        /// or proxy can retry a 400 with a corrected body, and cannot retry a
-        /// 413 with the same one. The message carries the limit so the caller
-        /// learns it from the response rather than from documentation.
-        #[error("{what}")]
-        PayloadTooLarge { what: String } => "control-plane.payload_too_large", 413, false,
-            Some("reduce the upload below the stated limit");
-
         /// The caller is not authenticated.
         #[error("authentication required")]
         Unauthenticated {} => "control-plane.unauthenticated", 401, false,
@@ -338,7 +328,6 @@ mod tests {
     fn owned_samples() -> Vec<Error> {
         vec![
             Error::InvalidRequest { what: "x".into() },
-            Error::PayloadTooLarge { what: "x".into() },
             Error::Unauthenticated {},
             Error::Forbidden { what: "x".into() },
             Error::NotFound { what: "x".into() },

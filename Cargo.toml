@@ -12,13 +12,11 @@ license = "LicenseRef-Proprietary"
 # intra-workspace. Carries a version as well as a path so `cargo deny`'s
 # wildcard check stays meaningful; CLAUDE.md blesses the path dep itself.
 shared = { version = "0.1.0", path = "crates/shared" }
-builder = { version = "0.1.0", path = "crates/builder" }
 
 # shared
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-bytes = "1"
 thiserror = "2.0.20"
 anyhow = "1"
 tracing = "0.1"
@@ -71,7 +69,10 @@ jsonwebtoken = "11.0.0"
 cedar-policy = "4"
 
 # builder
-opendal = { version = "0.58.2", features = ["services-memory", "services-fs"] }
+oci-spec = "0.10.0"
+oci-distribution = "0.11"
+blake3 = "1.8.7"
+opendal = "0.58.2"
 zstd = "0.13"
 mimalloc = "0.1.52"
 dashmap = "6.2.1"
