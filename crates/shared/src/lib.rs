@@ -1,8 +1,10 @@
 //! Wire types shared across platform crates, plus tracing/otel setup.
 
 pub mod error;
+pub mod limits;
 
 pub use error::{Envelope, Error, RequestId};
+pub use limits::MAX_BUNDLE_BYTES;
 
 pub mod telemetry {
     pub fn init() {

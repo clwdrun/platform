@@ -16,6 +16,8 @@ path = "src/main.rs"
 [dev-dependencies]
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
+# Only to build a body with no known length, for the chunked-upload test.
+futures = { workspace = true }
 
 [dependencies]
 axum = { workspace = true }
@@ -33,4 +35,3 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
-builder = { workspace = true }
