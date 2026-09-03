@@ -240,10 +240,15 @@ async fn an_oversized_upload_is_rejected_without_decoding() {
     assert_eq!(error.status(), 400);
 }
 
-/// A real bundle is orders of magnitude under the ceiling. If this ever fails,
-/// the limit needs revisiting against a measurement rather than raising.
+/// A template-class bundle sits far below the ceiling.
+///
+/// This is a floor check, not a calibration: the templates are the *smallest*
+/// realistic apps, and the ceiling is sized for one carrying a few megabytes of
+/// frontend assets. If this ever fails, something has changed about how bundles
+/// are packed and the limit needs revisiting against a fresh measurement rather
+/// than being raised to make the test pass.
 #[tokio::test]
-async fn a_real_bundle_is_far_under_the_ceiling() {
+async fn a_template_class_bundle_is_far_under_the_ceiling() {
     let bundle = a_bundle();
     assert!(
         bundle.len() < MAX_BUNDLE_BYTES / 100,

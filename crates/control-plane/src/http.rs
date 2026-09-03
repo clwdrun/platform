@@ -28,6 +28,7 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
@@ -74,13 +75,21 @@ fn router_with(timeout: Duration) -> Router {
     // Only compiled for tests: the timeout has nothing to interrupt otherwise,
     // every real handler here returns immediately.
     #[cfg(test)]
-    let router = router.route(
-        "/v1/slow",
-        get(|| async {
-            tokio::time::sleep(Duration::from_secs(30)).await;
-            "unreachable"
-        }),
-    );
+    let router = router
+        .route(
+            "/v1/slow",
+            get(|| async {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                "unreachable"
+            }),
+        )
+        // Nothing in this skeleton reads a body yet, so the body limit below
+        // has nothing to reject without this. It exists so the limit is proven
+        // rather than assumed — the route that will really use it is #7's.
+        .route(
+            "/v1/body",
+            axum::routing::post(|body: axum::body::Bytes| async move { body.len().to_string() }),
+        );
 
     router
         .fallback(unmatched)
@@ -90,6 +99,17 @@ fn router_with(timeout: Duration) -> Router {
         // it already matches what `control-plane.timeout` declares. 504 rather
         // than 408: 408 means the client was too slow sending, and this is our
         // side exceeding its own budget.
+        // The upload ceiling, applied to every route that reads a body.
+        //
+        // Axum's own default is 2 MiB, which is *below* what a bundle may
+        // legitimately be. Left alone, a valid upload would be refused by a
+        // limit nothing in this repository states, and `MAX_BUNDLE_BYTES` would
+        // be unreachable — a documented number that never applies.
+        //
+        // The rejection also arrives from an extractor rather than a handler,
+        // so it carries no envelope of ours. `assign_request_id` gives it one;
+        // see the 413 arm there.
+        .layer(DefaultBodyLimit::max(builder::MAX_BUNDLE_BYTES))
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             timeout,
@@ -135,6 +155,23 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
         return render(
             &Error::Timeout {
                 dependency: "the request exceeded its time budget".to_owned(),
+            },
+            &id,
+        );
+    }
+
+    // Same situation, different layer. `DefaultBodyLimit` rejects inside the
+    // extractor, before any handler runs, so the response is axum's rather than
+    // ours. Without this arm an oversized upload is the one reachable path that
+    // returns a non-envelope body, which is exactly what #2 asserts cannot
+    // happen.
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && !was_rendered(&response) {
+        return render(
+            &Error::PayloadTooLarge {
+                what: format!(
+                    "request body exceeds the {} byte limit",
+                    builder::MAX_BUNDLE_BYTES
+                ),
             },
             &id,
         );
@@ -336,6 +373,67 @@ mod tests {
                 .expect("a message")
                 .contains("deliberate panic"),
             "the panic payload must not reach the caller: {json}"
+        );
+    }
+
+    /// The one path that returns a response no handler produced.
+    ///
+    /// `DefaultBodyLimit` rejects inside the extractor, so without the 413 arm
+    /// in `assign_request_id` this is a bare body from axum — the single
+    /// reachable counter-example to "every failure path returns the envelope".
+    /// Asserted through the real router rather than by calling `render`, which
+    /// would prove only that `render` renders.
+    #[tokio::test]
+    async fn an_oversized_body_becomes_an_envelope_not_a_bare_413() {
+        let oversized = vec![0u8; builder::MAX_BUNDLE_BYTES + 1];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/body")
+            .body(Body::from(oversized))
+            .expect("a request with a large body is still a valid request");
+
+        let (status, json, _) = call(request).await;
+
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(json["code"], "control-plane.payload_too_large");
+        assert_eq!(
+            json["retryable"], false,
+            "the same body will not fit on a second attempt"
+        );
+        assert!(
+            json["message"]
+                .as_str()
+                .is_some_and(|m| m.contains(&builder::MAX_BUNDLE_BYTES.to_string())),
+            "the caller should learn the limit from the response, got {:?}",
+            json["message"]
+        );
+        assert!(
+            json.get("request_id").is_some(),
+            "a rejection from a layer still needs to be correlatable"
+        );
+    }
+
+    /// The limit is ours, not axum's 2 MiB default. A body over that default
+    /// but under our ceiling must reach the handler.
+    #[tokio::test]
+    async fn a_body_over_axums_default_but_under_ours_is_accepted() {
+        // That our ceiling exceeds this is asserted at compile time, beside the
+        // constant in `builder::ingest`.
+        const AXUM_DEFAULT_LIMIT: usize = 2 * 1024 * 1024;
+
+        let body = vec![0u8; AXUM_DEFAULT_LIMIT + 1];
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/body")
+            .body(Body::from(body))
+            .expect("valid request");
+
+        let response = router_with(REQUEST_TIMEOUT).oneshot(request).await;
+        let response = response.expect("the router answers");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "axum's 2 MiB default is still capping the body"
         );
     }
 

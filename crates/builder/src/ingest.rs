@@ -18,27 +18,50 @@ use crate::key::ArtifactKey;
 /// API — [`clwd_bundle::decode`] and [`BundleRef::of_stream`] both take a
 /// slice — so a bundle must be held whole to be validated or digested at all.
 /// Whatever ceiling is chosen is therefore a statement about how much memory
-/// one upload may occupy, and is recorded upstream as `clwdrun/clwd#74`.
+/// one upload may occupy, and the constraint is recorded upstream as
+/// `clwdrun/clwd#74`.
 ///
 /// The format's own ceiling is far higher: 8 GiB − 1 per member, from the tar
 /// size field's octal encoding (spec §3.4.3). Inheriting that would let a
 /// single upload exhaust a control-plane node, so it is deliberately not
 /// inherited.
 ///
-/// 16 MiB, chosen against measured entrypoints from the `clwd` templates:
+/// # Why 16 MiB
 ///
-/// | template   | stripped | unstripped |
-/// | ---------- | -------- | ---------- |
-/// | `minimal`  |  23.5 KB |    26.3 KB |
-/// | `webhook`  |  64.0 KB |    70.6 KB |
-/// | `notes`    |  68.9 KB |    75.8 KB |
+/// Sized against the app this product is *for*, not against the smallest thing
+/// that compiles. The `clwd` templates measure 23.5 KB, 64.0 KB and 68.9 KB
+/// stripped, but those are a bare handler, a notes app and a webhook — they
+/// establish a floor, not a target. Reading the ceiling as a multiple of them
+/// invites cutting it.
 ///
-/// A real bundle is its entrypoint plus a manifest under a kilobyte and tar
-/// framing. So this is roughly 200× the largest app anyone has built, which
-/// leaves room for an app shipping static assets alongside its component while
-/// still bounding one upload at 16 MiB — a number a node survives many of at
-/// once. Raise it when a real app needs more, not pre-emptively.
+/// The realistic case is an app carrying its own frontend: an embedded HTML
+/// page, a web font, and a handful of images alongside the component. That is
+/// plausibly 2–5 MiB of assets, and it is an ordinary app rather than an
+/// extreme one. 16 MiB leaves roughly threefold headroom above the top of that
+/// range, while still bounding one upload at a size a node survives many of
+/// concurrently.
+///
+/// The number that made this urgent is axum's: its `DefaultBodyLimit` is
+/// **2 MiB**, which sits *below* a realistic asset-carrying app. Left at the
+/// default, a legitimate upload would be refused by a limit stated nowhere in
+/// this repository, and this constant would never apply. `control-plane`'s
+/// router overrides it with this value for that reason.
+///
+/// Raise it when a real app needs more, not pre-emptively.
 pub const MAX_BUNDLE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Axum's `DefaultBodyLimit`, which applies to any route that reads a body
+/// unless a router overrides it.
+const AXUM_DEFAULT_BODY_LIMIT: usize = 2 * 1024 * 1024;
+
+/// The ceiling must exceed axum's default, or the override is pointless and a
+/// realistic asset-carrying app is refused by a limit nothing states.
+///
+/// A compile-time assertion rather than a test: this is a property of two
+/// constants, so there is nothing to run and no reason to wait for a test
+/// binary to discover it. Lowering `MAX_BUNDLE_BYTES` past 2 MiB fails the
+/// build, at the line that explains why.
+const _: () = assert!(MAX_BUNDLE_BYTES > AXUM_DEFAULT_BODY_LIMIT);
 
 /// A bundle that has passed every check in spec §8.
 ///

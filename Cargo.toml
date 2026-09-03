@@ -12,6 +12,7 @@ license = "LicenseRef-Proprietary"
 # intra-workspace. Carries a version as well as a path so `cargo deny`'s
 # wildcard check stays meaningful; CLAUDE.md blesses the path dep itself.
 shared = { version = "0.1.0", path = "crates/shared" }
+builder = { version = "0.1.0", path = "crates/builder" }
 
 # shared
 tokio = { version = "1", features = ["full"] }
