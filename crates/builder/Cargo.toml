@@ -6,13 +6,15 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-oci-spec = { workspace = true }
-oci-distribution = { workspace = true }
-blake3 = { workspace = true }
+clwd-bundle = { workspace = true }
 opendal = { workspace = true }
+bytes = { workspace = true }
 zstd = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 shared = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
