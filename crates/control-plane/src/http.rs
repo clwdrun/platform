@@ -413,6 +413,60 @@ mod tests {
         );
     }
 
+    /// The same limit, on a body whose length is not known in advance.
+    ///
+    /// A chunked upload sends no `Content-Length`, so nothing can be rejected
+    /// up front — the limit has to hold while the body streams. Axum enforces
+    /// it with `http_body_util::Limited`, which counts as it reads and has no
+    /// `Content-Length` fast path, so the streaming case should behave like the
+    /// sized one.
+    ///
+    /// "Should" is why this test exists. The sized test above uses
+    /// `Body::from(Vec)`, which knows its own length, and would keep passing if
+    /// the limit only ever worked for bodies that declare one — proving the
+    /// easy half of the property and reporting green about the other.
+    #[tokio::test]
+    async fn an_oversized_chunked_body_is_also_an_envelope() {
+        // A stream of 1 MiB chunks with no total length. `Body::from_stream`
+        // reports `size_hint` as unknown, which is what a chunked request looks
+        // like to everything downstream of the transport.
+        let chunk = vec![0u8; 1024 * 1024];
+        let chunks = (builder::MAX_BUNDLE_BYTES / chunk.len()) + 2;
+        let stream = futures::stream::iter(
+            std::iter::repeat_n(chunk, chunks)
+                .map(Ok::<Vec<u8>, std::convert::Infallible>)
+                .collect::<Vec<_>>(),
+        );
+        let body = Body::from_stream(stream);
+
+        {
+            use axum::body::HttpBody as _;
+            assert!(
+                body.size_hint().exact().is_none(),
+                "this test is pointless unless the body length is unknown"
+            );
+        }
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/body")
+            .body(body)
+            .expect("valid request");
+
+        let (status, json, _) = call(request).await;
+
+        assert_eq!(
+            status,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "a chunked body must hit the same ceiling as a sized one"
+        );
+        assert_eq!(json["code"], "control-plane.payload_too_large");
+        assert!(
+            json.get("request_id").is_some(),
+            "still correlatable when the rejection came from mid-stream"
+        );
+    }
+
     /// The limit is ours, not axum's 2 MiB default. A body over that default
     /// but under our ceiling must reach the handler.
     #[tokio::test]
