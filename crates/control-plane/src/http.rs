@@ -51,8 +51,32 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
 /// Build the router.
-pub fn router() -> Router {
-    router_with(REQUEST_TIMEOUT)
+/// What the routes need to do their work.
+///
+/// Cloned per request by axum, so both fields are cheap to clone: `PgPool` and
+/// `ArtifactStore` are handles, not resources.
+#[derive(Clone)]
+#[non_exhaustive]
+pub struct AppState {
+    pub pool: sqlx::PgPool,
+    pub artifacts: builder::ArtifactStore,
+}
+
+impl AppState {
+    /// Assemble the state.
+    ///
+    /// A constructor rather than a struct literal because the type is
+    /// `#[non_exhaustive]` — it will gain fields, and callers outside this
+    /// crate should keep compiling when it does. `#[non_exhaustive]` without a
+    /// constructor is just a type nobody outside can build.
+    #[must_use]
+    pub fn new(pool: sqlx::PgPool, artifacts: builder::ArtifactStore) -> Self {
+        Self { pool, artifacts }
+    }
+}
+
+pub fn router(state: AppState) -> Router {
+    router_with(state, REQUEST_TIMEOUT)
 }
 
 /// Build the router with an explicit time budget.
@@ -62,9 +86,13 @@ pub fn router() -> Router {
 /// that drives this exercises the real wiring — including the layer's status
 /// agreeing with what `control-plane.timeout` declares. A test that faked the
 /// timeout response instead would hardcode that status and prove nothing.
-fn router_with(timeout: Duration) -> Router {
+fn router_with(state: AppState, timeout: Duration) -> Router {
     let router = Router::new()
         .route("/healthz", get(healthz))
+        .route(
+            "/v1/apps/{app_id}/versions",
+            axum::routing::post(crate::publish::publish),
+        )
         // Placeholder routes, present so the envelope has something to travel
         // through. They return errors on purpose: this skeleton is here to prove
         // the failure paths, and a route that only ever succeeds proves nothing
@@ -92,6 +120,7 @@ fn router_with(timeout: Duration) -> Router {
         );
 
     router
+        .with_state(state)
         .fallback(unmatched)
         // Innermost first. `request_id` is outermost so everything below it —
         // including the panic catcher and the timeout — runs with one assigned.
@@ -287,8 +316,29 @@ mod tests {
     use axum::body::to_bytes;
     use tower::ServiceExt as _;
 
+    /// State for the envelope tests, which exercise no route that touches
+    /// either handle.
+    ///
+    /// The pool is `connect_lazy`, so no connection is made unless something
+    /// uses it — these tests need no database, and if one ever reaches for it
+    /// the call errors rather than quietly passing against a live one.
+    fn stateless() -> AppState {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .expect("a lazy pool connects to nothing");
+        let operator = opendal::Operator::new(opendal::services::Memory::default())
+            .expect("an in-memory operator needs no configuration");
+        AppState {
+            pool,
+            artifacts: builder::ArtifactStore::new(operator),
+        }
+    }
+
     async fn call(request: Request<Body>) -> (StatusCode, serde_json::Value, Response<Body>) {
-        let response = router().oneshot(request).await.expect("router responds");
+        let response = router(stateless())
+            .oneshot(request)
+            .await
+            .expect("router responds");
         let status = response.status();
         let (parts, body) = response.into_parts();
         let bytes = to_bytes(body, 64 * 1024).await.expect("body reads");
@@ -337,7 +387,7 @@ mod tests {
     /// gets an empty body.
     #[tokio::test]
     async fn a_timed_out_request_becomes_an_envelope() {
-        let response = router_with(Duration::from_millis(10))
+        let response = router_with(stateless(), Duration::from_millis(10))
             .oneshot(get("/v1/slow"))
             .await
             .expect("router responds");
@@ -486,7 +536,9 @@ mod tests {
             .body(Body::from(body))
             .expect("valid request");
 
-        let response = router_with(REQUEST_TIMEOUT).oneshot(request).await;
+        let response = router_with(stateless(), REQUEST_TIMEOUT)
+            .oneshot(request)
+            .await;
         let response = response.expect("the router answers");
         assert_eq!(
             response.status(),
@@ -548,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn healthz_succeeds_and_still_carries_a_request_id() {
-        let response = router()
+        let response = router(stateless())
             .oneshot(get("/healthz"))
             .await
             .expect("router responds");

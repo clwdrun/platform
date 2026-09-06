@@ -135,20 +135,47 @@ async fn app_id_and_digest_are_unique_together(pool: PgPool) {
         .await
         .expect("two");
 
-    db::create_app_version(&pool, one.id, DIGEST_A)
-        .await
-        .expect("first publish");
-    db::create_app_version(&pool, one.id, DIGEST_B)
-        .await
-        .expect("a different digest for the same app");
-    db::create_app_version(&pool, two.id, DIGEST_A)
-        .await
-        .expect("the same digest for a different app");
+    assert!(
+        db::claim_app_version(&pool, one.id, DIGEST_A)
+            .await
+            .expect("first publish")
+            .is_some(),
+        "the first claim on a digest wins it"
+    );
+    assert!(
+        db::claim_app_version(&pool, one.id, DIGEST_B)
+            .await
+            .expect("a different digest for the same app")
+            .is_some()
+    );
+    assert!(
+        db::claim_app_version(&pool, two.id, DIGEST_A)
+            .await
+            .expect("the same digest for a different app")
+            .is_some()
+    );
 
-    let err = db::create_app_version(&pool, one.id, DIGEST_A)
-        .await
-        .expect_err("the same digest twice for one app");
-    assert_eq!(sqlstate(err), UNIQUE_VIOLATION);
+    // The behaviour #7 changed. This used to be a unique violation; the index
+    // is the same, but `on conflict do nothing` turns the rejection into the
+    // answer — no row back, no error, and the caller reads the existing one.
+    assert!(
+        db::claim_app_version(&pool, one.id, DIGEST_A)
+            .await
+            .expect("a repeat claim is not an error")
+            .is_none(),
+        "the second claim on a digest must not win it"
+    );
+
+    // And exactly one row exists for it, which is what the index is for.
+    let rows = sqlx::query_scalar!(
+        "select count(*) from app_versions where app_id = $1 and digest = $2",
+        one.id.as_uuid(),
+        DIGEST_A
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("counting");
+    assert_eq!(rows, Some(1));
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -164,7 +191,7 @@ async fn a_version_digest_must_be_a_blake3_content_address(pool: PgPool) {
         "blake3:tooshort",
         "artifacts/dashboard/latest.tar",
     ] {
-        let result = db::create_app_version(&pool, app.id, bad).await;
+        let result = db::claim_app_version(&pool, app.id, bad).await;
         assert!(result.is_err(), "{bad:?} was accepted");
         assert_eq!(sqlstate(result.unwrap_err()), CHECK_VIOLATION, "{bad:?}");
     }
@@ -179,9 +206,10 @@ async fn a_version_starts_pending_and_is_marked_ready(pool: PgPool) {
         .await
         .expect("app");
 
-    let version = db::create_app_version(&pool, app.id, DIGEST_A)
+    let version = db::claim_app_version(&pool, app.id, DIGEST_A)
         .await
-        .expect("publish");
+        .expect("publish")
+        .expect("the first claim wins");
     assert_eq!(version.state, "pending");
 
     let ready = db::mark_app_version_ready(&pool, version.id)
@@ -189,6 +217,54 @@ async fn a_version_starts_pending_and_is_marked_ready(pool: PgPool) {
         .expect("store succeeded");
     assert_eq!(ready.state, "ready");
     assert_eq!(ready.id, version.id);
+}
+
+/// The foreign key cannot see `deleted_at`, so a plain insert would publish
+/// happily into a deleted app. The claim folds the predicate into its source
+/// query, which is what makes this a no-op rather than a silent success.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deleted_app_cannot_be_published_to(pool: PgPool) {
+    let org = db::create_org(&pool, "acme").await.expect("org");
+    let app = db::create_app(&pool, org.id, "one", "wasm")
+        .await
+        .expect("app");
+    sqlx::query!(
+        "update apps set deleted_at = now() where id = $1",
+        app.id.as_uuid()
+    )
+    .execute(&pool)
+    .await
+    .expect("soft delete");
+
+    assert!(
+        db::claim_app_version(&pool, app.id, DIGEST_A)
+            .await
+            .expect("a deleted app is not a driver error")
+            .is_none(),
+        "publishing into a deleted app must claim nothing"
+    );
+
+    // And no row was written, so this is genuinely absent rather than held.
+    assert!(
+        db::app_version_by_digest(&pool, app.id, DIGEST_A)
+            .await
+            .expect("lookup")
+            .is_none(),
+        "an unclaimed digest must leave no row behind"
+    );
+}
+
+/// An app that never existed is the other half of the ambiguous empty result.
+#[sqlx::test(migrations = "../../migrations")]
+async fn an_unknown_app_cannot_be_published_to(pool: PgPool) {
+    let absent = control_plane::ids::AppId::new();
+    assert!(
+        db::claim_app_version(&pool, absent, DIGEST_A)
+            .await
+            .expect("an unknown app is not a driver error")
+            .is_none(),
+        "the select yields no row, so the foreign key is never offered one"
+    );
 }
 
 #[sqlx::test(migrations = "../../migrations")]

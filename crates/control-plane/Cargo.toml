@@ -18,6 +18,10 @@ tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 # Only to build a body with no known length, for the chunked-upload test.
 futures = { workspace = true }
+# An in-memory artifact store for the router tests, which store nothing.
+opendal = { workspace = true }
+clwd-bundle = { workspace = true }
+bytes = { workspace = true }
 
 [dependencies]
 axum = { workspace = true }
@@ -35,3 +39,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
+# Load-bearing, unlike the last time control-plane depended on this. The
+# publish route calls `validate` and `ArtifactStore::put`; #45 took the
+# dependency only to read one constant, which pulled 39 crates in for a
+# `usize` and was reverted in #47. The constant still comes from `shared`.
+builder = { workspace = true }
