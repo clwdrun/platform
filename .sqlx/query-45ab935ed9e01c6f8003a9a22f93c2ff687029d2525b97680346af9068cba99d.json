@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into app_versions (id, app_id, digest) values ($1, $2, $3)\n           returning id, app_id, digest, state, created_at",
+  "query": "insert into app_versions (id, app_id, digest)\n           select $1, id, $3 from apps where id = $2 and deleted_at is null\n           on conflict (app_id, digest) do nothing\n           returning id, app_id, digest, state, created_at",
   "describe": {
     "columns": [
       {
@@ -74,5 +74,5 @@
       false
     ]
   },
-  "hash": "0bfd7b91a27ee24be1b70e8a7205055a89fcf87602977e05e415909525c97807"
+  "hash": "45ab935ed9e01c6f8003a9a22f93c2ff687029d2525b97680346af9068cba99d"
 }

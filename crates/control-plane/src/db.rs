@@ -54,7 +54,7 @@ pub struct App {
 /// The row is written `pending` before the artifact is stored and marked
 /// `ready` after — see the migration for why that ordering is the one that
 /// makes a crash mid-publish visible instead of leaving an orphan artifact.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct AppVersion {
     pub id: VersionId,
     pub app_id: AppId,
@@ -134,26 +134,112 @@ pub async fn create_app(
     .await
 }
 
-/// Inserts a `pending` version row for a digest.
+/// The outcome of claiming `(app_id, digest)`.
 ///
-/// Rejects a second row for the same `(app_id, digest)` on the unique index.
-/// Converting that rejection into "this digest was already published, here is
-/// the existing version" is idempotent publish, and belongs to #7 — this is
-/// only the row the index is built on.
-pub async fn create_app_version(
+/// Which arm you get is decided by whether the `INSERT` returned a row, not by
+/// a prior `SELECT`. A read-then-write would be a race wearing an
+/// optimisation's clothes: two requests could both read "absent" and both
+/// proceed. The insert *is* the atomic answer, and this type carries it out of
+/// the query so a caller cannot re-derive it wrongly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Claim {
+    /// This request won the digest and owes the artifact write.
+    Won(AppVersion),
+    /// Someone already holds it — this request, earlier, or another one now.
+    ///
+    /// Not an error. With a content address, the same bytes are the same
+    /// version by construction, so this is what a retry looks like.
+    Held(AppVersion),
+}
+
+impl Claim {
+    /// The version row, whichever way the claim went.
+    #[must_use]
+    pub fn version(&self) -> &AppVersion {
+        match self {
+            Self::Won(v) | Self::Held(v) => v,
+        }
+    }
+
+    /// Whether this request created the row.
+    #[must_use]
+    pub fn was_created(&self) -> bool {
+        matches!(self, Self::Won(_))
+    }
+}
+
+/// Claims `(app_id, digest)` for a live app, or reports who already holds it.
+///
+/// # The four lines that make the index a concurrency primitive
+///
+/// `#1` shipped the unique index on `(app_id, digest)`; until now the query
+/// was a plain `INSERT`, so a duplicate was a unique-violation *error* rather
+/// than the answer. `ON CONFLICT DO NOTHING ... RETURNING` turns the same
+/// index into the thing that decides a race: exactly one concurrent inserter
+/// gets a row back, every other gets none, and no lock is involved.
+///
+/// # The app check rides along in the same statement
+///
+/// `insert ... select ... from apps where id = $2 and deleted_at is null`
+/// rather than a `SELECT` first. The foreign key already rejects an app that
+/// does not exist, but it cannot see `deleted_at` — so a plain insert would
+/// happily publish into a deleted app. Folding the predicate into the source
+/// query keeps that check atomic with the claim.
+///
+/// # Why zero rows is ambiguous, and why that is fine
+///
+/// An empty result means *either* the conflict fired *or* no live app matched.
+/// Those need different answers — a conflict is a success, a missing app is a
+/// 404 — so the caller disambiguates with [`app_version_by_digest`]. That
+/// second query is a read, but it is not a race: it runs only on the path
+/// where this request is not the one making progress, and both possible
+/// answers are stable by the time it runs.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports. A foreign-key violation cannot
+/// occur here — the `select` yields no row for an unknown app rather than
+/// offering one the constraint would reject.
+pub async fn claim_app_version(
     ex: impl PgExecutor<'_>,
     app_id: AppId,
     digest: &str,
-) -> sqlx::Result<AppVersion> {
+) -> sqlx::Result<Option<AppVersion>> {
     sqlx::query_as!(
         AppVersion,
-        r#"insert into app_versions (id, app_id, digest) values ($1, $2, $3)
+        r#"insert into app_versions (id, app_id, digest)
+           select $1, id, $3 from apps where id = $2 and deleted_at is null
+           on conflict (app_id, digest) do nothing
            returning id, app_id, digest, state, created_at"#,
         VersionId::new().as_uuid(),
         app_id.as_uuid(),
         digest,
     )
-    .fetch_one(ex)
+    .fetch_optional(ex)
+    .await
+}
+
+/// The existing version for `(app_id, digest)`, if there is one.
+///
+/// Only called after [`claim_app_version`] returns nothing, to tell a conflict
+/// apart from an app that does not exist or has been deleted.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports.
+pub async fn app_version_by_digest(
+    ex: impl PgExecutor<'_>,
+    app_id: AppId,
+    digest: &str,
+) -> sqlx::Result<Option<AppVersion>> {
+    sqlx::query_as!(
+        AppVersion,
+        r#"select id, app_id, digest, state, created_at from app_versions
+           where app_id = $1 and digest = $2"#,
+        app_id.as_uuid(),
+        digest,
+    )
+    .fetch_optional(ex)
     .await
 }
 
