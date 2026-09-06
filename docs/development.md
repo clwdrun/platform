@@ -94,6 +94,10 @@ happened enough times to be a pattern rather than a run of bad luck:
   different one. Both jobs pass, both build a different version of the seam, and nothing
   reports the disagreement. Hence the explicit assertion that manifest and lock agree —
   the job asserts *what it is testing*, not just that a build succeeded.
+- A `compile_fail` doc test written to prove two identifier newtypes are not
+  interchangeable, placed inside `#[cfg(test)]` — where rustdoc does not collect doc
+  tests. It reported `ok` and ran **zero tests**. The property it existed to enforce was
+  unguarded for as long as it looked guarded.
 
 When adding a check, ask what it does when the thing it guards is absent or wrong, and
 make it fail there:
@@ -107,6 +111,23 @@ make it fail there:
   "A private type leaked, or the tag is not standalone-buildable" sends them to the seam.
 - **Read the log, not the tick.** Confirm the job did the work. That has caught real
   problems twice.
+- **Read the count, not the colour.** This is the thread running through every instance
+  above, and it is the one that keeps being missed:
+
+  ```
+  test result: ok. 0 passed; 0 failed; 0 ignored
+  test result: ok. 12 passed; 0 failed; 0 ignored
+  ```
+
+  Both are green. One ran nothing. Every failure on this list was a check that **executed
+  nothing**, not a check that got the wrong answer — so the number is the signal and the
+  colour is not. When a check is added, look at what it reported the first time: a new
+  test should move a count, a new job should print work it did. If the number did not
+  change, the check is not wired up, however green it looks.
+
+  The last two instances were both caught this way rather than by anything failing, and
+  the most recent was written *after* this note existed, in a check whose entire purpose
+  was to enforce a property. Knowing the pattern is not the same as looking.
 
 ## Crates
 
