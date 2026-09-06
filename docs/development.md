@@ -127,7 +127,18 @@ make it fail there:
 
   The last two instances were both caught this way rather than by anything failing, and
   the most recent was written *after* this note existed, in a check whose entire purpose
-  was to enforce a property. Knowing the pattern is not the same as looking.
+  was to enforce a property. Two more turned up in the single verification round that
+  followed — including a log grep that returned zero lines while "CI is green" was being
+  reported from the same command. **Knowing the pattern does not protect you from it.
+  Only looking does**, which is why this is a rule to apply rather than a fact to recall.
+
+- **A cancelled run is not a result.** GitHub's `concurrency` group kills an in-progress
+  run when the branch is pushed again, so every commit but the last has CI that ends
+  `cancelled` — neither green nor red. The danger is that a dead run still emits a
+  partial log, and a partial log reads exactly like evidence: the doc test above was
+  observed passing in a run that had already been cancelled. Only the run on the current
+  head means anything, which is what `statusCheckRollup` reports and what a bare
+  `gh run view` on a remembered id does not.
 
 ## Crates
 
