@@ -47,10 +47,13 @@ async fn reserved_org_slug_is_rejected(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn org_slug_is_immutable(pool: PgPool) {
     let org = db::create_org(&pool, "acme").await.expect("insert");
-    let err = sqlx::query!("update orgs set slug = 'acme2' where id = $1", org.id)
-        .execute(&pool)
-        .await
-        .expect_err("slug update");
+    let err = sqlx::query!(
+        "update orgs set slug = 'acme2' where id = $1",
+        org.id.as_uuid()
+    )
+    .execute(&pool)
+    .await
+    .expect_err("slug update");
     assert_eq!(sqlstate(err), RESTRICT_VIOLATION);
 }
 
@@ -91,10 +94,13 @@ async fn a_deleted_app_does_not_free_its_name(pool: PgPool) {
     let app = db::create_app(&pool, org.id, "dashboard", "wasm")
         .await
         .expect("app");
-    sqlx::query!("update apps set deleted_at = now() where id = $1", app.id)
-        .execute(&pool)
-        .await
-        .expect("soft delete");
+    sqlx::query!(
+        "update apps set deleted_at = now() where id = $1",
+        app.id.as_uuid()
+    )
+    .execute(&pool)
+    .await
+    .expect("soft delete");
 
     let err = db::create_app(&pool, org.id, "dashboard", "wasm")
         .await

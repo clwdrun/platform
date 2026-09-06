@@ -9,16 +9,16 @@
 //! a control plane running on several nodes has one clock its writers already
 //! agree on rather than several that drift.
 
+use crate::ids::{AppId, OrgId, UserId, VersionId};
 use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
-use uuid::Uuid;
 
 /// An organisation. `slug` is the org half of `{app}.{org}.clwd.run` and is
 /// immutable once set — the database enforces that with a trigger, because a
 /// reassignable subdomain is handed a browser's still-live cookie.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Org {
-    pub id: Uuid,
+    pub id: OrgId,
     pub slug: String,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -26,7 +26,7 @@ pub struct Org {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
-    pub id: Uuid,
+    pub id: UserId,
     pub email: String,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -41,8 +41,8 @@ pub struct User {
 /// enum here would make that match one keystroke away instead of a decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct App {
-    pub id: Uuid,
-    pub org_id: Uuid,
+    pub id: AppId,
+    pub org_id: OrgId,
     pub name: String,
     pub runtime: String,
     pub created_at: DateTime<Utc>,
@@ -56,8 +56,8 @@ pub struct App {
 /// makes a crash mid-publish visible instead of leaving an orphan artifact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppVersion {
-    pub id: Uuid,
-    pub app_id: Uuid,
+    pub id: VersionId,
+    pub app_id: AppId,
     pub digest: String,
     pub state: String,
     pub created_at: DateTime<Utc>,
@@ -68,7 +68,7 @@ pub async fn create_org(ex: impl PgExecutor<'_>, slug: &str) -> sqlx::Result<Org
         Org,
         r#"insert into orgs (id, slug) values ($1, $2)
            returning id, slug, created_at, deleted_at"#,
-        Uuid::now_v7(),
+        OrgId::new().as_uuid(),
         slug,
     )
     .fetch_one(ex)
@@ -91,7 +91,7 @@ pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<U
         User,
         r#"insert into users (id, email) values ($1, $2)
            returning id, email, created_at, deleted_at"#,
-        Uuid::now_v7(),
+        UserId::new().as_uuid(),
         email,
     )
     .fetch_one(ex)
@@ -102,13 +102,13 @@ pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<U
 /// do is a Cedar policy (#14), not a column here.
 pub async fn add_org_member(
     ex: impl PgExecutor<'_>,
-    org_id: Uuid,
-    user_id: Uuid,
+    org_id: OrgId,
+    user_id: UserId,
 ) -> sqlx::Result<()> {
     sqlx::query!(
         "insert into org_members (org_id, user_id) values ($1, $2)",
-        org_id,
-        user_id,
+        org_id.as_uuid(),
+        user_id.as_uuid(),
     )
     .execute(ex)
     .await
@@ -117,7 +117,7 @@ pub async fn add_org_member(
 
 pub async fn create_app(
     ex: impl PgExecutor<'_>,
-    org_id: Uuid,
+    org_id: OrgId,
     name: &str,
     runtime: &str,
 ) -> sqlx::Result<App> {
@@ -125,8 +125,8 @@ pub async fn create_app(
         App,
         r#"insert into apps (id, org_id, name, runtime) values ($1, $2, $3, $4)
            returning id, org_id, name, runtime, created_at, deleted_at"#,
-        Uuid::now_v7(),
-        org_id,
+        AppId::new().as_uuid(),
+        org_id.as_uuid(),
         name,
         runtime,
     )
@@ -142,15 +142,15 @@ pub async fn create_app(
 /// only the row the index is built on.
 pub async fn create_app_version(
     ex: impl PgExecutor<'_>,
-    app_id: Uuid,
+    app_id: AppId,
     digest: &str,
 ) -> sqlx::Result<AppVersion> {
     sqlx::query_as!(
         AppVersion,
         r#"insert into app_versions (id, app_id, digest) values ($1, $2, $3)
            returning id, app_id, digest, state, created_at"#,
-        Uuid::now_v7(),
-        app_id,
+        VersionId::new().as_uuid(),
+        app_id.as_uuid(),
         digest,
     )
     .fetch_one(ex)
@@ -159,12 +159,15 @@ pub async fn create_app_version(
 
 /// Marks a version `ready`, which is what the caller does once the artifact is
 /// stored under its digest.
-pub async fn mark_app_version_ready(ex: impl PgExecutor<'_>, id: Uuid) -> sqlx::Result<AppVersion> {
+pub async fn mark_app_version_ready(
+    ex: impl PgExecutor<'_>,
+    id: VersionId,
+) -> sqlx::Result<AppVersion> {
     sqlx::query_as!(
         AppVersion,
         r#"update app_versions set state = 'ready' where id = $1
            returning id, app_id, digest, state, created_at"#,
-        id,
+        id.as_uuid(),
     )
     .fetch_one(ex)
     .await
