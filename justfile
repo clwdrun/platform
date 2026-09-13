@@ -17,7 +17,7 @@ default:
 # `migrate` runs before anything that compiles the workspace: sqlx checks its
 # queries against the live database at macro expansion, so a fresh `just db-up`
 # with no schema fails `clippy` rather than failing something about schema.
-check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test deny
+check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe deny
 
 # Secret scan over full history. This repository is private, so GitHub's own
 # secret scanning and push protection — both Advanced Security features — are
@@ -58,6 +58,30 @@ clippy:
 [doc('cargo test --workspace (needs a database)')]
 test:
     cargo test --workspace
+
+# The envelope probe's counts, printed where a reader of the gate sees them.
+#
+# The probe already runs and asserts inside `test`, but `cargo test` hides a
+# passing test's output — so the count that proves every error response is an
+# envelope was asserted and invisible. That is a check reporting its colour
+# instead of its count. This runs the probe again with output shown and fails
+# unless both count lines appear, so it cannot pass by printing nothing.
+[doc('print the envelope probe counts: bare error responses, with and without conversion (needs a database)')]
+envelope-probe:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! out=$(cargo test -q -p control-plane --lib every_error_response_from_every_route -- --nocapture 2>&1); then
+      printf '%s\n' "$out" | tail -60
+      echo "error: the envelope probe failed"
+      exit 1
+    fi
+    lines=$(printf '%s\n' "$out" | grep '^envelope probe' || true)
+    if [ "$(printf '%s\n' "$lines" | grep -c '^envelope probe')" -ne 2 ]; then
+      printf '%s\n' "$out" | tail -40
+      echo "error: the envelope probe passed without reporting both counts"
+      exit 1
+    fi
+    printf '%s\n' "$lines"
 
 deny:
     cargo deny check --hide-inclusion-graph
