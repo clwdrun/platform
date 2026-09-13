@@ -22,6 +22,9 @@ futures = { workspace = true }
 opendal = { workspace = true }
 clwd-bundle = { workspace = true }
 bytes = { workspace = true }
+# Captures every log line the token tests produce, so the leak test can grep
+# them rather than trusting that nothing was logged.
+tracing-subscriber = { workspace = true }
 
 [dependencies]
 axum = { workspace = true }
@@ -44,3 +47,7 @@ shared = { workspace = true }
 # dependency only to read one constant, which pulled 39 crates in for a
 # `usize` and was reverted in #47. The constant still comes from `shared`.
 builder = { workspace = true }
+# API tokens (#4): the digest, the secret's randomness, per-token limits.
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+governor = { workspace = true }

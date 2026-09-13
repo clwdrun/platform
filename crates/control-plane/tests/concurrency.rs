@@ -30,7 +30,8 @@
 use std::sync::Arc;
 
 use control_plane::db::{self, Claim};
-use control_plane::ids::AppId;
+use control_plane::ids::{AppId, OrgId};
+use control_plane::token::Scopes;
 use sqlx::AssertSqlSafe;
 use sqlx::PgPool;
 use sqlx::postgres::PgPoolOptions;
@@ -111,14 +112,14 @@ impl Scratch {
 
 /// Publishes `digest` to `app`, resolving the ambiguous empty result the way
 /// the route does.
-async fn publish(pool: &PgPool, app: AppId, digest: &'static str) -> Claim {
-    match db::claim_app_version(pool, app, digest)
+async fn publish(pool: &PgPool, app: Target, digest: &'static str) -> Claim {
+    match db::claim_app_version(pool, app.org, app.app, digest)
         .await
         .expect("the claim query runs")
     {
         Some(row) => Claim::Won(row),
         None => Claim::Held(
-            db::app_version_by_digest(pool, app, digest)
+            db::app_version_by_digest(pool, app.org, app.app, digest)
                 .await
                 .expect("the disambiguating read runs")
                 .expect("a conflict means a row exists"),
@@ -126,12 +127,22 @@ async fn publish(pool: &PgPool, app: AppId, digest: &'static str) -> Claim {
     }
 }
 
-async fn an_app(pool: &PgPool) -> AppId {
+/// An app, and the org a token must belong to in order to reach it.
+#[derive(Debug, Clone, Copy)]
+struct Target {
+    org: OrgId,
+    app: AppId,
+}
+
+async fn an_app(pool: &PgPool) -> Target {
     let org = db::create_org(pool, "acme").await.expect("org");
-    db::create_app(pool, org.id, "one", "wasm")
+    let app = db::create_app(pool, org.id, "one", "wasm")
         .await
-        .expect("app")
-        .id
+        .expect("app");
+    Target {
+        org: org.id,
+        app: app.id,
+    }
 }
 
 /// A real bundle, built the way `clwd build` builds one.
@@ -170,13 +181,24 @@ fn state_for(pool: &PgPool) -> control_plane::http::AppState {
 
 async fn post_bundle(
     state: &control_plane::http::AppState,
-    app: AppId,
+    target: Target,
     body: bytes::Bytes,
 ) -> (axum::http::StatusCode, serde_json::Value) {
     use tower::ServiceExt;
+    // A fresh `publish` token for the target's org. Authentication is not what
+    // these tests are about, so they get exactly the credential the route
+    // needs and no more.
+    let scopes = Scopes::parse_all(["publish"]).expect("a known scope");
+    let token = control_plane::auth::issue(&state.pool, target.org, None, "concurrency", scopes)
+        .await
+        .expect("issuing a token");
     let request = axum::http::Request::builder()
         .method("POST")
-        .uri(format!("/v1/apps/{app}/versions"))
+        .uri(format!("/v1/apps/{}/versions", target.app))
+        .header(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {}", token.secret.expose()),
+        )
         .body(axum::body::Body::from(body))
         .expect("valid request");
     let response = control_plane::http::router(state.clone())
@@ -228,7 +250,7 @@ async fn publishing_to_a_deleted_app_is_404_not_200() {
 
     sqlx::query!(
         "update apps set deleted_at = now() where id = $1",
-        app.as_uuid()
+        app.app.as_uuid()
     )
     .execute(&scratch.pool)
     .await
@@ -245,7 +267,12 @@ async fn publishing_to_a_deleted_app_is_404_not_200() {
 async fn publishing_to_an_unknown_app_is_404() {
     let scratch = Scratch::new().await;
     let state = state_for(&scratch.pool);
-    let (status, body) = post_bundle(&state, AppId::new(), a_bundle(b"body")).await;
+    let org = db::create_org(&scratch.pool, "acme").await.expect("org");
+    let absent = Target {
+        org: org.id,
+        app: AppId::new(),
+    };
+    let (status, body) = post_bundle(&state, absent, a_bundle(b"body")).await;
     assert_eq!(status, axum::http::StatusCode::NOT_FOUND);
     assert_eq!(body["code"], "control-plane.not_found");
     scratch.drop_it().await;
@@ -270,7 +297,7 @@ async fn an_invalid_bundle_produces_no_row() {
 
     let rows: Option<i64> = sqlx::query_scalar!(
         "select count(*) from app_versions where app_id = $1",
-        app.as_uuid()
+        app.app.as_uuid()
     )
     .fetch_one(&scratch.pool)
     .await
@@ -310,7 +337,7 @@ async fn ten_concurrent_identical_publishes_produce_one_row() {
 
     let rows: Option<i64> = sqlx::query_scalar!(
         "select count(*) from app_versions where app_id = $1 and digest = $2",
-        app.as_uuid(),
+        app.app.as_uuid(),
         DIGEST_A
     )
     .fetch_one(&scratch.pool)
@@ -357,7 +384,7 @@ async fn two_different_digests_concurrently_produce_two_rows() {
 
     let rows: Option<i64> = sqlx::query_scalar!(
         "select count(*) from app_versions where app_id = $1",
-        app.as_uuid()
+        app.app.as_uuid()
     )
     .fetch_one(&scratch.pool)
     .await

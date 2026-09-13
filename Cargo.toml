@@ -63,7 +63,17 @@ pingora = "0.8.1"
 instant-acme = "0.8.5"
 moka = { version = "0.12", features = ["future"] }
 tower-cookies = "0.11.0"
-governor = "0.4.0"
+# Per-token rate limiting in the control plane (#4). `dashmap` is the keyed
+# store; `jitter` and `quanta` are left off because nothing here wants either
+# and they are crates for nothing.
+governor = { version = "0.10.4", default-features = false, features = [
+  "std",
+  "dashmap",
+] }
+# Token hashing and generation (#4). Both versions are the ones sqlx and
+# opentelemetry already resolve, so they add no crates to the graph.
+sha2 = "0.10.9"
+getrandom = "0.3.4"
 
 # identity — share grants modeled as Cedar entities from day one
 openidconnect = "4.0.1"

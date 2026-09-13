@@ -194,15 +194,29 @@ define_error! {
         PayloadTooLarge { what: String } => "control-plane.payload_too_large", 413, false,
             Some("reduce the upload below the stated limit");
 
-        /// The caller is not authenticated.
+        /// The request carries no valid credential.
+        ///
+        /// No header, a malformed one, an unknown token and a revoked token
+        /// are all this one value, deliberately. Distinguishing "revoked" from
+        /// "never existed" would tell whoever holds a leaked token that it was
+        /// once real.
+        ///
+        /// `identity.*` rather than `control-plane.*`: the prefix names the
+        /// subsystem that decided, and authentication decisions belong to
+        /// identity whichever process makes them — the control plane today,
+        /// `identity` (#9) and the gateway (#11) later.
         #[error("authentication required")]
-        Unauthenticated {} => "control-plane.unauthenticated", 401, false,
-            Some("supply a bearer token in the Authorization header");
+        Unauthenticated {} => "identity.unauthenticated", 401, false,
+            Some("supply a valid, unrevoked API token as `Authorization: Bearer <token>`");
 
-        /// The caller is authenticated but not permitted.
+        /// The credential is valid but lacks the scope this route needs.
+        ///
+        /// Only for a resource the credential may see. A resource outside the
+        /// token's org or app binding is `control-plane.not_found`, because a
+        /// 403 there would confirm the resource exists.
         #[error("not permitted: {what}")]
-        Forbidden { what: String } => "control-plane.forbidden", 403, false,
-            Some("ask an owner of the organisation to grant access");
+        Forbidden { what: String } => "identity.forbidden", 403, false,
+            Some("use a token that carries the scope named in the message");
 
         /// A named resource does not exist, or the caller may not see it.
         ///
@@ -230,12 +244,23 @@ define_error! {
 
         /// A dependency did not answer in time.
         ///
-        /// The one retryable code today, and the reason `retryable` is worth
-        /// carrying at all: a field that is uniformly `false` is decorative, and
-        /// nobody notices when it is wired wrong.
+        /// Retryable, and the reason `retryable` is worth carrying at all: a
+        /// field that is uniformly `false` is decorative, and nobody notices
+        /// when it is wired wrong.
         #[error("timed out talking to {dependency}")]
         Timeout { dependency: String } => "control-plane.timeout", 504, true,
             Some("retry; if it persists the dependency is down rather than slow");
+
+        /// This token has used its request budget.
+        ///
+        /// Retryable, and separate from `identity.forbidden` for exactly that
+        /// reason: a caller that cannot tell "retry in a moment" from "you may
+        /// not do this" either hammers or gives up. The wait is in the message
+        /// and, for a client that reads headers rather than bodies, in
+        /// `Retry-After`.
+        #[error("rate limit exceeded; retry in {retry_after_secs}s")]
+        RateLimited { retry_after_secs: u64 } => "control-plane.rate_limited", 429, true,
+            Some("retry after the number of seconds in the Retry-After header");
 
         /// Last resort only, never where a specific variant fits.
         #[error("internal error")]
@@ -347,10 +372,44 @@ mod tests {
             Error::Timeout {
                 dependency: "x".into(),
             },
+            Error::RateLimited {
+                retry_after_secs: 1,
+            },
             Error::Internal {
                 source: anyhow::anyhow!("x"),
             },
         ]
+    }
+
+    /// The namespaces this crate may declare codes in.
+    ///
+    /// `identity` is here because authentication decisions are identity's
+    /// whichever process makes them; see `Error::Unauthenticated`. Widening
+    /// this list is a deliberate act, so it is a list rather than a pattern.
+    const OWNED_NAMESPACES: &[&str] = &["control-plane", "identity"];
+
+    /// The two authentication codes, pinned as strings: `#3` publishes them,
+    /// and a caller branches on them.
+    #[test]
+    fn authentication_codes_are_identity_codes() {
+        assert_eq!(Error::Unauthenticated {}.code(), "identity.unauthenticated");
+        assert_eq!(Error::Unauthenticated {}.status(), 401);
+        let forbidden = Error::Forbidden { what: "x".into() };
+        assert_eq!(forbidden.code(), "identity.forbidden");
+        assert_eq!(forbidden.status(), 403);
+    }
+
+    /// A rate limit is the second retryable code, and must stay retryable:
+    /// a caller told to stop rather than wait gives up on a working token.
+    #[test]
+    fn a_rate_limit_is_retryable_and_says_how_long() {
+        let err = Error::RateLimited {
+            retry_after_secs: 7,
+        };
+        assert_eq!(err.code(), "control-plane.rate_limited");
+        assert_eq!(err.status(), 429);
+        assert!(err.retryable());
+        assert!(err.to_string().contains('7'), "the wait is in the message");
     }
 
     #[test]
@@ -380,9 +439,9 @@ mod tests {
                 "{code} has an empty half"
             );
             assert_eq!(*code, code.to_lowercase(), "{code} is not lowercase");
-            assert_eq!(
-                ns, "control-plane",
-                "{code} is not in this crate's namespace"
+            assert!(
+                OWNED_NAMESPACES.contains(&ns),
+                "{code} is not in a namespace this crate owns"
             );
         }
     }

@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into api_tokens (id, org_id, app_id, name, secret_sha256, scopes)\n         values ($1, $2, $3, 'x', $4, array['read'])",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "adbef94e48fd5e1d0d61a5474be6e747ff42f6b39e9c251bb8bdb468c5c9251a"
+}

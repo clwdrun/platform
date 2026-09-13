@@ -36,6 +36,7 @@ use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use shared::{Error, RequestId};
 
+use crate::auth::Principal;
 use crate::db::{self, AppVersion};
 use crate::http::{AppState, render};
 use crate::ids::AppId;
@@ -101,24 +102,44 @@ impl IntoResponse for Published {
 /// caller's bytes are wrong and the code says how. An unknown or deleted app
 /// is `control-plane.not_found` at 404, which is the other half of the
 /// claim's ambiguous empty result and must not be confused with a conflict.
+///
+/// An app outside the token's binding — another org's, or another app when
+/// the token is narrowed to one — is the same 404. The route requires the
+/// `publish` scope; that is checked before this runs.
 pub async fn publish(
     State(state): State<AppState>,
     Path(app_id): Path<AppId>,
+    axum::Extension(principal): axum::Extension<Principal>,
     axum::Extension(request_id): axum::Extension<RequestId>,
     body: Bytes,
 ) -> Response {
-    match publish_inner(&state, app_id, body).await {
+    match publish_inner(&state, &principal, app_id, body).await {
         Ok(published) => published.into_response(),
         Err(error) => render(&error, &request_id),
     }
 }
 
-async fn publish_inner(state: &AppState, app_id: AppId, body: Bytes) -> Result<Published, Error> {
+async fn publish_inner(
+    state: &AppState,
+    principal: &Principal,
+    app_id: AppId,
+    body: Bytes,
+) -> Result<Published, Error> {
+    // First, and before validation: decoding a bundle for an app this token
+    // cannot reach is work done for nobody. The org half of the binding is in
+    // the claim's own query.
+    if !principal.may_reach_app(app_id) {
+        return Err(Error::NotFound {
+            what: format!("app {app_id}"),
+        });
+    }
+
     // Before the claim, so an invalid bundle leaves no row at all.
     let validated = builder::validate(body)?;
     let digest = validated.digest().to_string();
+    let org_id = principal.org_id;
 
-    let claimed = db::claim_app_version(&state.pool, app_id, &digest)
+    let claimed = db::claim_app_version(&state.pool, org_id, app_id, &digest)
         .await
         .map_err(internal)?;
 
@@ -126,7 +147,7 @@ async fn publish_inner(state: &AppState, app_id: AppId, body: Bytes) -> Result<P
         // Empty means *either* the conflict fired *or* no live app matched.
         // Disambiguate with a read — not a race, because this request is not
         // the one making progress and both answers are stable by now.
-        let existing = db::app_version_by_digest(&state.pool, app_id, &digest)
+        let existing = db::app_version_by_digest(&state.pool, org_id, app_id, &digest)
             .await
             .map_err(internal)?;
 

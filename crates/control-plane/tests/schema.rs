@@ -136,20 +136,20 @@ async fn app_id_and_digest_are_unique_together(pool: PgPool) {
         .expect("two");
 
     assert!(
-        db::claim_app_version(&pool, one.id, DIGEST_A)
+        db::claim_app_version(&pool, org.id, one.id, DIGEST_A)
             .await
             .expect("first publish")
             .is_some(),
         "the first claim on a digest wins it"
     );
     assert!(
-        db::claim_app_version(&pool, one.id, DIGEST_B)
+        db::claim_app_version(&pool, org.id, one.id, DIGEST_B)
             .await
             .expect("a different digest for the same app")
             .is_some()
     );
     assert!(
-        db::claim_app_version(&pool, two.id, DIGEST_A)
+        db::claim_app_version(&pool, org.id, two.id, DIGEST_A)
             .await
             .expect("the same digest for a different app")
             .is_some()
@@ -159,7 +159,7 @@ async fn app_id_and_digest_are_unique_together(pool: PgPool) {
     // is the same, but `on conflict do nothing` turns the rejection into the
     // answer — no row back, no error, and the caller reads the existing one.
     assert!(
-        db::claim_app_version(&pool, one.id, DIGEST_A)
+        db::claim_app_version(&pool, org.id, one.id, DIGEST_A)
             .await
             .expect("a repeat claim is not an error")
             .is_none(),
@@ -191,7 +191,7 @@ async fn a_version_digest_must_be_a_blake3_content_address(pool: PgPool) {
         "blake3:tooshort",
         "artifacts/dashboard/latest.tar",
     ] {
-        let result = db::claim_app_version(&pool, app.id, bad).await;
+        let result = db::claim_app_version(&pool, org.id, app.id, bad).await;
         assert!(result.is_err(), "{bad:?} was accepted");
         assert_eq!(sqlstate(result.unwrap_err()), CHECK_VIOLATION, "{bad:?}");
     }
@@ -206,7 +206,7 @@ async fn a_version_starts_pending_and_is_marked_ready(pool: PgPool) {
         .await
         .expect("app");
 
-    let version = db::claim_app_version(&pool, app.id, DIGEST_A)
+    let version = db::claim_app_version(&pool, org.id, app.id, DIGEST_A)
         .await
         .expect("publish")
         .expect("the first claim wins");
@@ -237,7 +237,7 @@ async fn a_deleted_app_cannot_be_published_to(pool: PgPool) {
     .expect("soft delete");
 
     assert!(
-        db::claim_app_version(&pool, app.id, DIGEST_A)
+        db::claim_app_version(&pool, org.id, app.id, DIGEST_A)
             .await
             .expect("a deleted app is not a driver error")
             .is_none(),
@@ -246,7 +246,7 @@ async fn a_deleted_app_cannot_be_published_to(pool: PgPool) {
 
     // And no row was written, so this is genuinely absent rather than held.
     assert!(
-        db::app_version_by_digest(&pool, app.id, DIGEST_A)
+        db::app_version_by_digest(&pool, org.id, app.id, DIGEST_A)
             .await
             .expect("lookup")
             .is_none(),
@@ -259,7 +259,7 @@ async fn a_deleted_app_cannot_be_published_to(pool: PgPool) {
 async fn an_unknown_app_cannot_be_published_to(pool: PgPool) {
     let absent = control_plane::ids::AppId::new();
     assert!(
-        db::claim_app_version(&pool, absent, DIGEST_A)
+        db::claim_app_version(&pool, control_plane::ids::OrgId::new(), absent, DIGEST_A)
             .await
             .expect("an unknown app is not a driver error")
             .is_none(),

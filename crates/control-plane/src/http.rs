@@ -1,8 +1,4 @@
-//! The axum surface: middleware, error rendering, and enough routing to prove
-//! the envelope reaches the wire.
-//!
-//! No domain logic. Routes here exist so the error contract can be tested end to
-//! end; the ones that matter arrive with #3 onward.
+//! The axum surface: middleware, error rendering, and routing.
 //!
 //! # Every failure is an envelope, including the ones nobody wrote a handler for
 //!
@@ -23,6 +19,13 @@
 //! `request_id` is assigned in the outermost layer, before routing, so it exists
 //! on every path — including the three above. A layer that ran after routing
 //! would leave exactly the failures that most need correlating without any.
+//!
+//! # Authenticated by default
+//!
+//! A route is public only if it is added to the public router, which holds
+//! `/healthz` and nothing else. Every other route goes through [`protected`],
+//! which requires a scope as an argument. The failure this shape prevents is the
+//! common one: a new route that ships unprotected because nobody opted it in.
 
 use std::time::Duration;
 
@@ -33,12 +36,15 @@ use axum::extract::Request;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::get;
+use axum::routing::{MethodRouter, delete, get, post};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use shared::{Envelope, Error, RequestId};
+
+use crate::auth::{self, Limiter};
+use crate::token::Scope;
 
 /// How long a request may run before it is abandoned.
 ///
@@ -50,20 +56,20 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// The header a client may use to supply its own correlation id.
 const REQUEST_ID_HEADER: &str = "x-request-id";
 
-/// Build the router.
 /// What the routes need to do their work.
 ///
-/// Cloned per request by axum, so both fields are cheap to clone: `PgPool` and
-/// `ArtifactStore` are handles, not resources.
+/// Cloned per request by axum, so every field is cheap to clone: `PgPool` and
+/// `ArtifactStore` are handles, not resources, and the limiter is shared.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct AppState {
     pub pool: sqlx::PgPool,
     pub artifacts: builder::ArtifactStore,
+    pub limiter: std::sync::Arc<Limiter>,
 }
 
 impl AppState {
-    /// Assemble the state.
+    /// Assemble the state, with the default per-token rate limit.
     ///
     /// A constructor rather than a struct literal because the type is
     /// `#[non_exhaustive]` — it will gain fields, and callers outside this
@@ -71,12 +77,50 @@ impl AppState {
     /// constructor is just a type nobody outside can build.
     #[must_use]
     pub fn new(pool: sqlx::PgPool, artifacts: builder::ArtifactStore) -> Self {
-        Self { pool, artifacts }
+        Self::with_quota(pool, artifacts, auth::default_quota())
+    }
+
+    /// Assemble the state with an explicit per-token rate limit.
+    ///
+    /// Exists so a test can reach the limit in two requests rather than a
+    /// hundred; production uses [`AppState::new`].
+    #[must_use]
+    pub fn with_quota(
+        pool: sqlx::PgPool,
+        artifacts: builder::ArtifactStore,
+        quota: governor::Quota,
+    ) -> Self {
+        Self {
+            pool,
+            artifacts,
+            limiter: std::sync::Arc::new(Limiter::keyed(quota)),
+        }
     }
 }
 
+/// Build the router.
 pub fn router(state: AppState) -> Router {
     router_with(state, REQUEST_TIMEOUT)
+}
+
+/// Add a route that requires authentication and `scope`.
+///
+/// **The only way to add a protected route**, and it takes the scope as an
+/// argument, so "protected but no scope check" is not something a route can
+/// be. The authentication layer itself is added once, over every route this
+/// has registered, in [`router_with`].
+fn protected(
+    router: Router<AppState>,
+    path: &str,
+    scope: Scope,
+    method: MethodRouter<AppState>,
+) -> Router<AppState> {
+    router.route(
+        path,
+        method.route_layer(middleware::from_fn(move |request: Request, next: Next| {
+            auth::require_scope(scope, request, next)
+        })),
+    )
 }
 
 /// Build the router with an explicit time budget.
@@ -87,23 +131,43 @@ pub fn router(state: AppState) -> Router {
 /// agreeing with what `control-plane.timeout` declares. A test that faked the
 /// timeout response instead would hardcode that status and prove nothing.
 fn router_with(state: AppState, timeout: Duration) -> Router {
-    let router = Router::new()
-        .route("/healthz", get(healthz))
-        .route(
-            "/v1/apps/{app_id}/versions",
-            axum::routing::post(crate::publish::publish),
-        )
-        // Placeholder routes, present so the envelope has something to travel
-        // through. They return errors on purpose: this skeleton is here to prove
-        // the failure paths, and a route that only ever succeeds proves nothing
-        // about them.
-        .route("/v1/apps/{id}", get(placeholder_not_found))
-        .route("/v1/panic", get(placeholder_panic));
+    let authenticated = Router::new();
+    let authenticated = protected(
+        authenticated,
+        "/v1/apps/{app_id}/versions",
+        Scope::Publish,
+        post(crate::publish::publish),
+    );
+    let authenticated = protected(
+        authenticated,
+        "/v1/orgs/{org_id}/tokens",
+        Scope::Admin,
+        post(auth::issue_route),
+    );
+    let authenticated = protected(
+        authenticated,
+        "/v1/tokens/{token_id}",
+        Scope::Admin,
+        delete(auth::revoke_route),
+    );
+    // `route_layer`, after every protected route is registered: it covers the
+    // routes that exist when it is called, and only matched ones, so an
+    // unknown path is still the fallback's 404 rather than a 401.
+    let authenticated = authenticated.route_layer(middleware::from_fn_with_state(
+        state.clone(),
+        auth::authenticate,
+    ));
 
-    // Only compiled for tests: the timeout has nothing to interrupt otherwise,
-    // every real handler here returns immediately.
+    let public = Router::new().route("/healthz", get(healthz));
+
+    // Test-only, and public, because they exist to prove failure paths that
+    // happen before or regardless of authentication. They were compiled into
+    // production until authentication arrived; a deliberate-panic route did
+    // not belong there, and requiring a scope for it would have been worse.
     #[cfg(test)]
-    let router = router
+    let public = public
+        .route("/v1/apps/{id}", get(placeholder_not_found))
+        .route("/v1/panic", get(placeholder_panic))
         .route(
             "/v1/slow",
             get(|| async {
@@ -111,15 +175,14 @@ fn router_with(state: AppState, timeout: Duration) -> Router {
                 "unreachable"
             }),
         )
-        // Nothing in this skeleton reads a body yet, so the body limit below
-        // has nothing to reject without this. It exists so the limit is proven
-        // rather than assumed — the route that will really use it is #7's.
+        // Proves the body limit on a route with no other behaviour in the way.
         .route(
             "/v1/body",
-            axum::routing::post(|body: axum::body::Bytes| async move { body.len().to_string() }),
+            post(|body: axum::body::Bytes| async move { body.len().to_string() }),
         );
 
-    router
+    public
+        .merge(authenticated)
         .with_state(state)
         .fallback(unmatched)
         // Innermost first. `request_id` is outermost so everything below it —
@@ -159,6 +222,14 @@ fn router_with(state: AppState, timeout: Duration) -> Router {
 /// correlation header should not fail a request that is otherwise fine, and the
 /// caller still gets a usable id back in the response.
 async fn assign_request_id(mut request: Request, next: Next) -> Response {
+    // First, before any layer can see the headers: a sensitive `HeaderValue`
+    // prints as `Sensitive` under `Debug`, so a `{:?}` of the request or its
+    // headers anywhere below cannot put a token in a log line. Here rather
+    // than in the auth layer because the trace layer runs before that one.
+    if let Some(credential) = request.headers_mut().get_mut(header::AUTHORIZATION) {
+        credential.set_sensitive(true);
+    }
+
     let id = request
         .headers()
         .get(REQUEST_ID_HEADER)
@@ -225,6 +296,10 @@ fn was_rendered(response: &Response) -> bool {
 const ENVELOPE_MARKER: &str = "x-clwd-envelope";
 
 /// Render an error as the envelope, with the status its code declares.
+///
+/// Two errors also need a header, because some callers read headers and not
+/// bodies: a 401 carries `WWW-Authenticate: Bearer` (RFC 6750), and a rate
+/// limit carries `Retry-After`.
 pub fn render(error: &Error, id: &RequestId) -> Response {
     let body = serde_json::to_vec(&Envelope::new(error, id)).unwrap_or_else(|_| {
         // Serializing an envelope cannot fail — every field is a plain string or
@@ -243,10 +318,17 @@ pub fn render(error: &Error, id: &RequestId) -> Response {
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
 
-    response.headers_mut().insert(
+    let headers = response.headers_mut();
+    headers.insert(
         REQUEST_ID_HEADER,
         HeaderValue::from_str(id.as_str()).unwrap_or_else(|_| HeaderValue::from_static("invalid")),
     );
+    if status == StatusCode::UNAUTHORIZED {
+        headers.insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+    }
+    if let Error::RateLimited { retry_after_secs } = error {
+        headers.insert(header::RETRY_AFTER, HeaderValue::from(*retry_after_secs));
+    }
     response
 }
 
@@ -282,6 +364,7 @@ async fn healthz() -> &'static str {
 }
 
 /// A route that fails, so the envelope has a normal failure to travel through.
+#[cfg(test)]
 async fn placeholder_not_found(
     axum::extract::Path(id): axum::extract::Path<String>,
     axum::Extension(request_id): axum::Extension<RequestId>,
@@ -294,8 +377,8 @@ async fn placeholder_not_found(
     )
 }
 
-/// Exists to prove the panic path. Not reachable by accident: it is an explicit
-/// route, and it goes when #3 replaces this skeleton with real handlers.
+/// Exists to prove the panic path.
+#[cfg(test)]
 async fn placeholder_panic() -> Response {
     panic!("deliberate panic, to prove the catch layer produces an envelope");
 }
@@ -316,22 +399,20 @@ mod tests {
     use axum::body::to_bytes;
     use tower::ServiceExt as _;
 
-    /// State for the envelope tests, which exercise no route that touches
-    /// either handle.
+    /// State for the envelope tests, which reach no database.
     ///
-    /// The pool is `connect_lazy`, so no connection is made unless something
-    /// uses it — these tests need no database, and if one ever reaches for it
-    /// the call errors rather than quietly passing against a live one.
+    /// The pool is `connect_lazy` against an address nothing listens on, with a
+    /// short acquire timeout, so any route that does reach for it fails fast
+    /// rather than quietly passing against a live one. The authentication tests
+    /// below depend on exactly that.
     fn stateless() -> AppState {
         let pool = sqlx::postgres::PgPoolOptions::new()
-            .connect_lazy("postgres://unused@127.0.0.1/unused")
+            .acquire_timeout(Duration::from_millis(500))
+            .connect_lazy("postgres://unused@127.0.0.1:1/unused")
             .expect("a lazy pool connects to nothing");
         let operator = opendal::Operator::new(opendal::services::Memory::default())
             .expect("an in-memory operator needs no configuration");
-        AppState {
-            pool,
-            artifacts: builder::ArtifactStore::new(operator),
-        }
+        AppState::new(pool, builder::ArtifactStore::new(operator))
     }
 
     async fn call(request: Request<Body>) -> (StatusCode, serde_json::Value, Response<Body>) {
@@ -351,6 +432,16 @@ mod tests {
             .uri(uri)
             .body(Body::empty())
             .expect("a valid request")
+    }
+
+    fn publish_with(authorization: Option<&str>) -> Request<Body> {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(format!("/v1/apps/{}/versions", uuid::Uuid::now_v7()));
+        if let Some(value) = authorization {
+            builder = builder.header(header::AUTHORIZATION, value);
+        }
+        builder.body(Body::empty()).expect("a valid request")
     }
 
     /// Every error path is an envelope. **No bare 500, no bare 404, no dropped
@@ -379,6 +470,56 @@ mod tests {
             let code = object["code"].as_str().expect("code is a string");
             assert!(code.contains('.'), "for {uri}: {code:?} is not namespaced");
         }
+    }
+
+    /// A protected route with no valid credential is 401 — and is decided
+    /// **without touching the database**. The pool here cannot connect, so a
+    /// lookup would surface as a 5xx; getting 401 proves the malformed cases
+    /// are turned away by the format check, which is what makes a garbage
+    /// flood cheap.
+    #[tokio::test]
+    async fn a_protected_route_without_a_well_formed_token_is_401_before_any_lookup() {
+        for authorization in [
+            None,
+            Some("Basic dXNlcjpwYXNz"),
+            Some("Bearer"),
+            Some("Bearer not-a-token"),
+            Some("Bearer clwd_tok_short"),
+        ] {
+            let (status, json, response) = call(publish_with(authorization)).await;
+            assert_eq!(status, StatusCode::UNAUTHORIZED, "for {authorization:?}");
+            assert_eq!(
+                json["code"], "identity.unauthenticated",
+                "for {authorization:?}"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::WWW_AUTHENTICATE)
+                    .map(|v| v.as_bytes()),
+                Some(&b"Bearer"[..]),
+                "RFC 6750: a 401 names its scheme, for {authorization:?}"
+            );
+        }
+    }
+
+    /// **Fail closed.** A well-formed token whose lookup cannot be made is a
+    /// denial, and specifically not a 401: telling the caller their token is
+    /// bad would send them to rotate a credential that is fine.
+    #[tokio::test]
+    async fn a_database_outage_denies_and_does_not_blame_the_token() {
+        let token = format!("Bearer {}{}", crate::token::PREFIX, "0".repeat(64));
+        let (status, json, _) = call(publish_with(Some(&token))).await;
+
+        assert!(
+            status.is_server_error(),
+            "an unreachable database must deny with a 5xx, got {status}: {json}"
+        );
+        let code = json["code"].as_str().expect("an envelope");
+        assert!(
+            ["control-plane.timeout", "control-plane.internal"].contains(&code),
+            "a lookup failure is ours, not the caller's: {code}"
+        );
     }
 
     /// A timed-out request is an envelope too, not a bodyless status from the
@@ -617,5 +758,25 @@ mod tests {
         let (status, json, _) = call(get("/v1/apps/x")).await;
         assert_eq!(json["code"], "control-plane.not_found");
         assert_eq!(status.as_u16(), 404, "status() and the response must agree");
+    }
+
+    /// `render` gives a rate limit its `Retry-After`, so a client that reads
+    /// only headers still learns how long to wait.
+    #[test]
+    fn a_rate_limit_renders_retry_after() {
+        let response = render(
+            &Error::RateLimited {
+                retry_after_secs: 12,
+            },
+            &RequestId::generate(),
+        );
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .map(|v| v.as_bytes()),
+            Some(&b"12"[..])
+        );
     }
 }

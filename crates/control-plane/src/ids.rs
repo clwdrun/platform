@@ -133,6 +133,14 @@ id! {
     VersionId
 }
 
+id! {
+    /// An API token's row — never its secret.
+    ///
+    /// Safe to log, return and put in a URL: knowing it grants nothing, which
+    /// is exactly why the secret lives in a different type.
+    TokenId
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
