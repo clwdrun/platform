@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select secret_sha256 from api_tokens where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "secret_sha256",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "secret_sha256"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "df7c3df6c3f6fca870f9442b173dbe3f568886f7713ef9f799424d1cbad89a60"
+}

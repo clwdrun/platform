@@ -9,7 +9,7 @@
 //! a control plane running on several nodes has one clock its writers already
 //! agree on rather than several that drift.
 
-use crate::ids::{AppId, OrgId, UserId, VersionId};
+use crate::ids::{AppId, OrgId, TokenId, UserId, VersionId};
 use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
 
@@ -200,47 +200,177 @@ impl Claim {
 /// Propagates whatever the driver reports. A foreign-key violation cannot
 /// occur here — the `select` yields no row for an unknown app rather than
 /// offering one the constraint would reject.
+///
+/// # The org rides along too
+///
+/// `org_id` is the caller's org, from their token. An app in another org
+/// yields no row exactly as an app that does not exist does, so a token cannot
+/// learn that another org's app is real — and the check costs no extra query.
 pub async fn claim_app_version(
     ex: impl PgExecutor<'_>,
+    org_id: OrgId,
     app_id: AppId,
     digest: &str,
 ) -> sqlx::Result<Option<AppVersion>> {
     sqlx::query_as!(
         AppVersion,
         r#"insert into app_versions (id, app_id, digest)
-           select $1, id, $3 from apps where id = $2 and deleted_at is null
+           select $1, id, $3 from apps
+           where id = $2 and org_id = $4 and deleted_at is null
            on conflict (app_id, digest) do nothing
            returning id, app_id, digest, state, created_at"#,
         VersionId::new().as_uuid(),
         app_id.as_uuid(),
         digest,
+        org_id.as_uuid(),
     )
     .fetch_optional(ex)
     .await
 }
 
-/// The existing version for `(app_id, digest)`, if there is one.
+/// The existing version for `(app_id, digest)`, if there is one and the app
+/// is live and in `org_id`.
 ///
 /// Only called after [`claim_app_version`] returns nothing, to tell a conflict
-/// apart from an app that does not exist or has been deleted.
+/// apart from an app that does not exist, has been deleted, or belongs to
+/// another org.
+///
+/// **Scoped by the same predicate as the claim, deliberately.** Without it an
+/// org mismatch fails the claim and then succeeds here, and the caller is
+/// handed another org's version row — the claim's check undone by the read
+/// that follows it.
 ///
 /// # Errors
 ///
 /// Propagates whatever the driver reports.
 pub async fn app_version_by_digest(
     ex: impl PgExecutor<'_>,
+    org_id: OrgId,
     app_id: AppId,
     digest: &str,
 ) -> sqlx::Result<Option<AppVersion>> {
     sqlx::query_as!(
         AppVersion,
-        r#"select id, app_id, digest, state, created_at from app_versions
-           where app_id = $1 and digest = $2"#,
+        r#"select v.id, v.app_id, v.digest, v.state, v.created_at
+           from app_versions v
+           join apps a on a.id = v.app_id
+           where v.app_id = $1 and v.digest = $2
+             and a.org_id = $3 and a.deleted_at is null"#,
         app_id.as_uuid(),
         digest,
+        org_id.as_uuid(),
     )
     .fetch_optional(ex)
     .await
+}
+
+/// A live token, as verification sees it.
+///
+/// `scopes` is the column's names; [`crate::auth`] parses them. The secret is
+/// not here and never is: the row is found *by* its digest, so there is
+/// nothing to compare afterwards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenGrant {
+    pub id: TokenId,
+    pub org_id: OrgId,
+    pub app_id: Option<AppId>,
+    pub scopes: Vec<String>,
+}
+
+/// Records a token under its digest, if the org is live and any app binding
+/// names a live app in that org. `None` otherwise.
+///
+/// The liveness checks are folded into the insert, as the claim above does,
+/// rather than read first: a separate read would be a race with a delete.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports, including the `api_tokens`
+/// constraints if a caller skipped validating the name or the scopes.
+pub async fn insert_token(
+    ex: impl PgExecutor<'_>,
+    org_id: OrgId,
+    app_id: Option<AppId>,
+    name: &str,
+    digest: &[u8; 32],
+    scopes: &[String],
+) -> sqlx::Result<Option<TokenId>> {
+    sqlx::query_scalar!(
+        r#"insert into api_tokens (id, org_id, app_id, name, secret_sha256, scopes)
+           select $1, $2, $3, $4, $5, $6
+           where exists (select 1 from orgs where id = $2 and deleted_at is null)
+             and ($3::uuid is null or exists (
+                   select 1 from apps where id = $3 and org_id = $2 and deleted_at is null))
+           returning id as "id: TokenId""#,
+        TokenId::new().as_uuid(),
+        org_id.as_uuid(),
+        app_id.map(|app| app.as_uuid()),
+        name,
+        &digest[..],
+        scopes,
+    )
+    .fetch_optional(ex)
+    .await
+}
+
+/// The live token with this digest.
+///
+/// # One outcome for every failure
+///
+/// Unknown, revoked, belonging to a deleted org, bound to a deleted app: all
+/// `None`, from one query with one shape. There is no "found, but wrong" path
+/// to take a different amount of time or return a different error — the
+/// absent-not-denied property of `clwdrun/clwd#56`, applied to credentials.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports. The caller must treat an error as
+/// a denial, never as a pass.
+pub async fn token_by_digest(
+    ex: impl PgExecutor<'_>,
+    digest: &[u8; 32],
+) -> sqlx::Result<Option<TokenGrant>> {
+    sqlx::query_as!(
+        TokenGrant,
+        r#"select t.id, t.org_id, t.app_id as "app_id: AppId", t.scopes
+           from api_tokens t
+           where t.secret_sha256 = $1
+             and t.revoked_at is null
+             and exists (select 1 from orgs o where o.id = t.org_id and o.deleted_at is null)
+             and (t.app_id is null or exists (
+                   select 1 from apps a where a.id = t.app_id and a.deleted_at is null))"#,
+        &digest[..],
+    )
+    .fetch_optional(ex)
+    .await
+}
+
+/// Revokes a token in `org_id`, and within `app_id` when the revoker is bound
+/// to one. `true` if the token exists within that reach.
+///
+/// Revoking twice is revoking once: `coalesce` keeps the first timestamp,
+/// which is the one #30 needs, and the second call still reports success.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports.
+pub async fn revoke_token(
+    ex: impl PgExecutor<'_>,
+    id: TokenId,
+    org_id: OrgId,
+    app_id: Option<AppId>,
+) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        r#"update api_tokens set revoked_at = coalesce(revoked_at, now())
+           where id = $1 and org_id = $2 and ($3::uuid is null or app_id = $3)
+           returning id"#,
+        id.as_uuid(),
+        org_id.as_uuid(),
+        app_id.map(|app| app.as_uuid()),
+    )
+    .fetch_optional(ex)
+    .await
+    .map(|row| row.is_some())
 }
 
 /// Marks a version `ready`, which is what the caller does once the artifact is

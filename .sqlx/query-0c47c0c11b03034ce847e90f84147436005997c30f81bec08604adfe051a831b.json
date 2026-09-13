@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into app_versions (id, app_id, digest)\n           select $1, id, $3 from apps where id = $2 and deleted_at is null\n           on conflict (app_id, digest) do nothing\n           returning id, app_id, digest, state, created_at",
+  "query": "select v.id, v.app_id, v.digest, v.state, v.created_at\n           from app_versions v\n           join apps a on a.id = v.app_id\n           where v.app_id = $1 and v.digest = $2\n             and a.org_id = $3 and a.deleted_at is null",
   "describe": {
     "columns": [
       {
@@ -62,8 +62,8 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Text"
+        "Text",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -74,5 +74,5 @@
       false
     ]
   },
-  "hash": "45ab935ed9e01c6f8003a9a22f93c2ff687029d2525b97680346af9068cba99d"
+  "hash": "0c47c0c11b03034ce847e90f84147436005997c30f81bec08604adfe051a831b"
 }

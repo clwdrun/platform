@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into api_tokens (id, org_id, app_id, name, secret_sha256, scopes)\n           select $1, $2, $3, $4, $5, $6\n           where exists (select 1 from orgs where id = $2 and deleted_at is null)\n             and ($3::uuid is null or exists (\n                   select 1 from apps where id = $3 and org_id = $2 and deleted_at is null))\n           returning id as \"id: TokenId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: TokenId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Bytea",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ce43b764a73b0bd4a1316cbd50879b088579107fa612b4ae153626f886388764"
+}

@@ -1,0 +1,21 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select row_to_json(t)::text from api_tokens t",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "row_to_json",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "672d1cf324acb8de945d0252e2cee77f8d8f42b5194f4ebfc2c99bde05a19d0b"
+}

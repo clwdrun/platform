@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select t.id, t.org_id, t.app_id as \"app_id: AppId\", t.scopes\n           from api_tokens t\n           where t.secret_sha256 = $1\n             and t.revoked_at is null\n             and exists (select 1 from orgs o where o.id = t.org_id and o.deleted_at is null)\n             and (t.app_id is null or exists (\n                   select 1 from apps a where a.id = t.app_id and a.deleted_at is null))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "app_id: AppId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "app_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "scopes",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "api_tokens",
+            "name": "scopes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "0299d80212d60b3e5ec1729ddc5deb1507afaaed5eb3c518bf17d02bd9b2cfa4"
+}
