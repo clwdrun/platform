@@ -52,6 +52,7 @@ use sqlx::PgPool;
 use crate::db;
 use crate::http::{AppState, render};
 use crate::ids::{AppId, OrgId, TokenId};
+use crate::openapi::{Body, Doc, Success};
 use crate::token::{self, Scope, Scopes, TokenSecret};
 
 /// The verified caller of one request.
@@ -300,23 +301,41 @@ pub async fn issue(
     Ok(Issued { id, secret })
 }
 
-#[derive(serde::Deserialize)]
+/// A request to issue a token.
+#[derive(serde::Deserialize, serde::Serialize, utoipa::ToSchema)]
 #[serde(deny_unknown_fields)]
-struct IssueRequest {
+pub(crate) struct IssueRequest {
+    /// A label for the people deciding which token to revoke: 1 to 100 characters.
     name: String,
+    /// The scopes to grant: any of `read`, `write`, `publish`, `admin`. Each
+    /// must be held by the token making the request.
     scopes: Vec<String>,
+    /// Narrow the token to one app in the org. A token bound to an app can only
+    /// issue tokens bound to that same app.
     #[serde(default)]
+    #[schema(value_type = Option<String>, format = Uuid)]
     app_id: Option<AppId>,
 }
 
-#[derive(serde::Serialize)]
-struct IssueResponse<'a> {
+/// A newly issued token. `token` appears here and nowhere else, ever.
+#[derive(serde::Serialize, utoipa::ToSchema)]
+pub(crate) struct IssueResponse<'a> {
+    /// The token's id, for revoking it.
+    #[schema(value_type = String, format = Uuid)]
     id: TokenId,
-    /// The only time this value leaves the process.
+    /// The token itself. Shown once: only its digest is stored, so it cannot be
+    /// recovered. The only time this value leaves the process.
     token: &'a str,
+    /// The label it was issued with.
     name: &'a str,
+    /// The org it belongs to.
+    #[schema(value_type = String, format = Uuid)]
     org_id: OrgId,
+    /// The one app it is bound to, or `null` for the whole org.
+    #[schema(value_type = Option<String>, format = Uuid)]
     app_id: Option<AppId>,
+    /// The scopes it carries.
+    #[schema(value_type = Vec<String>)]
     scopes: Scopes,
 }
 
@@ -437,6 +456,73 @@ pub async fn revoke_route(
             &request_id,
         ),
         Err(e) => render(&Error::Internal { source: e.into() }, &request_id),
+    }
+}
+
+/// The documented token request: a real [`IssueRequest`], serialised.
+pub(crate) fn issue_request_example() -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(IssueRequest {
+        name: "ci".to_owned(),
+        scopes: vec!["publish".to_owned()],
+        app_id: None,
+    })
+}
+
+fn issue_response_example() -> serde_json::Result<serde_json::Value> {
+    let token = format!("{}{}", token::PREFIX, "0".repeat(64));
+    serde_json::to_value(IssueResponse {
+        id: TokenId::from(crate::openapi::EXAMPLE_TOKEN),
+        token: &token,
+        name: "ci",
+        org_id: OrgId::from(crate::openapi::EXAMPLE_ORG),
+        app_id: None,
+        scopes: [Scope::Publish].into_iter().collect(),
+    })
+}
+
+/// The documentation for `POST /v1/orgs/{org_id}/tokens`.
+pub(crate) fn issue_doc() -> Doc {
+    Doc {
+        operation_id: "issueToken",
+        summary: "Issue a token",
+        description: "Issues an API token for the org. The response carries the token itself, once: only its digest is stored, so it cannot be shown again. Sent with `Cache-Control: no-store`.\n\nA token can only issue a token no stronger than itself: every requested scope must be one it holds, and a token bound to an app can only issue tokens bound to that app.",
+        params: &[(
+            "org_id",
+            "The org to issue the token in. Must be the requesting token's org.",
+        )],
+        request: Some(Body::json::<IssueRequest>(
+            "What the token is called, what it may do, and optionally the one app it is bound to.",
+            issue_request_example,
+        )),
+        success: vec![Success {
+            status: StatusCode::CREATED,
+            description: "The token was issued. Store `token` now: it is never shown again.",
+            body: Some(Body::json::<IssueResponse<'static>>(
+                "The new token.",
+                issue_response_example,
+            )),
+        }],
+        errors: &["control-plane.invalid_request", "control-plane.not_found"],
+    }
+}
+
+/// The documentation for `DELETE /v1/tokens/{token_id}`.
+pub(crate) fn revoke_doc() -> Doc {
+    Doc {
+        operation_id: "revokeToken",
+        summary: "Revoke a token",
+        description: "Revokes a token. Effective on the token's next request: nothing caches it. Revoking a token that is already revoked succeeds.",
+        params: &[(
+            "token_id",
+            "The id returned when the token was issued. Must be in the requesting token's org, and bound to the same app if the requesting token is bound to one.",
+        )],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::NO_CONTENT,
+            description: "The token is revoked.",
+            body: None,
+        }],
+        errors: &["control-plane.not_found"],
     }
 }
 

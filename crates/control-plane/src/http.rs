@@ -63,6 +63,7 @@ use tower_http::trace::TraceLayer;
 use shared::{Envelope, Error, RequestId};
 
 use crate::auth::{self, Limiter};
+use crate::openapi::{self, Doc, Success};
 use crate::token::Scope;
 
 /// How long a request may run before it is abandoned.
@@ -179,11 +180,13 @@ pub struct Route {
     pub verb: Verb,
     pub path: &'static str,
     pub access: Access,
+    doc: Option<Doc>,
     handler: MethodRouter<AppState>,
 }
 
 impl Route {
-    fn new<H, T>(verb: Verb, path: &'static str, access: Access, handler: H) -> Self
+    /// A production route, which cannot be written without its documentation.
+    fn new<H, T>(verb: Verb, path: &'static str, access: Access, doc: Doc, handler: H) -> Self
     where
         H: Handler<T, AppState>,
         T: 'static,
@@ -192,43 +195,91 @@ impl Route {
             verb,
             path,
             access,
+            doc: Some(doc),
             handler: on(verb.filter(), handler),
         }
     }
+
+    /// A test-only route. It is never documented, and exists only under
+    /// `#[cfg(test)]`, so production cannot use it to skip documentation.
+    #[cfg(test)]
+    fn undocumented<H, T>(verb: Verb, path: &'static str, access: Access, handler: H) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        Self {
+            verb,
+            path,
+            access,
+            doc: None,
+            handler: on(verb.filter(), handler),
+        }
+    }
+
+    /// How this route is documented, or `None` for a test-only route.
+    pub(crate) fn doc(&self) -> Option<&Doc> {
+        self.doc.as_ref()
+    }
 }
 
-/// Every route this service answers.
+/// Every production route, each with its documentation.
 ///
-/// **The only way to add one.** `clippy.toml` disallows registering a route
-/// anywhere but `register`, which reads this table, so a route missing from here
-/// cannot reach the router — and the envelope probe, which walks this table,
-/// therefore walks every route there is. `#3` documents the same list.
+/// **The only place a production route can be added.** `clippy.toml` disallows
+/// registering a route anywhere but `register`, which reads [`routes`], and
+/// [`Route::new`] requires a [`Doc`] — so a route cannot reach the router
+/// without also reaching the OpenAPI document, which is built from this list.
 #[must_use]
-pub fn routes() -> Vec<Route> {
-    let table = vec![
-        Route::new(Verb::Get, "/healthz", Access::Public, healthz),
+pub fn production_routes() -> Vec<Route> {
+    vec![
+        Route::new(
+            Verb::Get,
+            "/healthz",
+            Access::Public,
+            healthz_doc(),
+            healthz,
+        ),
+        Route::new(
+            Verb::Get,
+            "/openapi.json",
+            Access::Public,
+            openapi::doc(),
+            openapi::serve,
+        ),
         Route::new(
             Verb::Post,
             "/v1/apps/{app_id}/versions",
             Access::Scoped(Scope::Publish),
+            crate::publish::doc(),
             crate::publish::publish,
         ),
         Route::new(
             Verb::Post,
             "/v1/orgs/{org_id}/tokens",
             Access::Scoped(Scope::Admin),
+            auth::issue_doc(),
             auth::issue_route,
         ),
         Route::new(
             Verb::Delete,
             "/v1/tokens/{token_id}",
             Access::Scoped(Scope::Admin),
+            auth::revoke_doc(),
             auth::revoke_route,
         ),
-    ];
+    ]
+}
 
-    // Test-only routes are in the table too, so the probe walks them and they
-    // obey the same registration rule as everything else.
+/// Every route the router serves: the production routes, plus test-only
+/// routes in a test build.
+///
+/// The envelope probe walks this, so test routes obey the same registration
+/// rule as everything else. The OpenAPI document reads [`production_routes`]
+/// instead, so it never describes a route that exists only to prove a failure.
+#[must_use]
+pub fn routes() -> Vec<Route> {
+    let table = production_routes();
+
     #[cfg(test)]
     let table = {
         let mut table = table;
@@ -243,18 +294,18 @@ pub fn routes() -> Vec<Route> {
 #[cfg(test)]
 fn test_routes() -> Vec<Route> {
     vec![
-        Route::new(
+        Route::undocumented(
             Verb::Get,
             "/v1/apps/{id}",
             Access::Public,
             placeholder_not_found,
         ),
-        Route::new(Verb::Get, "/v1/panic", Access::Public, placeholder_panic),
-        Route::new(Verb::Get, "/v1/slow", Access::Public, || async {
+        Route::undocumented(Verb::Get, "/v1/panic", Access::Public, placeholder_panic),
+        Route::undocumented(Verb::Get, "/v1/slow", Access::Public, || async {
             tokio::time::sleep(Duration::from_secs(30)).await;
             "unreachable"
         }),
-        Route::new(
+        Route::undocumented(
             Verb::Post,
             "/v1/body",
             Access::Public,
@@ -262,7 +313,7 @@ fn test_routes() -> Vec<Route> {
         ),
         // The envelope probe's planted counter-example: a handler, not a layer,
         // returning a bare error. Without conversion the probe must find it.
-        Route::new(Verb::Get, "/v1/bare", Access::Public, || async {
+        Route::undocumented(Verb::Get, "/v1/bare", Access::Public, || async {
             (StatusCode::BAD_REQUEST, "a planted bare response")
         }),
     ]
@@ -583,6 +634,24 @@ fn on_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+fn healthz_doc() -> Doc {
+    Doc {
+        operation_id: "health",
+        summary: "Liveness",
+        description: "Answers `ok` while the process is serving requests. For load balancers: it checks nothing downstream.",
+        params: &[],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::OK,
+            description: "The process is serving requests.",
+            body: Some(openapi::Body::text("The literal text `ok`.", || {
+                Ok("ok".into())
+            })),
+        }],
+        errors: &[],
+    }
 }
 
 /// A route that fails, so the envelope has a normal failure to travel through.

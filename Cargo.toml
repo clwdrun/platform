@@ -52,7 +52,11 @@ tower-http = { version = "0.7.0", features = [
   "set-header",
 ] }
 tower = "0.5"
-utoipa = "5"
+# The OpenAPI document (#3) is built with utoipa's builders from the route
+# table, not from `#[utoipa::path]` annotations — an annotation would be a
+# second description of a route. `uuid` and `chrono` give the id and timestamp
+# fields their formats.
+utoipa = { version = "5.5.0", features = ["uuid", "chrono"] }
 apalis = "0.7.4"
 # Identifiers are UUIDv7, minted by the application — see migrations/.
 uuid = { version = "1.26.0", features = ["v7", "serde"] }

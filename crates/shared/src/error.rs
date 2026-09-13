@@ -15,8 +15,11 @@
 //! comparing two serialisations of the same struct proves only that `serde` is
 //! deterministic.
 //!
-//! `hint` is always present and may be `null`. It is never omitted: a consumer
-//! indexes the key unconditionally.
+//! `hint` is always present and never omitted: a consumer indexes the key
+//! unconditionally. Every code this crate emits carries one — a null hint is a
+//! dead end for the caller least able to work out what to do — but the field
+//! stays nullable in the shape, so a consumer written against the CLI's
+//! envelope keeps working.
 //!
 //! # The prefix names the subsystem that decided
 //!
@@ -74,7 +77,8 @@ macro_rules! define_error {
         owned {
             $(
                 $(#[$attr:meta])*
-                $variant:ident { $($field:tt)* } => $code:literal, $status:expr, $retry:literal, $hint:expr;
+                $variant:ident { $($field:tt)* } => $code:literal, $status:expr, $retry:literal,
+                    meaning: $meaning:literal, hint: $hint:literal;
             )*
         }
     ) => {
@@ -127,8 +131,11 @@ macro_rules! define_error {
                 }
             }
 
-            /// A short, actionable next step, or `None`.
-            pub fn hint(&self) -> Option<&'static str> {
+            /// What to do about it: a short, actionable next step.
+            ///
+            /// Never absent. `meaning` and `hint` are required literals in the
+            /// invocation, so a code cannot ship without either.
+            pub fn hint(&self) -> &'static str {
                 match self {
                     // `clwd_bundle::Error` has `code()` and `retryable()` but no
                     // `hint()`, so there is nothing to forward. This points at
@@ -138,8 +145,16 @@ macro_rules! define_error {
                     // That is papering over an absence, not a design: the text
                     // belongs with the crate that owns the code, and
                     // `clwdrun/clwd#63` is the fix.
-                    $( Self::$dvariant { .. } => Some(DELEGATED_HINT), )*
+                    $( Self::$dvariant { .. } => DELEGATED_HINT, )*
                     $( Self::$variant { .. } => $hint, )*
+                }
+            }
+
+            /// What the failure means, in a sentence a caller can act on.
+            pub fn meaning(&self) -> &'static str {
+                match self {
+                    $( Self::$dvariant { .. } => DELEGATED_MEANING, )*
+                    $( Self::$variant { .. } => $meaning, )*
                 }
             }
         }
@@ -151,14 +166,20 @@ macro_rules! define_error {
         /// that defines them and are catalogued there.
         pub const OWNED_CODES: &[&str] = &[$($code),*];
 
-        /// Every owned code with its declared status and whether it is
-        /// retryable, generated from the same input as the enum.
+        /// Every owned code with its status, retryability, meaning and hint,
+        /// generated from the same input as the enum.
         ///
-        /// Public because two consumers need the code-to-status mapping without
-        /// constructing an error: the envelope probe, which asserts that every
-        /// response's status is the one its code declares, and the OpenAPI
-        /// document (#3), which publishes the table.
-        pub const OWNED_STATUSES: &[(&str, u16, bool)] = &[$(($code, $status, $retry)),*];
+        /// Public because two consumers need the table without constructing an
+        /// error: the envelope probe, which asserts every response's status is
+        /// the one its code declares, and the OpenAPI document (#3), which
+        /// publishes it.
+        pub const CATALOGUE: &[Code] = &[$(Code {
+            code: $code,
+            status: $status,
+            retryable: $retry,
+            meaning: $meaning,
+            hint: $hint,
+        }),*];
     };
 }
 
@@ -166,8 +187,28 @@ macro_rules! define_error {
 ///
 /// A real next step rather than a null. The table it points at is generated from
 /// the code, so this cannot drift from it the way a restatement would.
-const DELEGATED_HINT: &str =
+pub const DELEGATED_HINT: &str =
     "see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover";
+
+/// What a delegated `bundle.*` error means, in place of per-code text this crate
+/// cannot see — `clwd_bundle` does not expose its codes or their meanings yet.
+pub const DELEGATED_MEANING: &str = "The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect.";
+
+/// One owned code, as the catalogue publishes it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Code {
+    /// The stable `<component>.<condition>` identifier a caller branches on.
+    pub code: &'static str,
+    /// The HTTP status it is reported with.
+    pub status: u16,
+    /// Whether retrying the same request unchanged could succeed.
+    pub retryable: bool,
+    /// What the failure means.
+    pub meaning: &'static str,
+    /// What to do about it.
+    pub hint: &'static str,
+}
 
 define_error! {
     delegating {
@@ -186,7 +227,8 @@ define_error! {
         /// A request body or parameter the API would not accept.
         #[error("invalid request: {what}")]
         InvalidRequest { what: String } => "control-plane.invalid_request", 400, false,
-            Some("check the request against the OpenAPI schema at /openapi.json");
+            meaning: "A request body or parameter was not acceptable. The message says which part and why.",
+            hint: "check the request against the OpenAPI schema at /openapi.json";
 
         /// A request body larger than the endpoint accepts.
         ///
@@ -196,7 +238,8 @@ define_error! {
         /// learns it from the response rather than from documentation.
         #[error("{what}")]
         PayloadTooLarge { what: String } => "control-plane.payload_too_large", 413, false,
-            Some("reduce the upload below the stated limit");
+            meaning: "The request body is larger than this endpoint accepts. The message states the limit.",
+            hint: "reduce the upload below the stated limit";
 
         /// The path exists, but not for this method.
         ///
@@ -205,7 +248,8 @@ define_error! {
         /// header, which HTTP requires on a 405 and the router already sets.
         #[error("method not allowed on this path")]
         MethodNotAllowed {} => "control-plane.method_not_allowed", 405, false,
-            Some("use one of the methods named in the Allow header");
+            meaning: "The path exists, but not for this HTTP method.",
+            hint: "use one of the methods named in the Allow header";
 
         /// The request carries no valid credential.
         ///
@@ -220,7 +264,8 @@ define_error! {
         /// `identity` (#9) and the gateway (#11) later.
         #[error("authentication required")]
         Unauthenticated {} => "identity.unauthenticated", 401, false,
-            Some("supply a valid, unrevoked API token as `Authorization: Bearer <token>`");
+            meaning: "The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable.",
+            hint: "supply a valid, unrevoked API token as `Authorization: Bearer <token>`";
 
         /// The credential is valid but lacks the scope this route needs.
         ///
@@ -229,20 +274,24 @@ define_error! {
         /// 403 there would confirm the resource exists.
         #[error("not permitted: {what}")]
         Forbidden { what: String } => "identity.forbidden", 403, false,
-            Some("use a token that carries the scope named in the message");
+            meaning: "The token is valid, but lacks the scope this operation requires. The message names the scope.",
+            hint: "use a token that carries the scope named in the message";
 
         /// A named resource does not exist, or the caller may not see it.
         ///
         /// Deliberately does not distinguish the two. Telling an unauthorised
         /// caller that a thing exists is an enumeration oracle.
         #[error("not found: {what}")]
-        NotFound { what: String } => "control-plane.not_found", 404, false, None;
+        NotFound { what: String } => "control-plane.not_found", 404, false,
+            meaning: "The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable.",
+            hint: "check the identifier, and that the token's org, and its app if it is bound to one, cover this resource";
 
         /// The request conflicts with the current state — a slug already taken,
         /// a version already published under a different digest.
         #[error("conflict: {what}")]
         Conflict { what: String } => "control-plane.conflict", 409, false,
-            Some("re-read the resource and retry with the current state");
+            meaning: "The request conflicts with the resource's current state.",
+            hint: "re-read the resource and retry with the current state";
 
         /// A stored artifact could not be decoded.
         ///
@@ -253,7 +302,8 @@ define_error! {
         /// would file a real incident under client errors where nobody looks.
         #[error("stored artifact {digest} could not be read")]
         ArtifactCorrupt { digest: String } => "control-plane.artifact_corrupt", 500, false,
-            Some("this is a server-side integrity failure; the artifact must be rebuilt and republished");
+            meaning: "A stored artifact could not be decoded. This is a server-side integrity failure, not a problem with the request.",
+            hint: "this is a server-side integrity failure; the artifact must be rebuilt and republished";
 
         /// A dependency did not answer in time.
         ///
@@ -262,7 +312,8 @@ define_error! {
         /// when it is wired wrong.
         #[error("timed out talking to {dependency}")]
         Timeout { dependency: String } => "control-plane.timeout", 504, true,
-            Some("retry; if it persists the dependency is down rather than slow");
+            meaning: "The request exceeded its time budget, or a dependency did not answer in time.",
+            hint: "retry; if it persists the dependency is down rather than slow";
 
         /// This token has used its request budget.
         ///
@@ -273,7 +324,8 @@ define_error! {
         /// `Retry-After`.
         #[error("rate limit exceeded; retry in {retry_after_secs}s")]
         RateLimited { retry_after_secs: u64 } => "control-plane.rate_limited", 429, true,
-            Some("retry after the number of seconds in the Retry-After header");
+            meaning: "This token has used its request budget. The message and the Retry-After header say how long to wait.",
+            hint: "retry after the number of seconds in the Retry-After header";
 
         /// Last resort only, never where a specific variant fits.
         #[error("internal error")]
@@ -281,7 +333,8 @@ define_error! {
             #[source]
             source: anyhow::Error,
         } => "control-plane.internal", 500, false,
-            Some("this is a defect; report it with the request id");
+            meaning: "An unexpected failure inside the service.",
+            hint: "this is a defect; report it with the request id";
     }
 }
 
@@ -355,7 +408,7 @@ impl<'a> Envelope<'a> {
         Self {
             code: error.code(),
             message: error.to_string(),
-            hint: error.hint(),
+            hint: Some(error.hint()),
             retryable: error.retryable(),
             request_id: request_id.as_str(),
         }
@@ -368,32 +421,63 @@ impl From<clwd_bundle::Error> for Error {
     }
 }
 
+/// One realistic instance of every owned code, in declaration order.
+///
+/// These are what the OpenAPI document shows as each code's example, serialised
+/// through [`Envelope`] exactly as the wire carries them, and what the tests use
+/// to prove the catalogue and the enum agree. A variant missing here fails
+/// `owned_codes_are_exhaustive_over_variants`.
+#[must_use]
+pub fn owned_samples() -> Vec<Error> {
+    vec![
+        Error::InvalidRequest {
+            what: "token request: missing field `name` at line 1 column 25".into(),
+        },
+        Error::PayloadTooLarge {
+            what: format!(
+                "request body exceeds the {} byte limit",
+                crate::MAX_BUNDLE_BYTES
+            ),
+        },
+        Error::MethodNotAllowed {},
+        Error::Unauthenticated {},
+        Error::Forbidden {
+            what: "this route needs the `publish` scope".into(),
+        },
+        Error::NotFound {
+            what: "app 0198f0c1-8b3e-7000-8000-0000000000a2".into(),
+        },
+        Error::Conflict {
+            what: "slug acme is already taken".into(),
+        },
+        Error::ArtifactCorrupt {
+            digest: format!("blake3:{}", "5f".repeat(32)),
+        },
+        Error::Timeout {
+            dependency: "the database".into(),
+        },
+        Error::RateLimited {
+            retry_after_secs: 3,
+        },
+        Error::Internal {
+            source: anyhow::anyhow!("an unexpected failure"),
+        },
+    ]
+}
+
+/// One realistic delegated error: a bundle whose member does not match its
+/// recorded digest. Shown as the example for the `bundle.*` family.
+#[must_use]
+pub fn bundle_sample() -> Error {
+    Error::from(clwd_bundle::Error::MemberDigestMismatch {
+        path: "app.wasm".into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
-
-    fn owned_samples() -> Vec<Error> {
-        vec![
-            Error::InvalidRequest { what: "x".into() },
-            Error::PayloadTooLarge { what: "x".into() },
-            Error::MethodNotAllowed {},
-            Error::Unauthenticated {},
-            Error::Forbidden { what: "x".into() },
-            Error::NotFound { what: "x".into() },
-            Error::Conflict { what: "x".into() },
-            Error::ArtifactCorrupt { digest: "x".into() },
-            Error::Timeout {
-                dependency: "x".into(),
-            },
-            Error::RateLimited {
-                retry_after_secs: 1,
-            },
-            Error::Internal {
-                source: anyhow::anyhow!("x"),
-            },
-        ]
-    }
 
     /// The namespaces this crate may declare codes in.
     ///
@@ -424,6 +508,40 @@ mod tests {
         assert_eq!(err.status(), 429);
         assert!(err.retryable());
         assert!(err.to_string().contains('7'), "the wait is in the message");
+    }
+
+    /// Every code carries real text in both fields, and they say different
+    /// things: what happened, and what to do.
+    #[test]
+    fn every_code_has_a_meaning_and_a_hint() {
+        for entry in CATALOGUE {
+            assert!(
+                entry.meaning.len() > 20,
+                "{} has no real meaning",
+                entry.code
+            );
+            assert!(entry.hint.len() > 10, "{} has no real hint", entry.code);
+            assert_ne!(
+                entry.meaning, entry.hint,
+                "{}: one text for two purposes",
+                entry.code
+            );
+        }
+        for sample in owned_samples() {
+            let entry = CATALOGUE.iter().find(|e| e.code == sample.code());
+            assert_eq!(
+                entry.map(|e| e.hint),
+                Some(sample.hint()),
+                "{}",
+                sample.code()
+            );
+            assert_eq!(
+                entry.map(|e| e.meaning),
+                Some(sample.meaning()),
+                "{}",
+                sample.code()
+            );
+        }
     }
 
     #[test]
@@ -463,9 +581,9 @@ mod tests {
     /// The status table, enforced rather than documented.
     #[test]
     fn every_owned_code_has_a_sane_status() {
-        for (code, status, _) in OWNED_STATUSES {
+        for &Code { code, status, .. } in CATALOGUE {
             assert!(
-                (400..=599).contains(status),
+                (400..=599).contains(&status),
                 "{code} maps to {status}, which is not an error status"
             );
         }
@@ -476,11 +594,12 @@ mod tests {
     #[test]
     fn status_matches_the_declared_table() {
         for err in owned_samples() {
-            let (_, declared, _) = OWNED_STATUSES
+            let declared = CATALOGUE
                 .iter()
-                .find(|(c, _, _)| *c == err.code())
-                .unwrap_or_else(|| panic!("{} is not in the status table", err.code()));
-            assert_eq!(err.status(), *declared, "for {}", err.code());
+                .find(|entry| entry.code == err.code())
+                .map(|entry| entry.status)
+                .unwrap_or_else(|| panic!("{} is not in the catalogue", err.code()));
+            assert_eq!(err.status(), declared, "for {}", err.code());
         }
     }
 
@@ -513,7 +632,7 @@ mod tests {
         assert_eq!(err.code(), "bundle.member_digest_mismatch");
         assert_eq!(err.status(), 400);
         assert!(!err.retryable(), "a malformed bundle stays malformed");
-        assert_eq!(err.hint(), Some(DELEGATED_HINT));
+        assert_eq!(err.hint(), DELEGATED_HINT);
     }
 
     /// Reading a *stored* artifact that will not decode is our failure, not the
@@ -542,7 +661,7 @@ mod tests {
 
         assert_eq!(
             json,
-            r#"{"code":"control-plane.not_found","message":"not found: app dashboard","hint":null,"retryable":false,"request_id":"req-42"}"#
+            r#"{"code":"control-plane.not_found","message":"not found: app dashboard","hint":"check the identifier, and that the token's org, and its app if it is bound to one, cover this resource","retryable":false,"request_id":"req-42"}"#
         );
     }
 
@@ -550,10 +669,17 @@ mod tests {
     /// unconditionally.
     #[test]
     fn a_none_hint_serializes_as_null_rather_than_being_dropped() {
-        let err = Error::NotFound { what: "x".into() };
-        let id = RequestId::sanitize("r").expect("well formed");
-        let value: serde_json::Value =
-            serde_json::to_value(Envelope::new(&err, &id)).expect("serializes");
+        // No code this crate emits has a null hint any more, so the shape is
+        // exercised directly: the field stays nullable for consumers of the
+        // CLI's envelope, and `null` must still be present rather than dropped.
+        let value: serde_json::Value = serde_json::to_value(Envelope {
+            code: "cli.not_found",
+            message: "x".into(),
+            hint: None,
+            retryable: false,
+            request_id: "r",
+        })
+        .expect("serializes");
         let object = value.as_object().expect("an object");
 
         assert!(object.contains_key("hint"), "the key must be present");

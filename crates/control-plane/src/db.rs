@@ -54,12 +54,23 @@ pub struct App {
 /// The row is written `pending` before the artifact is stored and marked
 /// `ready` after — see the migration for why that ordering is the one that
 /// makes a crash mid-publish visible instead of leaving an orphan artifact.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, utoipa::ToSchema)]
 pub struct AppVersion {
+    /// The version's id.
+    #[schema(value_type = String, format = Uuid)]
     pub id: VersionId,
+    /// The app it is a version of.
+    #[schema(value_type = String, format = Uuid)]
     pub app_id: AppId,
+    /// The bundle's content address: `blake3:` and 64 lowercase hex characters.
+    /// The same bytes always have the same digest, which is what makes
+    /// publishing idempotent.
+    #[schema(pattern = "^blake3:[0-9a-f]{64}$")]
     pub digest: String,
+    /// `pending` while the artifact is being stored, `ready` once it is. A
+    /// successful publish always returns `ready`.
     pub state: String,
+    /// When the version was first published.
     pub created_at: DateTime<Utc>,
 }
 

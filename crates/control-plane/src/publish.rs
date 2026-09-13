@@ -39,7 +39,8 @@ use shared::{Error, RequestId};
 use crate::auth::Principal;
 use crate::db::{self, AppVersion};
 use crate::http::{AppState, render};
-use crate::ids::AppId;
+use crate::ids::{AppId, VersionId};
+use crate::openapi::{Body, Doc, EXAMPLE_APP, EXAMPLE_VERSION, Success};
 
 /// What a publish did, and the status it reports.
 ///
@@ -87,6 +88,52 @@ impl IntoResponse for Published {
         // No `created: bool` in the body. The status already carries it, and
         // two encodings of one fact eventually disagree.
         (self.status(), axum::Json(self.version().clone())).into_response()
+    }
+}
+
+fn version_example() -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(AppVersion {
+        id: VersionId::from(EXAMPLE_VERSION),
+        app_id: AppId::from(EXAMPLE_APP),
+        digest: format!("blake3:{}", "5f".repeat(32)),
+        state: "ready".to_owned(),
+        created_at: chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::seconds(1_757_764_800),
+    })
+}
+
+/// The documentation for `POST /v1/apps/{app_id}/versions`.
+pub(crate) fn doc() -> Doc {
+    Doc {
+        operation_id: "publishVersion",
+        summary: "Publish a version of an app",
+        description: "Uploads a bundle and records it as a version of the app, addressed by the digest of its contents.\n\nIdempotent: publishing the same bytes again returns the existing version with 200 rather than creating a second, so a retry after a timeout or a dropped connection is always safe.",
+        params: &[(
+            "app_id",
+            "The app to publish to. Must be in the token's org, and be the token's app if the token is bound to one; otherwise the answer is the same 404 as an app that does not exist.",
+        )],
+        request: Some(Body::binary(
+            "application/octet-stream",
+            "The bundle file itself, raw: the `.clwd` file that `clwd build` writes. For example, `curl --data-binary @app.clwd -H 'Content-Type: application/octet-stream' -H \"Authorization: Bearer $TOKEN\" https://…/v1/apps/$APP_ID/versions`. A malformed bundle is rejected before anything is stored, with a `bundle.*` code naming the defect.",
+        )),
+        success: vec![
+            Success {
+                status: StatusCode::CREATED,
+                description: "This request published the version.",
+                body: Some(Body::json::<AppVersion>(
+                    "The version, ready to deploy.",
+                    version_example,
+                )),
+            },
+            Success {
+                status: StatusCode::OK,
+                description: "These bytes were already published: this is the existing version. Not an error.",
+                body: Some(Body::json::<AppVersion>(
+                    "The existing version.",
+                    version_example,
+                )),
+            },
+        ],
+        errors: &[crate::openapi::BUNDLE_CODES, "control-plane.not_found"],
     }
 }
 
