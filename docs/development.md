@@ -132,6 +132,25 @@ make it fail there:
   reported from the same command. **Knowing the pattern does not protect you from it.
   Only looking does**, which is why this is a rule to apply rather than a fact to recall.
 
+- **A mutation that did not rebuild proved nothing.** Proving a guard by breaking it
+  (above) has a failure mode of its own: restoring the file from a backup copy can
+  restore an *older* modification time, older than the build that compiled the mutant.
+  Cargo decides what to rebuild by mtime, so it skips the rebuild and the next check
+  runs the previous mutant. In #4 one control failed — for the previous mutation's
+  reason — and read as caught. The procedure looked like it ran and did not: the
+  count-not-colour failure, applied to mutation checks. So, for every mutation:
+
+  - `touch` the file after restoring it, so the next build sees a change;
+  - assert the check failed **for this mutation's reason** — match the failure message,
+    not just a non-zero exit, which a stale binary or a compile error also produces;
+  - hash the working tree before and after the run, and require them to match.
+
+  The message check also cuts the other way: a check that fails on an earlier assertion
+  than expected is still caught, and should be recorded as caught, not missed. And a
+  mutation that passes is information too — in #4, removing a placeholder route changed
+  nothing because the fallback returned the same code, which showed the route was
+  redundant rather than that coverage was lost.
+
 - **A cancelled run is not a result.** GitHub's `concurrency` group kills an in-progress
   run when the branch is pushed again, so every commit but the last has CI that ends
   `cancelled` — neither green nor red. The danger is that a dead run still emits a
