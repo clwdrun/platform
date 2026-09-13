@@ -1,0 +1,22 @@
+# Load-bearing, not style.
+#
+# Every method that can put a route (or a fallback) into an axum router is
+# disallowed here, so the route table in `crates/control-plane/src/http.rs` is
+# the only way into the router. That is what lets the envelope probe claim it
+# walked *every* route: a route registered anywhere else fails
+# `clippy -D warnings`, and so fails `just check` and CI.
+#
+# It fails the gate, not rustc — `cargo build` alone still compiles an
+# untabled route. The single sanctioned call site carries `#[expect]` with the
+# reason. A test asserts these entries are still here, because deleting one is
+# the way to defeat the mechanism quietly.
+disallowed-methods = [
+  { path = "axum::routing::Router::route", reason = "add routes to `http::routes()`, the table the envelope probe walks" },
+  { path = "axum::routing::Router::route_service", reason = "add routes to `http::routes()`, the table the envelope probe walks" },
+  { path = "axum::routing::Router::nest", reason = "add routes to `http::routes()`, the table the envelope probe walks" },
+  { path = "axum::routing::Router::nest_service", reason = "add routes to `http::routes()`, the table the envelope probe walks" },
+  { path = "axum::routing::Router::merge", reason = "add routes to `http::routes()`, the table the envelope probe walks" },
+  { path = "axum::routing::Router::fallback", reason = "the fallback is registered once, in `http::register`" },
+  { path = "axum::routing::Router::fallback_service", reason = "the fallback is registered once, in `http::register`" },
+  { path = "axum::routing::Router::method_not_allowed_fallback", reason = "405s are rendered by the envelope layer, not a second fallback" },
+]

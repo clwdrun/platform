@@ -151,10 +151,14 @@ macro_rules! define_error {
         /// that defines them and are catalogued there.
         pub const OWNED_CODES: &[&str] = &[$($code),*];
 
-        /// One sample per owned variant, for the exhaustiveness test. Generated,
-        /// so a variant cannot be added and forgotten.
-        #[cfg(test)]
-        const OWNED_STATUSES: &[(&str, u16, bool)] = &[$(($code, $status, $retry)),*];
+        /// Every owned code with its declared status and whether it is
+        /// retryable, generated from the same input as the enum.
+        ///
+        /// Public because two consumers need the code-to-status mapping without
+        /// constructing an error: the envelope probe, which asserts that every
+        /// response's status is the one its code declares, and the OpenAPI
+        /// document (#3), which publishes the table.
+        pub const OWNED_STATUSES: &[(&str, u16, bool)] = &[$(($code, $status, $retry)),*];
     };
 }
 
@@ -193,6 +197,15 @@ define_error! {
         #[error("{what}")]
         PayloadTooLarge { what: String } => "control-plane.payload_too_large", 413, false,
             Some("reduce the upload below the stated limit");
+
+        /// The path exists, but not for this method.
+        ///
+        /// Not retryable: a `DELETE` sent to a `POST`-only route gets this answer
+        /// forever. The methods that would work are in the response's `Allow`
+        /// header, which HTTP requires on a 405 and the router already sets.
+        #[error("method not allowed on this path")]
+        MethodNotAllowed {} => "control-plane.method_not_allowed", 405, false,
+            Some("use one of the methods named in the Allow header");
 
         /// The request carries no valid credential.
         ///
@@ -364,6 +377,7 @@ mod tests {
         vec![
             Error::InvalidRequest { what: "x".into() },
             Error::PayloadTooLarge { what: "x".into() },
+            Error::MethodNotAllowed {},
             Error::Unauthenticated {},
             Error::Forbidden { what: "x".into() },
             Error::NotFound { what: "x".into() },
