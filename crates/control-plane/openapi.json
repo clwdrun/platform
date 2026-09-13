@@ -1,0 +1,1219 @@
+{
+  "components": {
+    "schemas": {
+      "AppVersion": {
+        "description": "A published version of an app, addressed by the digest of its bundle.\n\nThe row is written `pending` before the artifact is stored and marked\n`ready` after — see the migration for why that ordering is the one that\nmakes a crash mid-publish visible instead of leaving an orphan artifact.",
+        "properties": {
+          "app_id": {
+            "description": "The app it is a version of.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "created_at": {
+            "description": "When the version was first published.",
+            "format": "date-time",
+            "type": "string"
+          },
+          "digest": {
+            "description": "The bundle's content address: `blake3:` and 64 lowercase hex characters.\nThe same bytes always have the same digest, which is what makes\npublishing idempotent.",
+            "pattern": "^blake3:[0-9a-f]{64}$",
+            "type": "string"
+          },
+          "id": {
+            "description": "The version's id.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "state": {
+            "description": "`pending` while the artifact is being stored, `ready` once it is. A\nsuccessful publish always returns `ready`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "app_id",
+          "digest",
+          "state",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "Envelope": {
+        "additionalProperties": false,
+        "description": "Every 4xx and 5xx response carries this body. Branch on `code`; `message` is for people.",
+        "properties": {
+          "code": {
+            "description": "A stable `<component>.<condition>` identifier.",
+            "type": "string"
+          },
+          "hint": {
+            "description": "What to do about it.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "message": {
+            "description": "A human-readable account of this occurrence.",
+            "type": "string"
+          },
+          "request_id": {
+            "description": "Correlates this response with server logs. Also sent as `x-request-id`.",
+            "type": "string"
+          },
+          "retryable": {
+            "description": "Whether the same request, unchanged, could succeed later.",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "message",
+          "hint",
+          "retryable",
+          "request_id"
+        ],
+        "type": "object"
+      },
+      "IssueRequest": {
+        "additionalProperties": false,
+        "description": "A request to issue a token.",
+        "properties": {
+          "app_id": {
+            "description": "Narrow the token to one app in the org. A token bound to an app can only\nissue tokens bound to that same app.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "description": "A label for the people deciding which token to revoke: 1 to 100 characters.",
+            "type": "string"
+          },
+          "scopes": {
+            "description": "The scopes to grant: any of `read`, `write`, `publish`, `admin`. Each\nmust be held by the token making the request.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "name",
+          "scopes"
+        ],
+        "type": "object"
+      },
+      "IssueResponse": {
+        "description": "A newly issued token. `token` appears here and nowhere else, ever.",
+        "properties": {
+          "app_id": {
+            "description": "The one app it is bound to, or `null` for the whole org.",
+            "format": "uuid",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "description": "The token's id, for revoking it.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "name": {
+            "description": "The label it was issued with.",
+            "type": "string"
+          },
+          "org_id": {
+            "description": "The org it belongs to.",
+            "format": "uuid",
+            "type": "string"
+          },
+          "scopes": {
+            "description": "The scopes it carries.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "token": {
+            "description": "The token itself. Shown once: only its digest is stored, so it cannot be\nrecovered. The only time this value leaves the process.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "token",
+          "name",
+          "org_id",
+          "scopes"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "bearerAuth": {
+        "bearerFormat": "clwd_tok_",
+        "description": "A token looks like `clwd_tok_` followed by 64 lowercase hex characters, and is sent as `Authorization: Bearer <token>`. Each operation names the one scope its token must carry; scopes are independent, so `admin` does not imply `publish`.\n\nTokens are issued by `POST /v1/orgs/{org_id}/tokens`, which itself needs an `admin` token. Until sign-in exists, an org's first token is created by an operator with database access (`control-plane bootstrap-token`): there is no way to obtain a first token through this API.",
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "description": "The control plane API. Every operation lists the scope it needs and every error it can return, with what each error means and what to do about it.\n\n## Authentication\n\nA token looks like `clwd_tok_` followed by 64 lowercase hex characters, and is sent as `Authorization: Bearer <token>`. Each operation names the one scope its token must carry; scopes are independent, so `admin` does not imply `publish`.\n\nTokens are issued by `POST /v1/orgs/{org_id}/tokens`, which itself needs an `admin` token. Until sign-in exists, an org's first token is created by an operator with database access (`control-plane bootstrap-token`): there is no way to obtain a first token through this API.\n\n## Errors\n\nEvery 4xx and 5xx response carries the `Envelope` body. Branch on `code`, which is stable; `retryable` says whether the same request could succeed later.\n\n| Code | Status | Retryable | Meaning | What to do |\n|---|---|---|---|---|\n| `control-plane.invalid_request` | 400 | no | A request body or parameter was not acceptable. The message says which part and why. | check the request against the OpenAPI schema at /openapi.json |\n| `control-plane.payload_too_large` | 413 | no | The request body is larger than this endpoint accepts. The message states the limit. | reduce the upload below the stated limit |\n| `control-plane.method_not_allowed` | 405 | no | The path exists, but not for this HTTP method. | use one of the methods named in the Allow header |\n| `identity.unauthenticated` | 401 | no | The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. | supply a valid, unrevoked API token as `Authorization: Bearer <token>` |\n| `identity.forbidden` | 403 | no | The token is valid, but lacks the scope this operation requires. The message names the scope. | use a token that carries the scope named in the message |\n| `control-plane.not_found` | 404 | no | The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. | check the identifier, and that the token's org, and its app if it is bound to one, cover this resource |\n| `control-plane.conflict` | 409 | no | The request conflicts with the resource's current state. | re-read the resource and retry with the current state |\n| `control-plane.artifact_corrupt` | 500 | no | A stored artifact could not be decoded. This is a server-side integrity failure, not a problem with the request. | this is a server-side integrity failure; the artifact must be rebuilt and republished |\n| `control-plane.timeout` | 504 | yes | The request exceeded its time budget, or a dependency did not answer in time. | retry; if it persists the dependency is down rather than slow |\n| `control-plane.rate_limited` | 429 | yes | This token has used its request budget. The message and the Retry-After header say how long to wait. | retry after the number of seconds in the Retry-After header |\n| `control-plane.internal` | 500 | no | An unexpected failure inside the service. | this is a defect; report it with the request id |\n| `bundle.*` | 400 | per code | The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. | See the bundle format's code table: https://github.com/clwdrun/clwd/blob/main/docs/error-codes.md |\n\nNo operation produces `control-plane.conflict` or `control-plane.artifact_corrupt` today; they are listed so the catalogue is complete.\n",
+    "title": "clwd platform API",
+    "version": "0.1.0"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/healthz": {
+      "get": {
+        "description": "Answers `ok` while the process is serving requests. For load balancers: it checks nothing downstream.\n\n**Authentication:** none.",
+        "operationId": "health",
+        "responses": {
+          "200": {
+            "content": {
+              "text/plain": {
+                "example": "ok",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The process is serving requests."
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [],
+        "summary": "Liveness"
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "description": "The OpenAPI document describing every operation, the scope each needs, and every error each can return. Public, so a caller can learn how to authenticate before it holds a token.\n\n**Authentication:** none.",
+        "operationId": "getOpenApiDocument",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "This document."
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [],
+        "summary": "This document"
+      }
+    },
+    "/v1/apps/{app_id}/versions": {
+      "post": {
+        "description": "Uploads a bundle and records it as a version of the app, addressed by the digest of its contents.\n\nIdempotent: publishing the same bytes again returns the existing version with 200 rather than creating a second, so a retry after a timeout or a dropped connection is always safe.\n\n**Authentication:** a bearer token carrying the `publish` scope.",
+        "operationId": "publishVersion",
+        "parameters": [
+          {
+            "description": "The app to publish to. Must be in the token's org, and be the token's app if the token is bound to one; otherwise the answer is the same 404 as an app that does not exist.",
+            "in": "path",
+            "name": "app_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "contentMediaType": "application/octet-stream",
+                "type": "string"
+              }
+            }
+          },
+          "description": "The bundle file itself, raw: the `.clwd` file that `clwd build` writes. For example, `curl --data-binary @app.clwd -H 'Content-Type: application/octet-stream' -H \"Authorization: Bearer $TOKEN\" https://…/v1/apps/$APP_ID/versions`. A malformed bundle is rejected before anything is stored, with a `bundle.*` code naming the defect.",
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "app_id": "0198f0c1-8b3e-7000-8000-0000000000a2",
+                  "created_at": "2025-09-13T12:00:00Z",
+                  "digest": "blake3:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+                  "id": "0198f0c1-8b3e-7000-8000-0000000000a3",
+                  "state": "ready"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersion"
+                }
+              }
+            },
+            "description": "These bytes were already published: this is the existing version. Not an error."
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "app_id": "0198f0c1-8b3e-7000-8000-0000000000a2",
+                  "created_at": "2025-09-13T12:00:00Z",
+                  "digest": "blake3:5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f5f",
+                  "id": "0198f0c1-8b3e-7000-8000-0000000000a3",
+                  "state": "ready"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/AppVersion"
+                }
+              }
+            },
+            "description": "This request published the version."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "bundle.*": {
+                    "description": "The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. What to do: see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover",
+                    "summary": "bundle.*",
+                    "value": {
+                      "code": "bundle.member_digest_mismatch",
+                      "hint": "see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover",
+                      "message": "member \"app.wasm\" does not match its declared digest",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  },
+                  "control-plane.invalid_request": {
+                    "description": "A request body or parameter was not acceptable. The message says which part and why. What to do: check the request against the OpenAPI schema at /openapi.json",
+                    "summary": "control-plane.invalid_request",
+                    "value": {
+                      "code": "control-plane.invalid_request",
+                      "hint": "check the request against the OpenAPI schema at /openapi.json",
+                      "message": "invalid request: token request: missing field `name` at line 1 column 25",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `bundle.*`: The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. **What to do:** see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover\n- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.unauthenticated": {
+                    "description": "The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. What to do: supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                    "summary": "identity.unauthenticated",
+                    "value": {
+                      "code": "identity.unauthenticated",
+                      "hint": "supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                      "message": "authentication required",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.unauthenticated`: The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. **What to do:** supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Always `Bearer`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.forbidden": {
+                    "description": "The token is valid, but lacks the scope this operation requires. The message names the scope. What to do: use a token that carries the scope named in the message",
+                    "summary": "identity.forbidden",
+                    "value": {
+                      "code": "identity.forbidden",
+                      "hint": "use a token that carries the scope named in the message",
+                      "message": "not permitted: this route needs the `publish` scope",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.forbidden`: The token is valid, but lacks the scope this operation requires. The message names the scope. **What to do:** use a token that carries the scope named in the message"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.not_found": {
+                    "description": "The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. What to do: check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                    "summary": "control-plane.not_found",
+                    "value": {
+                      "code": "control-plane.not_found",
+                      "hint": "check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                      "message": "not found: app 0198f0c1-8b3e-7000-8000-0000000000a2",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.not_found`: The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. **What to do:** check the identifier, and that the token's org, and its app if it is bound to one, cover this resource"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.payload_too_large": {
+                    "description": "The request body is larger than this endpoint accepts. The message states the limit. What to do: reduce the upload below the stated limit",
+                    "summary": "control-plane.payload_too_large",
+                    "value": {
+                      "code": "control-plane.payload_too_large",
+                      "hint": "reduce the upload below the stated limit",
+                      "message": "request body exceeds the 16777216 byte limit",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.payload_too_large`: The request body is larger than this endpoint accepts. The message states the limit. **What to do:** reduce the upload below the stated limit"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.rate_limited": {
+                    "description": "This token has used its request budget. The message and the Retry-After header say how long to wait. What to do: retry after the number of seconds in the Retry-After header",
+                    "summary": "control-plane.rate_limited",
+                    "value": {
+                      "code": "control-plane.rate_limited",
+                      "hint": "retry after the number of seconds in the Retry-After header",
+                      "message": "rate limit exceeded; retry in 3s",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.rate_limited`: This token has used its request budget. The message and the Retry-After header say how long to wait. **What to do:** retry after the number of seconds in the Retry-After header",
+            "headers": {
+              "Retry-After": {
+                "description": "Whole seconds to wait before retrying. Never 0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": [
+              "publish"
+            ]
+          }
+        ],
+        "summary": "Publish a version of an app"
+      }
+    },
+    "/v1/orgs/{org_id}/tokens": {
+      "post": {
+        "description": "Issues an API token for the org. The response carries the token itself, once: only its digest is stored, so it cannot be shown again. Sent with `Cache-Control: no-store`.\n\nA token can only issue a token no stronger than itself: every requested scope must be one it holds, and a token bound to an app can only issue tokens bound to that app.\n\n**Authentication:** a bearer token carrying the `admin` scope.",
+        "operationId": "issueToken",
+        "parameters": [
+          {
+            "description": "The org to issue the token in. Must be the requesting token's org.",
+            "in": "path",
+            "name": "org_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "example": {
+                "app_id": null,
+                "name": "ci",
+                "scopes": [
+                  "publish"
+                ]
+              },
+              "schema": {
+                "$ref": "#/components/schemas/IssueRequest"
+              }
+            }
+          },
+          "description": "What the token is called, what it may do, and optionally the one app it is bound to.",
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "example": {
+                  "app_id": null,
+                  "id": "0198f0c1-8b3e-7000-8000-0000000000a4",
+                  "name": "ci",
+                  "org_id": "0198f0c1-8b3e-7000-8000-0000000000a1",
+                  "scopes": [
+                    "publish"
+                  ],
+                  "token": "clwd_tok_0000000000000000000000000000000000000000000000000000000000000000"
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/IssueResponse"
+                }
+              }
+            },
+            "description": "The token was issued. Store `token` now: it is never shown again."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.invalid_request": {
+                    "description": "A request body or parameter was not acceptable. The message says which part and why. What to do: check the request against the OpenAPI schema at /openapi.json",
+                    "summary": "control-plane.invalid_request",
+                    "value": {
+                      "code": "control-plane.invalid_request",
+                      "hint": "check the request against the OpenAPI schema at /openapi.json",
+                      "message": "invalid request: token request: missing field `name` at line 1 column 25",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.unauthenticated": {
+                    "description": "The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. What to do: supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                    "summary": "identity.unauthenticated",
+                    "value": {
+                      "code": "identity.unauthenticated",
+                      "hint": "supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                      "message": "authentication required",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.unauthenticated`: The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. **What to do:** supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Always `Bearer`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.forbidden": {
+                    "description": "The token is valid, but lacks the scope this operation requires. The message names the scope. What to do: use a token that carries the scope named in the message",
+                    "summary": "identity.forbidden",
+                    "value": {
+                      "code": "identity.forbidden",
+                      "hint": "use a token that carries the scope named in the message",
+                      "message": "not permitted: this route needs the `publish` scope",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.forbidden`: The token is valid, but lacks the scope this operation requires. The message names the scope. **What to do:** use a token that carries the scope named in the message"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.not_found": {
+                    "description": "The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. What to do: check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                    "summary": "control-plane.not_found",
+                    "value": {
+                      "code": "control-plane.not_found",
+                      "hint": "check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                      "message": "not found: app 0198f0c1-8b3e-7000-8000-0000000000a2",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.not_found`: The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. **What to do:** check the identifier, and that the token's org, and its app if it is bound to one, cover this resource"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.payload_too_large": {
+                    "description": "The request body is larger than this endpoint accepts. The message states the limit. What to do: reduce the upload below the stated limit",
+                    "summary": "control-plane.payload_too_large",
+                    "value": {
+                      "code": "control-plane.payload_too_large",
+                      "hint": "reduce the upload below the stated limit",
+                      "message": "request body exceeds the 16777216 byte limit",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.payload_too_large`: The request body is larger than this endpoint accepts. The message states the limit. **What to do:** reduce the upload below the stated limit"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.rate_limited": {
+                    "description": "This token has used its request budget. The message and the Retry-After header say how long to wait. What to do: retry after the number of seconds in the Retry-After header",
+                    "summary": "control-plane.rate_limited",
+                    "value": {
+                      "code": "control-plane.rate_limited",
+                      "hint": "retry after the number of seconds in the Retry-After header",
+                      "message": "rate limit exceeded; retry in 3s",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.rate_limited`: This token has used its request budget. The message and the Retry-After header say how long to wait. **What to do:** retry after the number of seconds in the Retry-After header",
+            "headers": {
+              "Retry-After": {
+                "description": "Whole seconds to wait before retrying. Never 0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": [
+              "admin"
+            ]
+          }
+        ],
+        "summary": "Issue a token"
+      }
+    },
+    "/v1/tokens/{token_id}": {
+      "delete": {
+        "description": "Revokes a token. Effective on the token's next request: nothing caches it. Revoking a token that is already revoked succeeds.\n\n**Authentication:** a bearer token carrying the `admin` scope.",
+        "operationId": "revokeToken",
+        "parameters": [
+          {
+            "description": "The id returned when the token was issued. Must be in the requesting token's org, and bound to the same app if the requesting token is bound to one.",
+            "in": "path",
+            "name": "token_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "The token is revoked."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.invalid_request": {
+                    "description": "A request body or parameter was not acceptable. The message says which part and why. What to do: check the request against the OpenAPI schema at /openapi.json",
+                    "summary": "control-plane.invalid_request",
+                    "value": {
+                      "code": "control-plane.invalid_request",
+                      "hint": "check the request against the OpenAPI schema at /openapi.json",
+                      "message": "invalid request: token request: missing field `name` at line 1 column 25",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.unauthenticated": {
+                    "description": "The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. What to do: supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                    "summary": "identity.unauthenticated",
+                    "value": {
+                      "code": "identity.unauthenticated",
+                      "hint": "supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+                      "message": "authentication required",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.unauthenticated`: The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable. **What to do:** supply a valid, unrevoked API token as `Authorization: Bearer <token>`",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Always `Bearer`.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "identity.forbidden": {
+                    "description": "The token is valid, but lacks the scope this operation requires. The message names the scope. What to do: use a token that carries the scope named in the message",
+                    "summary": "identity.forbidden",
+                    "value": {
+                      "code": "identity.forbidden",
+                      "hint": "use a token that carries the scope named in the message",
+                      "message": "not permitted: this route needs the `publish` scope",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `identity.forbidden`: The token is valid, but lacks the scope this operation requires. The message names the scope. **What to do:** use a token that carries the scope named in the message"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.not_found": {
+                    "description": "The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. What to do: check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                    "summary": "control-plane.not_found",
+                    "value": {
+                      "code": "control-plane.not_found",
+                      "hint": "check the identifier, and that the token's org, and its app if it is bound to one, cover this resource",
+                      "message": "not found: app 0198f0c1-8b3e-7000-8000-0000000000a2",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.not_found`: The resource does not exist, or it is outside what this token can reach — another org, or another app when the token is bound to one. These are deliberately indistinguishable. **What to do:** check the identifier, and that the token's org, and its app if it is bound to one, cover this resource"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.rate_limited": {
+                    "description": "This token has used its request budget. The message and the Retry-After header say how long to wait. What to do: retry after the number of seconds in the Retry-After header",
+                    "summary": "control-plane.rate_limited",
+                    "value": {
+                      "code": "control-plane.rate_limited",
+                      "hint": "retry after the number of seconds in the Retry-After header",
+                      "message": "rate limit exceeded; retry in 3s",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.rate_limited`: This token has used its request budget. The message and the Retry-After header say how long to wait. **What to do:** retry after the number of seconds in the Retry-After header",
+            "headers": {
+              "Retry-After": {
+                "description": "Whole seconds to wait before retrying. Never 0.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [
+          {
+            "bearerAuth": [
+              "admin"
+            ]
+          }
+        ],
+        "summary": "Revoke a token"
+      }
+    }
+  }
+}

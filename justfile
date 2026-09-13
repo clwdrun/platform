@@ -17,7 +17,7 @@ default:
 # `migrate` runs before anything that compiles the workspace: sqlx checks its
 # queries against the live database at macro expansion, so a fresh `just db-up`
 # with no schema fails `clippy` rather than failing something about schema.
-check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe deny
+check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe openapi-check deny
 
 # Secret scan over full history. This repository is private, so GitHub's own
 # secret scanning and push protection — both Advanced Security features — are
@@ -70,18 +70,54 @@ test:
 envelope-probe:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! out=$(cargo test -q -p control-plane --lib every_error_response_from_every_route -- --nocapture 2>&1); then
+    if ! out=$(cargo test -p control-plane --lib every_error_response_from_every_route -- --nocapture 2>&1); then
       printf '%s\n' "$out" | tail -60
       echo "error: the envelope probe failed"
       exit 1
     fi
-    lines=$(printf '%s\n' "$out" | grep '^envelope probe' || true)
-    if [ "$(printf '%s\n' "$lines" | grep -c '^envelope probe')" -ne 2 ]; then
+    # Matched anywhere on a line, not at its start: the test harness can print its
+    # own progress on the same line as the test's output.
+    lines=$(printf '%s\n' "$out" | grep -oE 'envelope probe, .*' || true)
+    if [ "$(printf '%s\n' "$lines" | grep -c .)" -ne 3 ]; then
       printf '%s\n' "$out" | tail -40
-      echo "error: the envelope probe passed without reporting both counts"
+      echo "error: the envelope probe passed without reporting all three counts"
       exit 1
     fi
     printf '%s\n' "$lines"
+
+# The OpenAPI document's counts, printed where a reader of the gate sees them:
+# routes documented, schema validity and resolved references, examples checked
+# against their schemas, and error codes carrying meaning and hint. Fails unless
+# all four lines appear, for the same reason as `envelope-probe`.
+[doc('check the committed OpenAPI document and print its counts')]
+openapi-check:
+    #!/usr/bin/env bash
+    set -uo pipefail
+    if ! out=$(cargo test -p control-plane --lib openapi::tests -- --nocapture --test-threads=1 2>&1); then
+      printf '%s\n' "$out" | tail -60
+      echo "error: the OpenAPI checks failed"
+      exit 1
+    fi
+    lines=$(printf '%s\n' "$out" | grep -oE '(routes documented|openapi document|openapi examples|error codes documented).*' || true)
+    if [ "$(printf '%s\n' "$lines" | grep -c .)" -ne 4 ]; then
+      printf '%s\n' "$out" | tail -40
+      echo "error: the OpenAPI checks passed without reporting all four counts"
+      exit 1
+    fi
+    printf '%s\n' "$lines"
+
+# Regenerate the OpenAPI document from the route table. Written to a temporary
+# file first, so a failed build cannot leave an empty document behind — which
+# `include_str!` would then embed.
+[doc('regenerate crates/control-plane/openapi.json from the route table')]
+openapi:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tmp=$(mktemp)
+    cargo run -q -p control-plane -- openapi > "$tmp"
+    mv "$tmp" crates/control-plane/openapi.json
+    chmod 644 crates/control-plane/openapi.json
+    echo "ok: wrote crates/control-plane/openapi.json ($(wc -c < crates/control-plane/openapi.json) bytes)"
 
 deny:
     cargo deny check --hide-inclusion-graph

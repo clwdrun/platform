@@ -17,21 +17,36 @@
 //!
 //! The token goes to stdout and nothing else does, so `$(...)` captures exactly
 //! the token. It is shown once.
+//!
+//! # `openapi`
+//!
+//! Prints the OpenAPI document built from the route table, and nothing else.
+//! `just openapi` writes it to `crates/control-plane/openapi.json`, which is the
+//! file the service serves and CI checks.
 
 use anyhow::{Context as _, bail, ensure};
 use control_plane::{auth, db, token::Scopes};
 
 const SUBCOMMAND: &str = "bootstrap-token";
+const OPENAPI: &str = "openapi";
 const CONFIRM: &str = "--direct-database-write";
 const USAGE: &str = "usage: control-plane bootstrap-token --org <slug> --name <name> \
                      --scopes <scope,...> --direct-database-write";
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let mut args = std::env::args().skip(1);
+    let first = args.next();
+
+    // Before telemetry, so stdout is the document and nothing else.
+    if first.as_deref() == Some(OPENAPI) {
+        print!("{}", control_plane::openapi::json()?);
+        return Ok(());
+    }
+
     shared::telemetry::init();
 
-    let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some(SUBCOMMAND) {
+    if first.as_deref() == Some(SUBCOMMAND) {
         return bootstrap(parse(args)?).await;
     }
 

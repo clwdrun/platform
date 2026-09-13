@@ -25,6 +25,10 @@ bytes = { workspace = true }
 # Captures every log line the token tests produce, so the leak test can grep
 # them rather than trusting that nothing was logged.
 tracing-subscriber = { workspace = true }
+# Validates the committed OpenAPI document, and every example in it, against
+# the vendored OpenAPI 3.1 JSON Schema. No HTTP or file resolution: every schema
+# it needs is in the repository, so the check is offline and deterministic.
+jsonschema = { version = "0.56.0", default-features = false }
 
 [dependencies]
 axum = { workspace = true }

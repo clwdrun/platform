@@ -23,7 +23,7 @@
 //!   bare route. That is a live measurement, so it cannot rot the way a fixture
 //!   can.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::num::NonZeroU32;
 use std::time::Duration;
@@ -65,7 +65,45 @@ const METHODS: [Method; 7] = [
     Method::HEAD,
 ];
 
-const BODIES: [&str; 3] = ["", "{", "not json"];
+/// The bodies each request is tried with: empty, broken JSON, not JSON, and a
+/// valid bundle.
+///
+/// The bundle matters for the same reason [`NAMES_NOTHING`] does. Publish
+/// validates the bundle before it looks the app up, so without a valid one it
+/// always answers `bundle.*` and its `not_found` is never observed — which let a
+/// mutation that stopped documenting `not_found` on publish pass.
+fn bodies() -> Vec<bytes::Bytes> {
+    const PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
+    let bundle = clwd_bundle::build(
+        clwd_bundle::Runtime::Wasm,
+        "app.wasm",
+        clwd_bundle::Capabilities {
+            version: 1,
+            egress: vec![],
+            secrets: vec![],
+            storage_namespaces: vec![],
+            limits: clwd_bundle::Limits {
+                cpu_ms: 1_000,
+                memory_mb: 64,
+            },
+        },
+        vec![clwd_bundle::File {
+            path: "app.wasm".into(),
+            data: PREAMBLE.to_vec(),
+            executable: false,
+        }],
+    )
+    .expect("a well-formed bundle encodes");
+    vec![
+        bytes::Bytes::new(),
+        bytes::Bytes::from_static(b"{"),
+        bytes::Bytes::from_static(b"not json"),
+        bytes::Bytes::from(bundle.bytes),
+    ]
+}
+
+/// A well-formed UUID that no fixture uses, so it names nothing.
+const NAMES_NOTHING: &str = "00000000-0000-7000-8000-000000000000";
 
 /// What fills a path parameter.
 struct Fixture {
@@ -91,7 +129,12 @@ impl Fixture {
 }
 
 /// Every concrete path to try for a route: all-valid, then each parameter in
-/// turn replaced with something malformed.
+/// turn replaced with something malformed, and with a well-formed id that names
+/// nothing.
+///
+/// The last one matters. Without it the probe never asks for a resource that
+/// does not exist, so a route's `not_found` is never observed — and a mutation
+/// that stopped documenting `not_found` on publish went uncaught.
 fn paths(template: &str, fixture: &Fixture) -> Vec<String> {
     let segments: Vec<&str> = template.split('/').collect();
     let params: Vec<usize> = segments
@@ -118,7 +161,7 @@ fn paths(template: &str, fixture: &Fixture) -> Vec<String> {
 
     let mut out = vec![fill(None)];
     for &at in &params {
-        for bad in ["not-a-uuid", "%ff%fe"] {
+        for bad in ["not-a-uuid", "%ff%fe", NAMES_NOTHING] {
             out.push(fill(Some((at, bad))));
         }
     }
@@ -139,6 +182,8 @@ struct Counts {
     rate_limited: usize,
     timed_out_elsewhere: usize,
     bare_by_class: BTreeMap<String, usize>,
+    /// Every code seen, by route path.
+    codes: BTreeMap<&'static str, BTreeSet<String>>,
 }
 
 impl fmt::Display for Counts {
@@ -165,10 +210,10 @@ impl fmt::Display for Counts {
 /// The status a code declares: owned codes from `shared`'s table, delegated
 /// `bundle.*` codes at 400.
 fn declared_status(code: &str) -> Option<u16> {
-    shared::error::OWNED_STATUSES
+    shared::error::CATALOGUE
         .iter()
-        .find(|(owned, _, _)| *owned == code)
-        .map(|(_, status, _)| *status)
+        .find(|entry| entry.code == code)
+        .map(|entry| entry.status)
         .or_else(|| code.starts_with("bundle.").then_some(400))
 }
 
@@ -188,18 +233,21 @@ async fn walk(state: &AppState, bare_errors: BareErrors, fixture: &Fixture) -> C
         ..Counts::default()
     };
     let bearer = format!("Bearer {}", fixture.caller);
+    let bodies = bodies();
 
     for route in &table {
         let mut matched = false;
         for path in paths(route.path, fixture) {
             for method in &METHODS {
                 for authenticated in [true, false] {
-                    for body in BODIES {
+                    for body in &bodies {
                         let mut request = Request::builder().method(method.clone()).uri(&path);
                         if authenticated {
                             request = request.header(header::AUTHORIZATION, &bearer);
                         }
-                        let request = request.body(Body::from(body)).expect("a valid request");
+                        let request = request
+                            .body(Body::from(body.clone()))
+                            .expect("a valid request");
 
                         let budget = if route.path == SLOW {
                             SLOW_BUDGET
@@ -252,6 +300,11 @@ async fn walk(state: &AppState, bare_errors: BareErrors, fixture: &Fixture) -> C
                                 .or_default() += 1;
                         } else if *method != Method::HEAD {
                             let code = json["code"].as_str().unwrap_or_default();
+                            counts
+                                .codes
+                                .entry(route.path)
+                                .or_default()
+                                .insert(code.to_owned());
                             match declared_status(code) {
                                 None => counts.unknown_code += 1,
                                 Some(declared) if declared != status.as_u16() => {
@@ -369,6 +422,36 @@ async fn every_error_response_from_every_route_is_an_envelope(pool: PgPool) {
     assert_eq!(
         converted.allow_missing, 0,
         "a 405 without the Allow header HTTP requires"
+    );
+
+    // Every code a production route was seen to produce is one the OpenAPI
+    // document lists for that route. The reverse — a documented code never
+    // produced — cannot be checked here: `internal` and `timeout` cannot be
+    // provoked on a real route.
+    let mut pairs = 0;
+    let mut undocumented = Vec::new();
+    for route in routes() {
+        let Some(documented) = crate::openapi::documented_codes(&route) else {
+            continue;
+        };
+        for code in converted.codes.get(route.path).into_iter().flatten() {
+            pairs += 1;
+            if !crate::openapi::covers(&documented, code) {
+                undocumented.push(format!("{} {}: {code}", route.verb.method(), route.path));
+            }
+        }
+    }
+    println!(
+        "envelope probe, codes seen on production routes: {pairs} (route, code) pairs, {} undocumented",
+        undocumented.len()
+    );
+    assert!(
+        pairs > 0,
+        "the probe saw no codes on production routes, so this checked nothing"
+    );
+    assert!(
+        undocumented.is_empty(),
+        "codes a route produces that the OpenAPI document does not list for it: {undocumented:#?}"
     );
 }
 
