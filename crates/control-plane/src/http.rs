@@ -1,31 +1,48 @@
-//! The axum surface: middleware, error rendering, and routing.
+//! The axum surface: the route table, middleware, and error rendering.
 //!
-//! # Every failure is an envelope, including the ones nobody wrote a handler for
+//! # Every 4xx and 5xx is an envelope
 //!
-//! Three paths produce a response that no handler returned:
+//! Not "every error a handler returns". Plenty of error responses are produced
+//! by something that is not a handler: axum's 405 for a wrong method, the `Path`
+//! extractor's plain-text 400, the body limit's 413, the timeout's 504, a panic.
+//! Those were found and fixed one at a time, and special-casing never converged
+//! — a probe later found 192 more.
 //!
-//! - **a panic** — caught by `CatchPanicLayer`, which would otherwise drop the
-//!   connection and give a caller nothing to correlate;
-//! - **a timeout** — `TimeoutLayer`, which produces a bodyless response on its
-//!   own;
-//! - **an unmatched route** — axum's fallback, which is a bare 404.
+//! So the mechanism is general. [`render`] marks the responses it produces with
+//! a response extension, and `envelope_every_error` converts **any** 4xx or 5xx
+//! that lacks the mark. There is no list of statuses to keep up to date and no
+//! list of exempt routes: exception lists are how "every" stopped being true.
 //!
-//! Each is mapped to the same envelope. A caller that has to distinguish "the
-//! API said no" from "something ate my request" by looking at whether the body
-//! parses is not being given a contract.
+//! The mark is an extension rather than a header because extensions are never
+//! serialised. An earlier header marker claimed to be "stripped before the
+//! response leaves the process"; nothing stripped it, and it reached every
+//! caller.
+//!
+//! # Every route is in the table
+//!
+//! [`routes`] is the only way into the router. `clippy.toml` disallows every
+//! `Router` method that can register a route, and the one call site allowed to
+//! is `register`. That is what makes the envelope probe's claim — that it
+//! walked every route — true by construction rather than true on the day it was
+//! written. See `envelope_probe` for the probe.
 //!
 //! # Ordering
 //!
-//! `request_id` is assigned in the outermost layer, before routing, so it exists
-//! on every path — including the three above. A layer that ran after routing
-//! would leave exactly the failures that most need correlating without any.
+//! ```text
+//! assign_request_id        outermost: the id exists on every path
+//! envelope_every_error     inside it, so a synthesised envelope has an id;
+//!                          outside everything that can produce a bare response
+//! TraceLayer
+//! CatchPanicLayer
+//! TimeoutLayer
+//! DefaultBodyLimit
+//! router                   fallback, 405s, extractors, auth, handlers
+//! ```
 //!
-//! # Authenticated by default
-//!
-//! A route is public only if it is added to the public router, which holds
-//! `/healthz` and nothing else. Every other route goes through [`protected`],
-//! which requires a scope as an argument. The failure this shape prevents is the
-//! common one: a new route that ships unprotected because nobody opted it in.
+//! One subtlety: `Router::layer` wraps each route's endpoint, and axum's method
+//! router appends `Allow` to a 405 *after* that wrapped call returns. So the
+//! conversion sees a 405 with no headers, and `Allow` is added around it. The
+//! header reaches the wire regardless, which the envelope probe checks.
 
 use std::time::Duration;
 
@@ -33,10 +50,12 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::Request;
-use axum::http::{HeaderValue, StatusCode, header};
+use axum::handler::Handler;
+use axum::http::response::Parts;
+use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{MethodRouter, delete, get, post};
+use axum::routing::{MethodFilter, MethodRouter, on};
 use tower_http::catch_panic::CatchPanicLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
@@ -55,6 +74,12 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The header a client may use to supply its own correlation id.
 const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// The most of a bare 4xx's plain-text body that is echoed as the message.
+///
+/// Enough for axum's rejection text ("Cannot parse `app_id` with value …"),
+/// small enough that echoing it costs nothing worth measuring.
+const ECHO_LIMIT: usize = 1024;
 
 /// What the routes need to do their work.
 ///
@@ -98,99 +123,180 @@ impl AppState {
     }
 }
 
+/// Who may call a route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Access {
+    /// Anyone. Only `/healthz` today.
+    Public,
+    /// An authenticated caller whose token carries this scope.
+    Scoped(Scope),
+}
+
+/// A method a route can be registered for.
+///
+/// Its own type rather than `http::Method`, because `Method` admits extension
+/// methods the router cannot filter on, and a fallible conversion at route
+/// registration is a failure path that should not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum Verb {
+    Get,
+    Post,
+    Put,
+    Patch,
+    Delete,
+}
+
+impl Verb {
+    /// The HTTP method.
+    #[must_use]
+    pub fn method(self) -> Method {
+        match self {
+            Self::Get => Method::GET,
+            Self::Post => Method::POST,
+            Self::Put => Method::PUT,
+            Self::Patch => Method::PATCH,
+            Self::Delete => Method::DELETE,
+        }
+    }
+
+    fn filter(self) -> MethodFilter {
+        match self {
+            Self::Get => MethodFilter::GET,
+            Self::Post => MethodFilter::POST,
+            Self::Put => MethodFilter::PUT,
+            Self::Patch => MethodFilter::PATCH,
+            Self::Delete => MethodFilter::DELETE,
+        }
+    }
+}
+
+/// One route: what it answers, who may call it, and the handler.
+///
+/// The verb is stated once and the handler is registered *for* that verb, so
+/// the table cannot say `POST` while the router answers `GET`.
+pub struct Route {
+    pub verb: Verb,
+    pub path: &'static str,
+    pub access: Access,
+    handler: MethodRouter<AppState>,
+}
+
+impl Route {
+    fn new<H, T>(verb: Verb, path: &'static str, access: Access, handler: H) -> Self
+    where
+        H: Handler<T, AppState>,
+        T: 'static,
+    {
+        Self {
+            verb,
+            path,
+            access,
+            handler: on(verb.filter(), handler),
+        }
+    }
+}
+
+/// Every route this service answers.
+///
+/// **The only way to add one.** `clippy.toml` disallows registering a route
+/// anywhere but `register`, which reads this table, so a route missing from here
+/// cannot reach the router — and the envelope probe, which walks this table,
+/// therefore walks every route there is. `#3` documents the same list.
+#[must_use]
+pub fn routes() -> Vec<Route> {
+    let table = vec![
+        Route::new(Verb::Get, "/healthz", Access::Public, healthz),
+        Route::new(
+            Verb::Post,
+            "/v1/apps/{app_id}/versions",
+            Access::Scoped(Scope::Publish),
+            crate::publish::publish,
+        ),
+        Route::new(
+            Verb::Post,
+            "/v1/orgs/{org_id}/tokens",
+            Access::Scoped(Scope::Admin),
+            auth::issue_route,
+        ),
+        Route::new(
+            Verb::Delete,
+            "/v1/tokens/{token_id}",
+            Access::Scoped(Scope::Admin),
+            auth::revoke_route,
+        ),
+    ];
+
+    // Test-only routes are in the table too, so the probe walks them and they
+    // obey the same registration rule as everything else.
+    #[cfg(test)]
+    let table = {
+        let mut table = table;
+        table.extend(test_routes());
+        table
+    };
+
+    table
+}
+
+/// Routes that exist to prove failure paths. Compiled only for tests.
+#[cfg(test)]
+fn test_routes() -> Vec<Route> {
+    vec![
+        Route::new(
+            Verb::Get,
+            "/v1/apps/{id}",
+            Access::Public,
+            placeholder_not_found,
+        ),
+        Route::new(Verb::Get, "/v1/panic", Access::Public, placeholder_panic),
+        Route::new(Verb::Get, "/v1/slow", Access::Public, || async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            "unreachable"
+        }),
+        Route::new(
+            Verb::Post,
+            "/v1/body",
+            Access::Public,
+            |body: axum::body::Bytes| async move { body.len().to_string() },
+        ),
+        // The envelope probe's planted counter-example: a handler, not a layer,
+        // returning a bare error. Without conversion the probe must find it.
+        Route::new(Verb::Get, "/v1/bare", Access::Public, || async {
+            (StatusCode::BAD_REQUEST, "a planted bare response")
+        }),
+    ]
+}
+
 /// Build the router.
 pub fn router(state: AppState) -> Router {
     router_with(state, REQUEST_TIMEOUT)
-}
-
-/// Add a route that requires authentication and `scope`.
-///
-/// **The only way to add a protected route**, and it takes the scope as an
-/// argument, so "protected but no scope check" is not something a route can
-/// be. The authentication layer itself is added once, over every route this
-/// has registered, in [`router_with`].
-fn protected(
-    router: Router<AppState>,
-    path: &str,
-    scope: Scope,
-    method: MethodRouter<AppState>,
-) -> Router<AppState> {
-    router.route(
-        path,
-        method.route_layer(middleware::from_fn(move |request: Request, next: Next| {
-            auth::require_scope(scope, request, next)
-        })),
-    )
 }
 
 /// Build the router with an explicit time budget.
 ///
 /// Exists so the timeout path is reachable in a test without waiting out
 /// [`REQUEST_TIMEOUT`]. The whole layer stack is still assembled here, so a test
-/// that drives this exercises the real wiring — including the layer's status
-/// agreeing with what `control-plane.timeout` declares. A test that faked the
-/// timeout response instead would hardcode that status and prove nothing.
+/// that drives this exercises the real wiring.
 fn router_with(state: AppState, timeout: Duration) -> Router {
-    let authenticated = Router::new();
-    let authenticated = protected(
-        authenticated,
-        "/v1/apps/{app_id}/versions",
-        Scope::Publish,
-        post(crate::publish::publish),
-    );
-    let authenticated = protected(
-        authenticated,
-        "/v1/orgs/{org_id}/tokens",
-        Scope::Admin,
-        post(auth::issue_route),
-    );
-    let authenticated = protected(
-        authenticated,
-        "/v1/tokens/{token_id}",
-        Scope::Admin,
-        delete(auth::revoke_route),
-    );
-    // `route_layer`, after every protected route is registered: it covers the
-    // routes that exist when it is called, and only matched ones, so an
-    // unknown path is still the fallback's 404 rather than a 401.
-    let authenticated = authenticated.route_layer(middleware::from_fn_with_state(
-        state.clone(),
-        auth::authenticate,
-    ));
+    build(state, timeout, BareErrors::Convert)
+}
 
-    let public = Router::new().route("/healthz", get(healthz));
-
-    // Test-only, and public, because they exist to prove failure paths that
-    // happen before or regardless of authentication. They were compiled into
-    // production until authentication arrived; a deliberate-panic route did
-    // not belong there, and requiring a scope for it would have been worse.
+/// Whether bare error responses are converted to envelopes.
+///
+/// Production always converts. `Leave` exists only so the envelope probe can
+/// measure what the conversion catches — its positive control is a live count
+/// taken from the unconverted stack, which cannot rot the way a fixture can.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BareErrors {
+    Convert,
     #[cfg(test)]
-    let public = public
-        .route("/v1/apps/{id}", get(placeholder_not_found))
-        .route("/v1/panic", get(placeholder_panic))
-        .route(
-            "/v1/slow",
-            get(|| async {
-                tokio::time::sleep(Duration::from_secs(30)).await;
-                "unreachable"
-            }),
-        )
-        // Proves the body limit on a route with no other behaviour in the way.
-        .route(
-            "/v1/body",
-            post(|body: axum::body::Bytes| async move { body.len().to_string() }),
-        );
+    Leave,
+}
 
-    public
-        .merge(authenticated)
+pub(crate) fn build(state: AppState, timeout: Duration, bare_errors: BareErrors) -> Router {
+    let router = register(routes(), &state)
         .with_state(state)
-        .fallback(unmatched)
-        // Innermost first. `request_id` is outermost so everything below it —
-        // including the panic catcher and the timeout — runs with one assigned.
-        // The status is set here rather than left to the layer's default, so
-        // it already matches what `control-plane.timeout` declares. 504 rather
-        // than 408: 408 means the client was too slow sending, and this is our
-        // side exceeding its own budget.
         // The upload ceiling, applied to every route that reads a body.
         //
         // The constant comes from `shared`, not from `builder`. Reaching into
@@ -199,20 +305,61 @@ fn router_with(state: AppState, timeout: Duration) -> Router {
         //
         // Axum's own default is 2 MiB, which is *below* what a bundle may
         // legitimately be. Left alone, a valid upload would be refused by a
-        // limit nothing in this repository states, and `MAX_BUNDLE_BYTES` would
-        // be unreachable — a documented number that never applies.
-        //
-        // The rejection also arrives from an extractor rather than a handler,
-        // so it carries no envelope of ours. `assign_request_id` gives it one;
-        // see the 413 arm there.
+        // limit nothing in this repository states.
         .layer(DefaultBodyLimit::max(shared::MAX_BUNDLE_BYTES))
+        // 504 rather than 408: 408 means the client was too slow sending, and
+        // this is our side exceeding its own budget.
         .layer(TimeoutLayer::with_status_code(
             StatusCode::GATEWAY_TIMEOUT,
             timeout,
         ))
         .layer(CatchPanicLayer::custom(on_panic))
-        .layer(TraceLayer::new_for_http())
-        .layer(middleware::from_fn(assign_request_id))
+        .layer(TraceLayer::new_for_http());
+
+    let router = match bare_errors {
+        BareErrors::Convert => router.layer(middleware::from_fn(envelope_every_error)),
+        #[cfg(test)]
+        BareErrors::Leave => router,
+    };
+
+    router.layer(middleware::from_fn(assign_request_id))
+}
+
+/// Put every route in the table into a router, with its access control.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "load-bearing: clippy.toml forbids registering routes anywhere but \
+              here, which is what makes `routes()` the complete list the envelope \
+              probe walks. This is the one sanctioned site. Do not add routes \
+              elsewhere, and do not remove the lint to make that easier."
+)]
+fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
+    let mut public = Router::new();
+    let mut authenticated = Router::new();
+
+    for route in table {
+        match route.access {
+            Access::Public => public = public.route(route.path, route.handler),
+            Access::Scoped(scope) => {
+                let handler = route.handler.route_layer(middleware::from_fn(
+                    move |request: Request, next: Next| auth::require_scope(scope, request, next),
+                ));
+                authenticated = authenticated.route(route.path, handler);
+            }
+        }
+    }
+
+    // After every protected route is registered: `route_layer` covers the
+    // routes that exist when it is called, and only matched ones, so an unknown
+    // path is still the fallback's 404 rather than a 401.
+    if authenticated.has_routes() {
+        authenticated = authenticated.route_layer(middleware::from_fn_with_state(
+            state.clone(),
+            auth::authenticate,
+        ));
+    }
+
+    public.merge(authenticated).fallback(unmatched)
 }
 
 /// Assign a request id before anything else looks at the request.
@@ -224,8 +371,7 @@ fn router_with(state: AppState, timeout: Duration) -> Router {
 async fn assign_request_id(mut request: Request, next: Next) -> Response {
     // First, before any layer can see the headers: a sensitive `HeaderValue`
     // prints as `Sensitive` under `Debug`, so a `{:?}` of the request or its
-    // headers anywhere below cannot put a token in a log line. Here rather
-    // than in the auth layer because the trace layer runs before that one.
+    // headers anywhere below cannot put a token in a log line.
     if let Some(credential) = request.headers_mut().get_mut(header::AUTHORIZATION) {
         credential.set_sensitive(true);
     }
@@ -251,49 +397,125 @@ async fn assign_request_id(mut request: Request, next: Next) -> Response {
     let value =
         HeaderValue::from_str(id.as_str()).unwrap_or_else(|_| HeaderValue::from_static("invalid"));
     response.headers_mut().insert(REQUEST_ID_HEADER, value);
-
-    // A response that came from a layer rather than a handler — the timeout —
-    // has no body of ours. Give it one. The status already agrees with what the
-    // code declares, so only the body is missing.
-    if response.status() == StatusCode::GATEWAY_TIMEOUT && !was_rendered(&response) {
-        return render(
-            &Error::Timeout {
-                dependency: "the request exceeded its time budget".to_owned(),
-            },
-            &id,
-        );
-    }
-
-    // Same situation, different layer. `DefaultBodyLimit` rejects inside the
-    // extractor, before any handler runs, so the response is axum's rather than
-    // ours. Without this arm an oversized upload is the one reachable path that
-    // returns a non-envelope body, which is exactly what #2 asserts cannot
-    // happen.
-    if response.status() == StatusCode::PAYLOAD_TOO_LARGE && !was_rendered(&response) {
-        return render(
-            &Error::PayloadTooLarge {
-                what: format!(
-                    "request body exceeds the {} byte limit",
-                    shared::MAX_BUNDLE_BYTES
-                ),
-            },
-            &id,
-        );
-    }
-
     response
 }
 
-/// Whether a response already carries one of our envelopes.
+/// Marks a response that already carries an envelope.
 ///
-/// Marked with a header rather than by parsing the body: the body may be a
-/// stream, and consuming it to find out would be worse than the question.
-fn was_rendered(response: &Response) -> bool {
-    response.headers().contains_key(ENVELOPE_MARKER)
+/// An extension, so it is never serialised: nothing has to strip it, and a
+/// caller cannot see it or forge it.
+#[derive(Debug, Clone, Copy)]
+struct Rendered;
+
+/// Give every 4xx and 5xx an envelope, whatever produced it.
+///
+/// A success is returned untouched: the status is checked first, and below 400
+/// there is no extension lookup, no header read and no body. The *decision* is
+/// one comparison, but the layer is not free — measured at about 1.1 µs per
+/// request in a release build (6.5 µs to 7.7 µs for `GET /healthz` through the
+/// whole stack), which is the `from_fn` future and the request id cloned before
+/// the inner service runs. Against a database round trip of hundreds of
+/// microseconds that is noise; it is stated so nobody assumes it is zero.
+async fn envelope_every_error(request: Request, next: Next) -> Response {
+    let id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::generate);
+
+    let response = next.run(request).await;
+
+    if response.status().as_u16() < 400 || response.extensions().get::<Rendered>().is_some() {
+        return response;
+    }
+    envelope(response, &id).await
 }
 
-/// Internal marker, stripped before the response leaves the process.
-const ENVELOPE_MARKER: &str = "x-clwd-envelope";
+/// Convert a bare error response into the envelope.
+async fn envelope(response: Response, id: &RequestId) -> Response {
+    let (parts, body) = response.into_parts();
+    let status = parts.status;
+
+    let error = match status {
+        StatusCode::BAD_REQUEST => Error::InvalidRequest {
+            what: echoable_text(&parts, body)
+                .await
+                .unwrap_or_else(|| "the request could not be read".to_owned()),
+        },
+        StatusCode::NOT_FOUND => Error::NotFound {
+            what: "that resource".to_owned(),
+        },
+        StatusCode::METHOD_NOT_ALLOWED => Error::MethodNotAllowed {},
+        StatusCode::PAYLOAD_TOO_LARGE => Error::PayloadTooLarge {
+            what: format!(
+                "request body exceeds the {} byte limit",
+                shared::MAX_BUNDLE_BYTES
+            ),
+        },
+        StatusCode::GATEWAY_TIMEOUT => Error::Timeout {
+            dependency: "the request exceeded its time budget".to_owned(),
+        },
+        other if other.is_client_error() => {
+            tracing::warn!(status = %other, "a bare client error had no code of its own");
+            Error::InvalidRequest {
+                what: format!("the request was rejected with status {other}"),
+            }
+        }
+        other => {
+            tracing::error!(status = %other, "a bare server error reached the edge unrendered");
+            Error::Internal {
+                source: anyhow::anyhow!("a bare {other} reached the edge unrendered"),
+            }
+        }
+    };
+
+    let mut rendered = render(&error, id);
+
+    // A status with no code of its own keeps its status, even though the code
+    // it borrowed declares a different one. Rewriting a 415 into a 400 would
+    // misreport what happened; leaving the disagreement in place is what lets
+    // the envelope probe count it and force a proper mapping.
+    *rendered.status_mut() = status;
+
+    // No headers are copied from the bare response. The one a caller needs,
+    // `Allow` on a 405, is appended by axum's method router *after* this layer
+    // returns — `Router::layer` wraps each route's endpoint, and the router adds
+    // `Allow` around that call — so this layer never sees it and cannot drop it.
+    // The envelope probe checks `Allow` on the wire, which is where it matters.
+    rendered
+}
+
+/// The plain-text body of a bare 4xx, fit to be the envelope's message.
+///
+/// Only for 400s, only `text/plain`, only under [`ECHO_LIMIT`], and never for a
+/// 5xx — whose text is ours and may name internals.
+///
+/// # Why echoing caller input is safe here and was not in `clwdrun/clwd#34`
+///
+/// The text contains what the caller sent: "Cannot parse `app_id` with value
+/// `…`". `clwd#34` made SDK error bodies `&'static str` for the mirror image of
+/// this — there, input from one party would have reached another. Here the input
+/// is the caller's own and goes back only to them, so it tells them nothing they
+/// did not send. It is not logged. It is JSON-encoded, and control characters
+/// are replaced anyway, so a client that prints the message to a terminal
+/// cannot be handed an escape sequence decoded from its own URL.
+async fn echoable_text(parts: &Parts, body: Body) -> Option<String> {
+    let plain = parts
+        .headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|ct| ct.starts_with("text/plain"));
+    if !plain {
+        return None;
+    }
+    let bytes = axum::body::to_bytes(body, ECHO_LIMIT).await.ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    Some(
+        text.chars()
+            .map(|c| if c.is_control() { '\u{fffd}' } else { c })
+            .collect(),
+    )
+}
 
 /// Render an error as the envelope, with the status its code declares.
 ///
@@ -314,9 +536,9 @@ pub fn render(error: &Error, id: &RequestId) -> Response {
     let mut response = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(ENVELOPE_MARKER, "1")
         .body(Body::from(body))
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    response.extensions_mut().insert(Rendered);
 
     let headers = response.headers_mut();
     headers.insert(
@@ -397,6 +619,7 @@ async fn unmatched(axum::Extension(request_id): axum::Extension<RequestId>) -> R
 mod tests {
     use super::*;
     use axum::body::to_bytes;
+    use std::convert::Infallible;
     use tower::ServiceExt as _;
 
     /// State for the envelope tests, which reach no database.
@@ -444,8 +667,24 @@ mod tests {
         builder.body(Body::empty()).expect("a valid request")
     }
 
+    /// One bare response, through the conversion layer alone — no router, so
+    /// the conversion is what is under test and nothing else can render.
+    async fn converted(bare: fn() -> Response) -> (StatusCode, serde_json::Value, Response<Body>) {
+        let service = tower::ServiceBuilder::new()
+            .layer(middleware::from_fn(envelope_every_error))
+            .service(tower::service_fn(move |_: Request| async move {
+                Ok::<_, Infallible>(bare())
+            }));
+        let response = service.oneshot(get("/")).await.expect("infallible");
+        let status = response.status();
+        let (parts, body) = response.into_parts();
+        let bytes = to_bytes(body, 64 * 1024).await.expect("body reads");
+        let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
+        (status, json, Response::from_parts(parts, Body::empty()))
+    }
+
     /// Every error path is an envelope. **No bare 500, no bare 404, no dropped
-    /// connection.**
+    /// connection.** The envelope probe generalises this to every route.
     #[tokio::test]
     async fn every_failure_path_returns_the_envelope() {
         for uri in ["/v1/apps/dashboard", "/v1/panic", "/no/such/route"] {
@@ -472,6 +711,165 @@ mod tests {
         }
     }
 
+    /// The marker that says "this is already an envelope" never reaches the
+    /// caller. Its predecessor was a header documented as stripped, which
+    /// nothing stripped.
+    #[tokio::test]
+    async fn no_internal_marker_reaches_the_wire() {
+        for uri in [
+            "/v1/apps/dashboard",
+            "/v1/panic",
+            "/no/such/route",
+            "/healthz",
+        ] {
+            let (_, _, response) = call(get(uri)).await;
+            let leaked: Vec<&str> = response
+                .headers()
+                .keys()
+                .map(axum::http::HeaderName::as_str)
+                .filter(|name| name.starts_with("x-clwd"))
+                .collect();
+            assert!(leaked.is_empty(), "for {uri}: {leaked:?}");
+        }
+    }
+
+    /// A wrong method is a 405 envelope, and keeps the `Allow` header HTTP
+    /// requires — through the real router, where axum produces it.
+    #[tokio::test]
+    async fn a_wrong_method_is_a_405_envelope_with_allow() {
+        let (status, json, response) = call(get("/v1/body")).await;
+        assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+        assert_eq!(json["code"], "control-plane.method_not_allowed");
+        assert_eq!(json["retryable"], false, "the same method fails forever");
+        assert_eq!(
+            response
+                .headers()
+                .get(header::ALLOW)
+                .map(HeaderValue::as_bytes),
+            Some(&b"POST"[..])
+        );
+    }
+
+    /// A bare plain-text 400 keeps its text as the message, with control
+    /// characters replaced, so a client printing it cannot be handed an escape
+    /// sequence.
+    #[tokio::test]
+    async fn a_bare_plain_text_400_is_echoed_with_controls_replaced() {
+        let (status, json, _) = converted(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                "Cannot parse `app_id` with value `\u{1b}[31mred\n`",
+            )
+                .into_response()
+        })
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(json["code"], "control-plane.invalid_request");
+        let message = json["message"].as_str().expect("a message");
+        assert!(message.contains("Cannot parse `app_id`"), "{message}");
+        assert!(
+            !message.chars().any(char::is_control),
+            "control characters survived: {message:?}"
+        );
+    }
+
+    /// Only short plain text is echoed. JSON, HTML or a large body is not.
+    #[tokio::test]
+    async fn only_short_plain_text_is_echoed() {
+        let (_, json, _) =
+            converted(|| (StatusCode::BAD_REQUEST, "x".repeat(ECHO_LIMIT + 1)).into_response())
+                .await;
+        assert_eq!(
+            json["message"],
+            "invalid request: the request could not be read"
+        );
+
+        let (_, json, _) = converted(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                [(header::CONTENT_TYPE, "text/html")],
+                "<b>internal detail</b>",
+            )
+                .into_response()
+        })
+        .await;
+        assert_eq!(
+            json["message"],
+            "invalid request: the request could not be read"
+        );
+    }
+
+    /// A bare 5xx's body is ours and may name internals: it is never forwarded.
+    /// A status with no code of its own keeps that status.
+    #[tokio::test]
+    async fn a_bare_5xx_is_never_echoed_and_keeps_its_status() {
+        let (status, json, _) = converted(|| {
+            (StatusCode::BAD_GATEWAY, "upstream db-7.internal refused").into_response()
+        })
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_GATEWAY,
+            "the status is not rewritten"
+        );
+        assert_eq!(json["code"], "control-plane.internal");
+        assert!(
+            !json.to_string().contains("db-7"),
+            "a server error's text leaked: {json}"
+        );
+    }
+
+    /// An unmapped 4xx keeps its status, so its code's declared status
+    /// disagrees — which the envelope probe counts, forcing a real mapping.
+    #[tokio::test]
+    async fn an_unmapped_client_error_keeps_its_status() {
+        let (status, json, _) =
+            converted(|| StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response()).await;
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(json["code"], "control-plane.invalid_request");
+    }
+
+    /// A response that already carries an envelope passes through unchanged:
+    /// the conversion must not alter responses that were already correct.
+    #[tokio::test]
+    async fn an_envelope_passes_through_untouched() {
+        fn already() -> Response {
+            render(
+                &Error::Conflict {
+                    what: "slug taken".to_owned(),
+                },
+                &RequestId::sanitize("req-1").expect("well formed"),
+            )
+        }
+        let (status, json, _) = converted(already).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(json["code"], "control-plane.conflict");
+        assert_eq!(json["message"], "conflict: slug taken");
+        assert_eq!(json["request_id"], "req-1", "not re-rendered with a new id");
+    }
+
+    /// A success is returned exactly as produced.
+    #[tokio::test]
+    async fn a_success_passes_through_untouched() {
+        let service = tower::ServiceBuilder::new()
+            .layer(middleware::from_fn(envelope_every_error))
+            .service(tower::service_fn(|_: Request| async {
+                Ok::<_, Infallible>(
+                    (
+                        StatusCode::CREATED,
+                        [(header::CONTENT_TYPE, "text/plain")],
+                        "made",
+                    )
+                        .into_response(),
+                )
+            }));
+        let response = service.oneshot(get("/")).await.expect("infallible");
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(response.headers()[header::CONTENT_TYPE], "text/plain");
+        let bytes = to_bytes(response.into_body(), 1024).await.expect("body");
+        assert_eq!(&bytes[..], b"made");
+    }
+
     /// A protected route with no valid credential is 401 — and is decided
     /// **without touching the database**. The pool here cannot connect, so a
     /// lookup would surface as a 5xx; getting 401 proves the malformed cases
@@ -496,7 +894,7 @@ mod tests {
                 response
                     .headers()
                     .get(header::WWW_AUTHENTICATE)
-                    .map(|v| v.as_bytes()),
+                    .map(HeaderValue::as_bytes),
                 Some(&b"Bearer"[..]),
                 "RFC 6750: a 401 names its scheme, for {authorization:?}"
             );
@@ -524,8 +922,7 @@ mod tests {
 
     /// A timed-out request is an envelope too, not a bodyless status from the
     /// layer. Also pins the layer's status to the one `control-plane.timeout`
-    /// declares: if they drift apart the re-render stops firing and the caller
-    /// gets an empty body.
+    /// declares.
     #[tokio::test]
     async fn a_timed_out_request_becomes_an_envelope() {
         let response = router_with(stateless(), Duration::from_millis(10))
@@ -571,13 +968,9 @@ mod tests {
         );
     }
 
-    /// The one path that returns a response no handler produced.
-    ///
-    /// `DefaultBodyLimit` rejects inside the extractor, so without the 413 arm
-    /// in `assign_request_id` this is a bare body from axum — the single
-    /// reachable counter-example to "every failure path returns the envelope".
-    /// Asserted through the real router rather than by calling `render`, which
-    /// would prove only that `render` renders.
+    /// The body limit's rejection, which comes from an extractor rather than a
+    /// handler, is an envelope. Asserted through the real router rather than by
+    /// calling `render`, which would prove only that `render` renders.
     #[tokio::test]
     async fn an_oversized_body_becomes_an_envelope_not_a_bare_413() {
         let oversized = vec![0u8; shared::MAX_BUNDLE_BYTES + 1];
@@ -611,20 +1004,11 @@ mod tests {
     /// The same limit, on a body whose length is not known in advance.
     ///
     /// A chunked upload sends no `Content-Length`, so nothing can be rejected
-    /// up front — the limit has to hold while the body streams. Axum enforces
-    /// it with `http_body_util::Limited`, which counts as it reads and has no
-    /// `Content-Length` fast path, so the streaming case should behave like the
-    /// sized one.
-    ///
-    /// "Should" is why this test exists. The sized test above uses
-    /// `Body::from(Vec)`, which knows its own length, and would keep passing if
-    /// the limit only ever worked for bodies that declare one — proving the
-    /// easy half of the property and reporting green about the other.
+    /// up front — the limit has to hold while the body streams. The sized test
+    /// above would keep passing if the limit only ever worked for bodies that
+    /// declare a length.
     #[tokio::test]
     async fn an_oversized_chunked_body_is_also_an_envelope() {
-        // A stream of 1 MiB chunks with no total length. `Body::from_stream`
-        // reports `size_hint` as unknown, which is what a chunked request looks
-        // like to everything downstream of the transport.
         let chunk = vec![0u8; 1024 * 1024];
         let chunks = (shared::MAX_BUNDLE_BYTES / chunk.len()) + 2;
         let stream = futures::stream::iter(
@@ -666,8 +1050,6 @@ mod tests {
     /// but under our ceiling must reach the handler.
     #[tokio::test]
     async fn a_body_over_axums_default_but_under_ours_is_accepted() {
-        // That our ceiling exceeds this is asserted at compile time, beside the
-        // constant in `shared::limits`.
         const AXUM_DEFAULT_LIMIT: usize = 2 * 1024 * 1024;
 
         let body = vec![0u8; AXUM_DEFAULT_LIMIT + 1];
@@ -720,8 +1102,6 @@ mod tests {
     /// entries, so a malformed one is replaced rather than trusted.
     #[tokio::test]
     async fn a_malformed_request_id_is_replaced_not_trusted() {
-        // `HeaderValue` rejects a literal newline, so the attack that reaches us
-        // is the one that survives HTTP parsing: visible junk, or oversize.
         for hostile in ["a".repeat(200), "has space".to_owned(), String::new()] {
             let mut builder = Request::builder().uri("/v1/apps/x");
             if !hostile.is_empty() {
