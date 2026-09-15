@@ -8,4 +8,5 @@ pub mod http;
 pub mod ids;
 pub mod openapi;
 pub mod publish;
+pub mod resolve;
 pub mod token;

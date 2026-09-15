@@ -197,7 +197,7 @@ fn retry_after_secs(wait: Duration) -> u64 {
 }
 
 /// A lookup that could not be made is a denial, reported as what it is.
-fn unavailable(source: sqlx::Error) -> Error {
+pub(crate) fn unavailable(source: sqlx::Error) -> Error {
     match source {
         sqlx::Error::PoolTimedOut => Error::Timeout {
             dependency: "the database".to_owned(),
@@ -234,6 +234,52 @@ pub async fn require_scope(scope: Scope, request: Request, next: Next) -> Respon
         Ok(()) => next.run(request).await,
         Err(error) => render(&error, &request_id_of(&request)),
     }
+}
+
+/// Deny unless the request carries the platform-internal service credential.
+///
+/// Internal routes (`Access::Internal`) are served from the same table as the
+/// public API but are not part of it: only a platform service — the gateway
+/// today — may call them, authenticated by a shared bearer secret rather than a
+/// customer token, so no customer token, at any scope, can reach them. The
+/// secret lives in [`AppState::internal_secret`]; #22 (the secret broker) will
+/// own its storage and rotation. Absent a configured secret the route fails
+/// closed: every request is denied.
+pub async fn require_internal(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(bearer);
+    let authorized = match (state.internal_secret.as_deref(), presented) {
+        (Some(secret), Some(presented)) => {
+            constant_time_eq(secret.as_bytes(), presented.as_bytes())
+        }
+        // No configured secret, or no credential: deny. An unconfigured
+        // internal secret must never read as "open".
+        _ => false,
+    };
+    if authorized {
+        next.run(request).await
+    } else {
+        render(&Error::Unauthenticated {}, &request_id_of(&request))
+    }
+}
+
+/// Constant-time byte equality: the running time depends on the input lengths
+/// but not on where two equal-length inputs first differ, so a caller cannot
+/// recover the secret one byte at a time by timing the comparison. The secret's
+/// length is not itself secret.
+///
+// ponytail: six lines rather than a `subtle`/`ring` dependency for one compare.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 /// The longest token name accepted, in characters. Matches the column's CHECK.
@@ -529,6 +575,15 @@ pub(crate) fn revoke_doc() -> Doc {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn constant_time_eq_holds_only_for_identical_bytes() {
+        assert!(constant_time_eq(b"correct horse", b"correct horse"));
+        assert!(!constant_time_eq(b"correct horse", b"correct horsf"));
+        assert!(!constant_time_eq(b"correct horse", b"correct hors"));
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(constant_time_eq(b"", b""));
+    }
 
     /// **Fail closed, on every arm.** Whatever the database reports, a lookup
     /// that could not be made is a 5xx that blames us — never a 401 that tells

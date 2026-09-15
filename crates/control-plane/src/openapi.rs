@@ -303,12 +303,22 @@ pub(crate) fn documented_codes(route: &Route) -> Option<BTreeSet<&'static str>> 
     if route.path.contains('{') {
         codes.insert("control-plane.invalid_request");
     }
-    if let Access::Scoped(_) = route.access {
-        codes.extend([
-            "identity.unauthenticated",
-            "identity.forbidden",
-            "control-plane.rate_limited",
-        ]);
+    match route.access {
+        Access::Public => {}
+        Access::Scoped(_) => {
+            codes.extend([
+                "identity.unauthenticated",
+                "identity.forbidden",
+                "control-plane.rate_limited",
+            ]);
+        }
+        // Internal routes authenticate by a binary secret check: a bad or
+        // missing credential is `unauthenticated`. There is no scope to lack
+        // (no `forbidden`) and no per-token limiter on this path (no
+        // `rate_limited`).
+        Access::Internal => {
+            codes.insert("identity.unauthenticated");
+        }
     }
     codes.extend(doc.errors.iter().copied());
     Some(codes)
@@ -395,6 +405,12 @@ pub fn document() -> Result<OpenApi, SpecError> {
     let mut produced: BTreeSet<&'static str> = BTreeSet::new();
 
     for route in production_routes() {
+        // Internal routes are served from the same table (walked by the probe,
+        // required to carry a Doc) but are not part of the public API surface,
+        // so they never appear in the rendered document. See `Access::Internal`.
+        if matches!(route.access, Access::Internal) {
+            continue;
+        }
         let doc = route.doc().ok_or(SpecError::Undocumented(route.path))?;
         let codes = documented_codes(&route).ok_or(SpecError::Undocumented(route.path))?;
         produced.extend(codes.iter().copied());
@@ -405,6 +421,8 @@ pub fn document() -> Result<OpenApi, SpecError> {
                 "**Authentication:** a bearer token carrying the `{}` scope.",
                 scope.as_str()
             ),
+            // Skipped above: internal routes are never rendered.
+            Access::Internal => unreachable!("internal routes are not rendered"),
         };
         let mut operation = OperationBuilder::new()
             .operation_id(Some(doc.operation_id))
@@ -443,6 +461,8 @@ pub fn document() -> Result<OpenApi, SpecError> {
             Access::Scoped(scope) => {
                 operation.security(SecurityRequirement::new(SECURITY_SCHEME, [scope.as_str()]))
             }
+            // Skipped above: internal routes are never rendered.
+            Access::Internal => unreachable!("internal routes are not rendered"),
         };
 
         if let Some(body) = &doc.request {
@@ -724,6 +744,16 @@ mod tests {
             .map(|route| (route.path.to_owned(), method(route.verb)))
             .collect();
 
+        // The public API surface: internal routes are served from the same
+        // table but are deliberately absent from the document, so they are not
+        // expected in it. Counting all routes here would fail on every internal
+        // route; counting them as documented if they appeared would hide an
+        // internal route leaking into the public spec, which this must catch.
+        let public = routes
+            .iter()
+            .filter(|route| !matches!(route.access, Access::Internal))
+            .count();
+
         let documented = routes
             .iter()
             .filter(|route| {
@@ -748,14 +778,14 @@ mod tests {
         }
 
         println!(
-            "routes documented: {documented} of {}; operations without a route: {}",
+            "routes documented: {documented} of {public} public ({} in table); operations without a route: {}",
             routes.len(),
             stray.len()
         );
         assert_eq!(
-            documented,
-            routes.len(),
-            "a production route is missing from the committed OpenAPI document"
+            documented, public,
+            "a public production route is missing from the committed OpenAPI document, \
+             or an internal route leaked into it"
         );
         assert!(
             stray.is_empty(),

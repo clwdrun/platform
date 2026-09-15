@@ -97,6 +97,29 @@ pub async fn org_by_slug(ex: impl PgExecutor<'_>, slug: &str) -> sqlx::Result<Op
     .await
 }
 
+/// Resolve `{app}.{org}` to the live app it names, for the gateway's host
+/// router. `None` when the org or the app does not exist, is soft-deleted, or
+/// the app is not that org's — the three cases the gateway answers with a 404,
+/// deliberately indistinguishable to a caller.
+pub async fn resolve_app(
+    ex: impl PgExecutor<'_>,
+    org_slug: &str,
+    app_name: &str,
+) -> sqlx::Result<Option<App>> {
+    sqlx::query_as!(
+        App,
+        r#"select a.id, a.org_id, a.name, a.runtime, a.created_at, a.deleted_at
+           from apps a
+           join orgs o on o.id = a.org_id
+           where o.slug = $1 and o.deleted_at is null
+             and a.name = $2 and a.deleted_at is null"#,
+        org_slug,
+        app_name,
+    )
+    .fetch_optional(ex)
+    .await
+}
+
 pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<User> {
     sqlx::query_as!(
         User,

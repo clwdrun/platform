@@ -92,6 +92,11 @@ pub struct AppState {
     pub pool: sqlx::PgPool,
     pub artifacts: builder::ArtifactStore,
     pub limiter: std::sync::Arc<Limiter>,
+    /// The shared secret a platform service presents to reach
+    /// [`Access::Internal`] routes. `None` means no internal route can be
+    /// called — fail closed. Set via [`AppState::with_internal_secret`]; #22
+    /// (the secret broker) will own where it comes from and how it rotates.
+    pub internal_secret: Option<std::sync::Arc<str>>,
 }
 
 impl AppState {
@@ -120,7 +125,16 @@ impl AppState {
             pool,
             artifacts,
             limiter: std::sync::Arc::new(Limiter::keyed(quota)),
+            internal_secret: None,
         }
+    }
+
+    /// Set the platform-internal service credential that [`Access::Internal`]
+    /// routes require. Without it those routes deny every request.
+    #[must_use]
+    pub fn with_internal_secret(mut self, secret: impl Into<std::sync::Arc<str>>) -> Self {
+        self.internal_secret = Some(secret.into());
+        self
     }
 }
 
@@ -131,6 +145,14 @@ pub enum Access {
     Public,
     /// An authenticated caller whose token carries this scope.
     Scoped(Scope),
+    /// A platform-internal service, authenticated by the shared internal
+    /// credential rather than a customer token (see [`auth::require_internal`]),
+    /// so no customer token at any scope can reach it. Served from the table
+    /// like any route — walked by the envelope probe, required to carry a
+    /// [`Doc`] — but absent from the public OpenAPI document, because it is not
+    /// part of the customer API surface. The gateway's host-resolution call is
+    /// the only one today.
+    Internal,
 }
 
 /// A method a route can be registered for.
@@ -267,6 +289,13 @@ pub fn production_routes() -> Vec<Route> {
             auth::revoke_doc(),
             auth::revoke_route,
         ),
+        Route::new(
+            Verb::Get,
+            "/internal/orgs/{org}/apps/{app}",
+            Access::Internal,
+            crate::resolve::doc(),
+            crate::resolve::resolve,
+        ),
     ]
 }
 
@@ -387,6 +416,7 @@ pub(crate) fn build(state: AppState, timeout: Duration, bare_errors: BareErrors)
 fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
     let mut public = Router::new();
     let mut authenticated = Router::new();
+    let mut internal = Router::new();
 
     for route in table {
         match route.access {
@@ -396,6 +426,17 @@ fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
                     move |request: Request, next: Next| auth::require_scope(scope, request, next),
                 ));
                 authenticated = authenticated.route(route.path, handler);
+            }
+            Access::Internal => {
+                // The internal credential check, per route, so an internal route
+                // cannot be registered without it. A different auth path from
+                // the customer `authenticate` layer below: a customer token can
+                // never satisfy it.
+                let handler = route.handler.route_layer(middleware::from_fn_with_state(
+                    state.clone(),
+                    auth::require_internal,
+                ));
+                internal = internal.route(route.path, handler);
             }
         }
     }
@@ -410,7 +451,10 @@ fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
         ));
     }
 
-    public.merge(authenticated).fallback(unmatched)
+    public
+        .merge(authenticated)
+        .merge(internal)
+        .fallback(unmatched)
 }
 
 /// Assign a request id before anything else looks at the request.
