@@ -13,9 +13,25 @@ path = "src/main.rs"
 pingora = { workspace = true }
 instant-acme = { workspace = true }
 moka = { workspace = true }
+reqwest = { workspace = true }
+http = { workspace = true }
+async-trait = { workspace = true }
 tower-cookies = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
+
+[dev-dependencies]
+# A real HTTP server to point the lookup client at: warm the cache over real
+# HTTP, then close the port to prove the control-plane-unreachable path.
+axum = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# The TLS end-to-end test's client and its self-signed cert generation. Same
+# BoringSSL `boring` pingora already builds (no extra compile), so client and
+# server share a stack, and it exposes the negotiated TLS version to assert on.
+boring = "4.22"
