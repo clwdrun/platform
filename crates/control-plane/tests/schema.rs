@@ -20,6 +20,7 @@ fn sqlstate(err: sqlx::Error) -> String {
 const UNIQUE_VIOLATION: &str = "23505";
 const CHECK_VIOLATION: &str = "23514";
 const RESTRICT_VIOLATION: &str = "23001";
+const FK_VIOLATION: &str = "23503";
 
 const DIGEST_A: &str = "blake3:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const DIGEST_B: &str = "blake3:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -292,4 +293,43 @@ async fn an_email_is_stored_lowercased(pool: PgPool) {
         .await
         .expect_err("mixed case");
     assert_eq!(sqlstate(err), CHECK_VIOLATION);
+}
+
+/// The certificates table (#5): one row per org, a bounded state, and a real
+/// org behind every row. State only — no key material is stored here.
+#[sqlx::test(migrations = "../../migrations")]
+async fn certificate_rows_are_one_per_org_with_a_bounded_state(pool: PgPool) {
+    let org = db::create_org(&pool, "acme").await.expect("org");
+
+    // A valid row inserts.
+    sqlx::query("insert into certificates (org_id, state) values ($1, 'pending')")
+        .bind(org.id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("a valid certificate row");
+
+    // One row per org: the primary key is org_id.
+    let dup = sqlx::query("insert into certificates (org_id, state) values ($1, 'issued')")
+        .bind(org.id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect_err("a second row for the same org");
+    assert_eq!(sqlstate(dup), UNIQUE_VIOLATION);
+
+    // An unknown state is rejected (real org, so only the CHECK can fire).
+    let beta = db::create_org(&pool, "beta").await.expect("org2");
+    let bad_state = sqlx::query("insert into certificates (org_id, state) values ($1, 'bogus')")
+        .bind(beta.id.as_uuid())
+        .execute(&pool)
+        .await
+        .expect_err("an out-of-range state");
+    assert_eq!(sqlstate(bad_state), CHECK_VIOLATION);
+
+    // A certificate for a nonexistent org is rejected.
+    let orphan = sqlx::query("insert into certificates (org_id, state) values ($1, 'pending')")
+        .bind(uuid::Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .expect_err("a certificate with no org");
+    assert_eq!(sqlstate(orphan), FK_VIOLATION);
 }
