@@ -1189,6 +1189,7 @@ dependencies = [
  "instant-acme",
  "jsonschema",
  "opendal",
+ "reqwest 0.13.4",
  "rustls 0.23.45",
  "serde",
  "serde_json",

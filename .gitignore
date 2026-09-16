@@ -27,3 +27,4 @@ infra/**/*.tfvars
 infra/**/*.tfvars.json
 infra/**/.terraform.lock.hcl
 crash.log
+.pebble/

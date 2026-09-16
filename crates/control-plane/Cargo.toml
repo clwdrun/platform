@@ -29,6 +29,9 @@ tracing-subscriber = { workspace = true }
 # the vendored OpenAPI 3.1 JSON Schema. No HTTP or file resolution: every schema
 # it needs is in the repository, so the check is offline and deterministic.
 jsonschema = { version = "0.56.0", default-features = false }
+# The ACME issuance test's challtestsrv DNS provider POSTs TXT records to the
+# challtestsrv management API over HTTP.
+reqwest = { workspace = true }
 
 [dependencies]
 axum = { workspace = true }
