@@ -120,6 +120,98 @@ pub async fn resolve_app(
     .await
 }
 
+/// The certificate lifecycle row for an org: its state and, when issuing, the
+/// in-flight ACME order URL. Holds no key material — the certificate and key
+/// live in the [`shared::cert::CertStore`]. See `migrations/*_certificates.sql`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CertRecord {
+    pub state: String,
+    pub order_url: Option<String>,
+}
+
+/// The certificate row for `org`, or `None` if issuance has never begun. The
+/// issuer reads this to decide whether to RESUME an in-flight order
+/// (`order_url` present) or start a fresh one — resuming is what keeps a retry
+/// during an outage from burning the new-certificate rate limit.
+pub async fn cert_record(
+    ex: impl PgExecutor<'_>,
+    org_id: OrgId,
+) -> sqlx::Result<Option<CertRecord>> {
+    sqlx::query_as!(
+        CertRecord,
+        r#"select state, order_url from certificates where org_id = $1"#,
+        org_id.as_uuid(),
+    )
+    .fetch_optional(ex)
+    .await
+}
+
+/// Record that issuance is in flight for `org`, persisting the ACME order URL so
+/// a later attempt resumes it. Idempotent: repeated calls (a retry) update the
+/// URL in place rather than failing on the primary key.
+pub async fn cert_mark_pending(
+    ex: impl PgExecutor<'_>,
+    org_id: OrgId,
+    order_url: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"insert into certificates (org_id, state, order_url)
+           values ($1, 'pending', $2)
+           on conflict (org_id) do update
+             set state = 'pending', order_url = $2, last_renewal_error = null"#,
+        org_id.as_uuid(),
+        order_url,
+    )
+    .execute(ex)
+    .await
+    .map(|_| ())
+}
+
+/// Mark `org`'s certificate issued and clear the in-flight order: the
+/// certificate itself is already in the store, this records the lifecycle state
+/// the renewal reconciler reads.
+pub async fn cert_mark_issued(
+    ex: impl PgExecutor<'_>,
+    org_id: OrgId,
+    not_after: DateTime<Utc>,
+    ari_renewal_after: DateTime<Utc>,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"update certificates
+             set state = 'issued', order_url = null,
+                 not_after = $2, ari_renewal_after = $3,
+                 last_renewal_attempt = now(), last_renewal_error = null
+           where org_id = $1"#,
+        org_id.as_uuid(),
+        not_after,
+        ari_renewal_after,
+    )
+    .execute(ex)
+    .await
+    .map(|_| ())
+}
+
+/// Record that issuance or renewal failed, visibly. A silent failure is an
+/// outage with no deploy behind it, so the error is stored for the reconciler
+/// and an operator to see. The order URL is kept so the failure can be resumed.
+pub async fn cert_mark_failed(
+    ex: impl PgExecutor<'_>,
+    org_id: OrgId,
+    error: &str,
+) -> sqlx::Result<()> {
+    sqlx::query!(
+        r#"insert into certificates (org_id, state, last_renewal_attempt, last_renewal_error)
+           values ($1, 'failed', now(), $2)
+           on conflict (org_id) do update
+             set state = 'failed', last_renewal_attempt = now(), last_renewal_error = $2"#,
+        org_id.as_uuid(),
+        error,
+    )
+    .execute(ex)
+    .await
+    .map(|_| ())
+}
+
 pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<User> {
     sqlx::query_as!(
         User,
