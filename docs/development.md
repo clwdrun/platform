@@ -170,6 +170,17 @@ make it fail there:
   push, and treat a green advisory result as "clean as of now" rather than "clean
   forever".
 
+- **The secrets gate has two halves with different scopes, and a seam between
+  them.** `just secrets` runs `gitleaks detect`, which scans committed *history*;
+  the pre-commit hook runs `gitleaks protect --staged`, which scans what is about
+  to be committed. So a secret in the working tree is invisible to `detect` until
+  it is committed — a key-shaped test fixture was written, read by a test, and
+  passed several green `just check` runs before the pre-commit hook caught it at
+  the commit boundary. That is the design working, but the seam is real: a secret
+  written and read by a test and *never committed* is scanned by neither half. A
+  green `just check` means "no secret in history", not "no secret on disk" —
+  another check honest about a narrower scope than its name.
+
 - **Verify a pinned dependency's actual surface before designing against it.**
   Four times a pinned dependency has not been what an issue assumed: `wasm-opt`
   could not parse components, `keyring`'s API had changed, `instant-acme`'s ARI
