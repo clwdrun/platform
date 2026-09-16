@@ -26,7 +26,9 @@ use pingora::tls::pkey::PKey;
 use pingora::tls::ssl::{NameType, SslRef};
 use pingora::tls::x509::X509;
 
-use crate::cert::{CertResolver, Selection, StoredCert};
+use shared::cert::StoredCert;
+
+use crate::cert::{CertResolver, Selection};
 
 /// A pingora `TlsAccept` callback that serves each org its own certificate.
 pub struct DynamicCert {

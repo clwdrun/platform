@@ -1,5 +1,6 @@
 //! Apps, orgs, versions, share grants.
 
+pub mod acme;
 pub mod auth;
 pub mod db;
 #[cfg(test)]

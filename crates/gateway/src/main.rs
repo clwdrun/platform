@@ -13,7 +13,7 @@ use std::env;
 use std::sync::Arc;
 
 use anyhow::Context as _;
-use gateway::cert::{CertResolver, DirCertStore};
+use gateway::cert::CertResolver;
 use gateway::edge::Edge;
 use gateway::lookup::RouteLookup;
 use gateway::tls::DynamicCert;
@@ -21,6 +21,7 @@ use pingora::apps::http_app::HttpServer;
 use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use pingora::services::listening::Service;
+use shared::cert::DirCertStore;
 
 fn main() -> anyhow::Result<()> {
     shared::telemetry::init();

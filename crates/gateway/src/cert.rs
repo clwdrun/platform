@@ -1,79 +1,20 @@
-//! Per-org certificate storage and SNI-time selection.
+//! SNI-time certificate selection: mapping an inbound SNI name to the per-org
+//! certificate that serves it.
 //!
-//! One wildcard certificate per org — `*.{slug}.clwd.run` — covers every
-//! `{app}.{slug}.clwd.run` host (#5, #18). At handshake time the SNI names the
-//! full host; this module extracts the org and finds its certificate.
-//!
-//! Two seams, deliberately separated:
-//!
-//! - [`CertStore`] — where certificates live. #22 (the secret broker) inherits
-//!   this trait; its Postgres + `age`-encrypted-key implementation sits behind
-//!   it and changes no caller. The trait shape is what survives, so it is what
-//!   matters here.
-//! - [`CertResolver`] — the selection logic (SNI → org → certificate), kept out
-//!   of the pingora `TlsAccept` callback so it is testable without a handshake.
-//!
-//! Every outcome other than "served" is a client-visible handshake failure that
-//! looks identical to an outage from outside, so each is counted in
-//! [`HandshakeMetrics`] and logged — the same visibility a silent renewal
-//! failure would need.
+//! The certificate *store* ([`shared::cert::CertStore`], the two-sided interface
+//! the control plane writes and the gateway reads) lives in `shared`. This
+//! module is the gateway's read side: [`CertResolver`] turns an SNI name into a
+//! [`Selection`], kept out of the pingora `TlsAccept` callback so it is testable
+//! without a handshake. Every outcome other than "served" is a client-visible
+//! handshake failure indistinguishable from an outage, so each is counted in
+//! [`HandshakeMetrics`] and logged.
 
-use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use async_trait::async_trait;
-use thiserror::Error;
+use shared::cert::{CertStore, StoredCert};
 
-use crate::host::{OrgSlug, parse_host};
-
-/// A stored certificate chain and its private key, as PEM bytes.
-///
-/// Bytes rather than parsed TLS types on purpose: the store and the selection
-/// logic stay decoupled from the TLS backend and testable without it, and the
-/// key is parsed only at the moment the handshake needs it.
-#[derive(Clone)]
-pub struct StoredCert {
-    /// The certificate (chain) in PEM.
-    pub cert_pem: Vec<u8>,
-    /// The private key in PEM. Never logged, never serialized — see the `Debug`
-    /// impl, which redacts it.
-    pub key_pem: Vec<u8>,
-}
-
-impl fmt::Debug for StoredCert {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        // The private key must never reach a log line or an error message.
-        f.debug_struct("StoredCert")
-            .field("cert_pem", &format_args!("{} bytes", self.cert_pem.len()))
-            .field("key_pem", &"<redacted>")
-            .finish()
-    }
-}
-
-/// Where per-org certificates live, keyed by org slug.
-///
-/// #22 inherits this trait. Implementations must be cheap to share (`Arc`ed and
-/// called per handshake).
-#[async_trait]
-pub trait CertStore: Send + Sync {
-    /// The certificate for `org`, or `None` if none is stored yet (unissued, or
-    /// issuance not complete).
-    ///
-    /// # Errors
-    /// [`CertStoreError`] if the store cannot be reached.
-    async fn cert_for(&self, org: &OrgSlug) -> Result<Option<StoredCert>, CertStoreError>;
-}
-
-/// Why a certificate store lookup could not be answered.
-#[derive(Debug, Error)]
-#[non_exhaustive]
-pub enum CertStoreError {
-    /// The store could not be reached. A handshake with no cached alternative
-    /// must fail closed, not serve a wrong or absent certificate.
-    #[error("certificate store unavailable: {0}")]
-    Unavailable(String),
-}
+use crate::host::parse_host;
 
 /// The outcome of resolving an SNI name to a certificate.
 #[derive(Debug)]
@@ -188,57 +129,12 @@ impl CertResolver {
     }
 }
 
-/// A file-backed [`CertStore`] for development ONLY, until #22's secret broker
-/// exists: it reads `{dir}/{org}/cert.pem` and `{dir}/{org}/key.pem`.
-///
-/// **This must not become the production answer.** It stores unencrypted private
-/// keys as plaintext files on the gateway host — and the gateway is the shared,
-/// multi-tenant case that clwd#71 says a file store is explicitly wrong for (a
-/// file store is right for a dev laptop and nothing shared). It exists behind
-/// the [`CertStore`] trait purely so per-org selection can be built and tested
-/// before issuance and storage land; **#22 (the secret broker: `age` at rest,
-/// keys off the host filesystem) replaces it**, and the trait means that swap
-/// touches no caller. Do not deploy this to a shared gateway.
-///
-/// `org` is an [`OrgSlug`], already validated as a single DNS label, so it
-/// cannot contain a path separator or `..` — no traversal.
-pub struct DirCertStore {
-    dir: std::path::PathBuf,
-}
-
-impl DirCertStore {
-    /// A store rooted at `dir`.
-    #[must_use]
-    pub fn new(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self { dir: dir.into() }
-    }
-}
-
-#[async_trait]
-impl CertStore for DirCertStore {
-    async fn cert_for(&self, org: &OrgSlug) -> Result<Option<StoredCert>, CertStoreError> {
-        let base = self.dir.join(org.as_str());
-        match tokio::fs::read(base.join("cert.pem")).await {
-            Ok(cert_pem) => {
-                // A cert with no key beside it is a store-integrity fault, not a
-                // missing cert: surface it rather than silently reading as NoCert.
-                let key_pem = tokio::fs::read(base.join("key.pem")).await.map_err(|e| {
-                    CertStoreError::Unavailable(format!("key for {}: {e}", org.as_str()))
-                })?;
-                Ok(Some(StoredCert { cert_pem, key_pem }))
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(CertStoreError::Unavailable(format!(
-                "cert for {}: {e}",
-                org.as_str()
-            ))),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+
+    use async_trait::async_trait;
+    use shared::cert::{CertStoreError, OrgSlug};
 
     use super::*;
 
@@ -255,6 +151,12 @@ mod tests {
                 return Err(CertStoreError::Unavailable("test store is down".to_owned()));
             }
             Ok(self.certs.get(org.as_str()).cloned())
+        }
+        async fn store(&self, _org: &OrgSlug, _cert: &StoredCert) -> Result<(), CertStoreError> {
+            if self.down {
+                return Err(CertStoreError::Unavailable("test store is down".to_owned()));
+            }
+            Ok(())
         }
     }
 
@@ -316,15 +218,5 @@ mod tests {
             Selection::Unavailable
         ));
         assert_eq!(HandshakeMetrics::get(&r.metrics().unavailable), 1);
-    }
-
-    #[test]
-    fn debug_never_prints_the_private_key() {
-        let rendered = format!("{:?}", cert());
-        assert!(rendered.contains("<redacted>"), "{rendered}");
-        assert!(
-            !rendered.contains("PRIVATE KEY"),
-            "the key must not appear: {rendered}"
-        );
     }
 }

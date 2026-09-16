@@ -15,19 +15,10 @@ use std::fmt;
 
 use thiserror::Error;
 
-/// Longest a single DNS label may be, per RFC 1035 and the `orgs.slug` /
-/// `apps.name` CHECK constraints in `migrations/`.
-const MAX_LABEL_LEN: usize = 63;
-
-/// An org slug: the `{org}` in `{app}.{org}.clwd.run`, and the label a per-org
-/// wildcard certificate (`*.{slug}.clwd.run`, #5) is issued for.
-///
-/// Construct only via [`OrgSlug::parse`], which enforces the DNS-label rule the
-/// `orgs.slug` column enforces in the database. Reserved-word rejection is the
-/// database's job (`reserved_slugs`), not this type's — the gateway routes what
-/// exists rather than re-deciding what may exist.
-#[derive(Clone, PartialEq, Eq, Hash)]
-pub struct OrgSlug(String);
+// The org slug and its DNS-label rule live in `shared` (they key the shared
+// certificate store); re-exported here so the routing parser and its callers
+// keep using `host::OrgSlug`.
+pub use shared::cert::{MAX_LABEL_LEN, OrgSlug, is_valid_label};
 
 /// An app name: the `{app}` in `{app}.{org}.clwd.run`. Same DNS-label rule as a
 /// slug, but mutable and unique only within its org (#18), so it carries no
@@ -69,26 +60,6 @@ pub enum HostError {
     InvalidLabel,
 }
 
-impl OrgSlug {
-    /// Parse a single DNS label as an org slug, applying the `orgs.slug` rule.
-    ///
-    /// # Errors
-    /// Returns [`HostError::InvalidLabel`] if `label` is not a valid DNS label.
-    pub fn parse(label: &str) -> Result<Self, HostError> {
-        if is_valid_label(label) {
-            Ok(Self(label.to_owned()))
-        } else {
-            Err(HostError::InvalidLabel)
-        }
-    }
-
-    /// The slug as a string slice.
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl AppName {
     /// Parse a single DNS label as an app name, applying the `apps.name` rule.
     ///
@@ -109,12 +80,6 @@ impl AppName {
     }
 }
 
-impl fmt::Debug for OrgSlug {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "OrgSlug({})", self.0)
-    }
-}
-
 impl fmt::Debug for AppName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "AppName({})", self.0)
@@ -123,29 +88,8 @@ impl fmt::Debug for AppName {
 
 impl fmt::Debug for AppHost {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}.{}", self.app.0, self.org.0)
+        write!(f, "{}.{}", self.app.0, self.org.as_str())
     }
-}
-
-/// True when `label` satisfies the platform DNS-label rule, matching the regex
-/// `^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$` used by the `orgs.slug` and
-/// `apps.name` CHECK constraints. Kept as code rather than a regex dependency:
-/// the rule is four conditions and pulling in a regex engine to express them
-/// would be more to audit, not less.
-///
-// ponytail: hand-rolled to avoid a regex dep; mirrors the DB CHECK verbatim.
-// If the DB rule changes, this changes with it — the parity test pins them.
-fn is_valid_label(label: &str) -> bool {
-    let bytes = label.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_LABEL_LEN {
-        return false;
-    }
-    let is_ldh = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-';
-    if !bytes.iter().all(|&b| is_ldh(b)) {
-        return false;
-    }
-    // No leading or trailing hyphen. `first`/`last` are safe: non-empty above.
-    bytes[0] != b'-' && bytes[bytes.len() - 1] != b'-'
 }
 
 /// Resolve an inbound host to the app host it addresses, if any.
@@ -186,7 +130,9 @@ pub fn parse_host(host: &str, apex: &str) -> Result<AppHost, HostError> {
 
     Ok(AppHost {
         app: AppName::parse(app)?,
-        org: OrgSlug::parse(org)?,
+        // OrgSlug lives in `shared` and returns its own label error; the routing
+        // layer reports every bad label as HostError::InvalidLabel.
+        org: OrgSlug::parse(org).map_err(|_| HostError::InvalidLabel)?,
     })
 }
 

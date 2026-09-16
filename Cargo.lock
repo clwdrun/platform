@@ -1187,6 +1187,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "apalis",
+ "async-trait",
  "axum 0.8.9",
  "builder",
  "bytes",
@@ -5967,12 +5968,14 @@ name = "shared"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "clwd-bundle",
  "opentelemetry",
  "opentelemetry-otlp",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "tracing-subscriber",
  "uuid",

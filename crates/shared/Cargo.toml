@@ -10,6 +10,9 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 clwd-bundle = { workspace = true }
 thiserror = { workspace = true }
+# CertStore is an async trait with a filesystem-backed dev implementation.
+async-trait = { workspace = true }
+tokio = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 opentelemetry = { workspace = true }
