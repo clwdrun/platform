@@ -2,6 +2,7 @@
 
 pub mod acme;
 pub mod auth;
+pub mod cloudflare;
 pub mod db;
 #[cfg(test)]
 mod envelope_probe;

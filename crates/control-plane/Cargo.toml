@@ -29,9 +29,9 @@ tracing-subscriber = { workspace = true }
 # the vendored OpenAPI 3.1 JSON Schema. No HTTP or file resolution: every schema
 # it needs is in the repository, so the check is offline and deterministic.
 jsonschema = { version = "0.56.0", default-features = false }
-# The ACME issuance test's challtestsrv DNS provider POSTs TXT records to the
-# challtestsrv management API over HTTP.
-reqwest = { workspace = true }
+# A mock HTTP server for the Cloudflare provider test: exercises request
+# construction and error mapping without hitting live Cloudflare.
+wiremock = "0.6"
 
 [dependencies]
 axum = { workspace = true }
@@ -61,6 +61,10 @@ instant-acme = { workspace = true, features = ["rcgen"] }
 # runtime — so the provider must be chosen explicitly. aws-lc-rs matches
 # instant-acme's default. See `acme::install_crypto_provider`.
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# The Cloudflare DnsProvider: reqwest for the API, hickory-resolver for the
+# authoritative-NS propagation check.
+reqwest = { workspace = true }
+hickory-resolver = { workspace = true }
 # Load-bearing, unlike the last time control-plane depended on this. The
 # publish route calls `validate` and `ArtifactStore::put`; #45 took the
 # dependency only to read one constant, which pulled 39 crates in for a

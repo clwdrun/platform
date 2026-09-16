@@ -78,7 +78,20 @@ tower-cookies = "0.11.0"
 # boundary. `json` pulls in serde_json for `.json()`.
 # 0.13 to match the version opendal and opentelemetry-http already pull in —
 # pinning 0.12 would add a second copy to the graph.
-reqwest = { version = "0.13", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = [
+  "json",
+  # `.query()` for the Cloudflare list-records call's query string.
+  "query",
+  # The Cloudflare API is HTTPS. rustls (not native-tls) to avoid an OpenSSL
+  # system dependency; the `rustls` feature bundles the aws-lc-rs provider, the
+  # same one `acme::install_crypto_provider` installs, so there is no second
+  # provider. `webpki-roots` bundles the CA roots (no system trust-store dep).
+  "rustls",
+] }
+# Authoritative-nameserver DNS queries for the ACME DNS-01 propagation check: a
+# recursive resolver's view lags, and validating before the authoritative NS
+# serves the record burns a failed-validation attempt.
+hickory-resolver = "0.26"
 # `http` types for the pingora `ServeHttp` response; `async-trait` for its trait.
 # Both are already in the graph transitively, so they add no crates.
 http = "1"
