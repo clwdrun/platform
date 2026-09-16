@@ -47,6 +47,17 @@ async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
+# ACME certificate issuance (#5). The `rcgen` feature makes `Order::finalize()`
+# generate the keypair and CSR and return the key PEM — so the control plane
+# needs no separate TLS/crypto stack (boring lives in the gateway, via pingora,
+# and issuance does not run there). ARI is base API, not feature-gated.
+instant-acme = { workspace = true, features = ["rcgen"] }
+# Only to install the process-level CryptoProvider instant-acme's rustls needs.
+# When both `aws-lc-rs` and `ring` end up linked (feature unification across the
+# workspace pulls both), rustls 0.23 refuses to auto-select one and panics at
+# runtime — so the provider must be chosen explicitly. aws-lc-rs matches
+# instant-acme's default. See `acme::install_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 # Load-bearing, unlike the last time control-plane depended on this. The
 # publish route calls `validate` and `ArtifactStore::put`; #45 took the
 # dependency only to read one constant, which pulled 39 crates in for a

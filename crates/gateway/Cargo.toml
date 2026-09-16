@@ -11,7 +11,6 @@ path = "src/main.rs"
 
 [dependencies]
 pingora = { workspace = true }
-instant-acme = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
 http = { workspace = true }

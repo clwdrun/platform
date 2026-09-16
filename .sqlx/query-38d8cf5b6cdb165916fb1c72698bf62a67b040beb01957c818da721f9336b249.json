@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select slug from orgs where id = $1 and deleted_at is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "orgs",
+            "name": "slug"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "38d8cf5b6cdb165916fb1c72698bf62a67b040beb01957c818da721f9336b249"
+}
