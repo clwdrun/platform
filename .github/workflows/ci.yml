@@ -77,6 +77,16 @@ jobs:
 
     env:
       DATABASE_URL: postgres://postgres:postgres@localhost:5432/clwd_platform
+      # The ACME issuance test (crates/control-plane/tests/acme_issue.rs) drives
+      # real DNS-01 against Pebble + challtestsrv, started by the step below. The
+      # test reads these and fails RED if the servers are unreachable — it never
+      # skips, so it cannot be green in the one environment where issuance is
+      # untested. Pebble cannot be a `services:` container: those cannot override
+      # the command, and Pebble needs `-dnsserver <challtestsrv>` args — so it is
+      # started with `just pebble-up` (the same recipe developers run) instead.
+      PEBBLE_DIR: https://localhost:14000/dir
+      CHALLTESTSRV: http://localhost:8055
+      PEBBLE_CA: ${{ github.workspace }}/.pebble/pebble.minica.pem
 
     steps:
       # Full history: `just secrets` runs `gitleaks detect`, which walks every
@@ -182,6 +192,13 @@ jobs:
           install -m 0755 gitleaks /usr/local/bin/gitleaks
           rm -f "$archive" gitleaks
           gitleaks version
+
+      # Start the test ACME CA (Pebble) + mock DNS (challtestsrv) before the
+      # gate, so the issuance test in `just check`'s `test` step runs against
+      # them. `just pebble-up` fails loud (bounded readiness wait) if a container
+      # does not start, rather than letting the test hang to the job timeout.
+      - name: Start Pebble + challtestsrv
+        run: just pebble-up
 
       # One command, the same one a developer runs. Its steps are:
       # secrets, fmt-check, seam, rollback-plans, migrate, clippy,

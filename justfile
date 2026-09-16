@@ -241,7 +241,18 @@ pebble-up:
     mkdir -p .pebble
     docker cp "$cid:/test/certs/pebble.minica.pem" .pebble/pebble.minica.pem >/dev/null
     docker rm "$cid" >/dev/null
-    until curl -ks https://localhost:14000/dir >/dev/null 2>&1; do sleep 0.2; done
+    # Bounded wait: an unbounded `until` would hang CI to the job timeout if a
+    # container failed to start, reading as a hang rather than the startup
+    # failure it is.
+    for _ in $(seq 1 100); do
+      curl -ks https://localhost:14000/dir >/dev/null 2>&1 && break
+      sleep 0.2
+    done
+    if ! curl -ks https://localhost:14000/dir >/dev/null 2>&1; then
+      echo "error: Pebble did not become ready; logs follow" >&2
+      docker logs clwd-pebble 2>&1 | tail -20 >&2
+      exit 1
+    fi
     echo 'PEBBLE_DIR=https://localhost:14000/dir'
     echo 'CHALLTESTSRV=http://localhost:8055'
     echo 'PEBBLE_CA='"$(pwd)"'/.pebble/pebble.minica.pem'
