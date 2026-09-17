@@ -97,6 +97,24 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Free runner disk before anything builds. ubuntu-latest guarantees only
+      # ~14 GB free, and a full-workspace debug build with the C/C++ static
+      # archives this tree links (boring-ssl, aws-lc, ring, zstd, all with
+      # debuginfo) does not fit beside the restored cargo cache: the link of
+      # the control-plane test binary died three runs in a row with rust-lld
+      # SIGBUS, the classic symptom of an output mmap hitting a full
+      # filesystem, while the same toolchain links it fine locally. Only
+      # preinstalled, build-unrelated toolchains go — never target/, so the
+      # cargo cache above stays valid — and the step ends with df so the log
+      # shows the headroom it bought. Each rm is guarded: a missing path must
+      # not fail the job when the image changes under it.
+      - name: Free runner disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" || true
+          sudo docker image prune --all --force >/dev/null 2>&1 || true
+          df -h /
+
       # rust-toolchain.toml pins the version and components. Installing via
       # rustup rather than an action keeps one source of truth for which
       # compiler this workspace builds with.
