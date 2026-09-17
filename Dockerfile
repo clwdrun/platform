@@ -18,13 +18,17 @@ WORKDIR /src
 #   cmake, make, g++        pingora -> flate2 -> libz-ng-sys builds zlib-ng
 #                           with cmake, which needs a make program and a C++
 #                           compiler. rust:slim ships gcc but neither of those.
+#   libclang-dev            pingora -> boring-sys builds BoringSSL through
+#                           bindgen, which needs libclang at build time. Without
+#                           it the gateway image fails with "Unable to find
+#                           libclang" while control-plane (no boring) builds.
 #   git, ca-certificates    the seam dependency is a private git repository, and
 #                           cargo's built-in fetcher cannot carry credentials.
 #                           CARGO_NET_GIT_FETCH_WITH_CLI hands the fetch to git,
 #                           which can — the same arrangement ci.yml uses.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-      pkg-config libssl-dev cmake make g++ git ca-certificates \
+      pkg-config libssl-dev cmake make g++ libclang-dev git ca-certificates \
  && rm -rf /var/lib/apt/lists/*
 
 COPY . .
