@@ -19,7 +19,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use instant_acme::{Account, ChallengeType, Identifier, NewOrder, Order, OrderStatus, RetryPolicy};
+use instant_acme::{
+    Account, CertificateIdentifier, ChallengeType, Identifier, NewOrder, Order, OrderStatus,
+    RetryPolicy,
+};
+use rustls_pki_types::CertificateDer;
 use shared::cert::{CertStore, OrgSlug, StoredCert};
 use sqlx::PgPool;
 use thiserror::Error;
@@ -109,9 +113,10 @@ pub enum DnsError {
 /// | before the order URL is persisted | nothing | next attempt starts a fresh order — correct, none exists |
 /// | order persisted, challenges not yet valid | order URL in DB, maybe a TXT record | **resume** the order via `order_url` (not a fresh one — this is the rate-limit-safe path); already-valid authorizations are skipped; TXT re-provisioned |
 /// | challenges valid, before `finalize` | order Ready | resume → finalize → fetch |
-/// | after `finalize`, before the cert is stored | order Valid/Processing, but the key `finalize` generated is **lost** (returned once) | resume detects Valid/Processing with no stored cert and starts a **fresh** order (one rate-limit slot) — a narrow in-process window between `finalize` and the store write |
-/// | cert stored, before `cert_mark_issued` | DB says `pending`, cert is servable | the gateway serves it (it reads the store, not the DB); the reconciler re-stores (idempotent) and marks issued — benign |
-/// | any crash leaving a TXT record | stale `_acme-challenge` TXT | best-effort `remove_txt` on every exit path; the reconciler sweeps orphans |
+/// | after `finalize`, before the cert is stored | order Valid/Processing, but the key `finalize` generated is **lost** (returned once) | resume detects an undrivable order and starts a **fresh** order (one rate-limit slot) — a narrow in-process window between `finalize` and the store write |
+/// | order failed validation | order Invalid, URL kept for visibility | resume detects an undrivable order and starts a **fresh** order — resuming it would no-op to a false success, so the dead URL is never driven twice |
+/// | cert stored, before `cert_mark_issued` | DB says `pending` (first issuance) or `renewing` (reconciler), cert is servable | the gateway serves it (it reads the store, not the DB); the next pass resumes via `order_url` and converges to `issued` — a benign extra order in a narrow window |
+/// | any crash leaving a TXT record | stale `_acme-challenge` TXT | best-effort `remove_txt` on every exit path; a stale record is harmless (challenges are single-use values) and ages out by TTL |
 ///
 /// The account credentials are persisted once by the caller (issuance shares one
 /// account across all orgs); losing them costs a new account, which is not
@@ -143,6 +148,12 @@ pub enum IssueError {
     /// The CA finished the order in a state that yields no usable certificate.
     #[error("ACME order ended in an unusable state: {0:?}")]
     OrderState(OrderStatus),
+    /// The issued certificate could not be parsed (for its validity or ARI id).
+    #[error("parsing the issued certificate: {0}")]
+    CertParse(String),
+    /// Renewal was asked for an org that has no stored certificate to replace.
+    #[error("no stored certificate to renew for this org")]
+    NothingToRenew,
 }
 
 impl From<instant_acme::Error> for IssueError {
@@ -184,7 +195,73 @@ impl CertIssuer {
     /// [`IssueError`] for any ACME, DNS, store, or database failure; the failure
     /// is also recorded in `certificates.last_renewal_error` before returning.
     pub async fn issue(&self, org_id: OrgId, slug: &OrgSlug) -> Result<(), IssueError> {
-        match self.issue_inner(org_id, slug).await {
+        self.attempt(org_id, slug, None).await
+    }
+
+    /// Renew `org`'s certificate: issue a new one whose ACME order `replaces` the
+    /// currently-stored certificate. The `replaces` link is what makes the
+    /// renewal exempt from the 50-new-certificates-per-week rate limit
+    /// (RFC 9773). A renewal for an org with no stored certificate is
+    /// [`IssueError::NothingToRenew`].
+    ///
+    /// Direct callers must drive to completion: a crash between the order
+    /// persist and `cert_mark_issued` leaves `pending`, which the reconciler
+    /// claim does not cover — new callers go through the claim (see
+    /// [`db::claim_due_for_renewal`]).
+    ///
+    /// # Errors
+    /// [`IssueError`] as [`CertIssuer::issue`], plus [`IssueError::NothingToRenew`].
+    pub async fn renew(&self, org_id: OrgId, slug: &OrgSlug) -> Result<(), IssueError> {
+        // A store outage here must be recorded, not just returned: the claim
+        // already cleared `last_renewal_error`, so returning bare would leave
+        // the row `renewing` with no signal and retry on the stale tier
+        // instead of the failed tier. (`NothingToRenew` stays unrecorded — it
+        // is the reconciler's cue to issue instead, not a failure.)
+        let current = match self.store.cert_for(slug).await {
+            Ok(current) => current.ok_or(IssueError::NothingToRenew)?,
+            Err(error) => {
+                let error = IssueError::Store(error);
+                if let Err(db_error) =
+                    db::cert_mark_failed(&self.pool, org_id, &error.to_string()).await
+                {
+                    tracing::error!(%db_error, "could not record certificate failure");
+                }
+                return Err(error);
+            }
+        };
+        // The DER of the current cert identifies what this renewal replaces. If
+        // the stored PEM does not parse, there is no `CertificateIdentifier` to
+        // put in `replaces` — so the order below counts against the
+        // new-certificate bucket instead of being exempt. That is a silent
+        // rate-limit consumer unless it is loud here, so this degrades to an
+        // unlinked order with an error log rather than failing the renewal.
+        let replaces_der = match first_cert_der(&current.cert_pem) {
+            Ok(der) => Some(der),
+            Err(error) => {
+                tracing::error!(
+                    org = slug.as_str(),
+                    %error,
+                    "stored certificate unparseable; renewing WITHOUT replaces \
+                     (counts against the new-certificate rate-limit bucket)"
+                );
+                None
+            }
+        };
+        self.attempt(org_id, slug, replaces_der).await
+    }
+
+    /// Shared issue/renew path with failure recording. `replaces_der` is the DER
+    /// of the certificate a renewal replaces, or `None` for a first issuance.
+    async fn attempt(
+        &self,
+        org_id: OrgId,
+        slug: &OrgSlug,
+        replaces_der: Option<Vec<u8>>,
+    ) -> Result<(), IssueError> {
+        match self
+            .issue_inner(org_id, slug, replaces_der.as_deref())
+            .await
+        {
             Ok(()) => Ok(()),
             Err(error) => {
                 // A failure must be visible, not silent (a cert that never issues
@@ -200,51 +277,68 @@ impl CertIssuer {
         }
     }
 
-    async fn issue_inner(&self, org_id: OrgId, slug: &OrgSlug) -> Result<(), IssueError> {
+    async fn issue_inner(
+        &self,
+        org_id: OrgId,
+        slug: &OrgSlug,
+        replaces_der: Option<&[u8]>,
+    ) -> Result<(), IssueError> {
         // The wildcard goes in the IDENTIFIER — `*.{slug}.clwd.run` — not the
         // challenge name. Ordering the base domain here yields a non-wildcard
         // certificate that works for one host and fails for every app.
         let wildcard = format!("*.{}.{}", slug.as_str(), self.apex);
         let identifier = Identifier::Dns(wildcard);
 
-        // Resume an in-flight order if one is persisted; otherwise start one and
-        // persist its URL before doing any work, so a crash resumes rather than
-        // restarts (the rate-limit-safe path).
+        // Resume an in-flight order if one is persisted and still drivable;
+        // otherwise start fresh and persist its URL before doing any work, so a
+        // crash resumes rather than restarts (the rate-limit-safe path).
+        //
+        // Only `Pending` (challenges to complete) and `Ready` (to finalize)
+        // are drivable. Anything else — `Valid`/`Processing` (finalize already
+        // ran and its key died with that process), `Invalid` (a failed
+        // validation poisoned this URL; resuming it would no-op to a false
+        // success), or an order the CA no longer knows (fetch error) — starts
+        // fresh. A fresh order costs one rate-limit slot and is logged; a
+        // resumed dead order costs the certificate with no signal, which is
+        // strictly worse.
         let record = db::cert_record(&self.pool, org_id)
             .await
             .map_err(IssueError::Db)?;
         let mut order = match record.and_then(|r| r.order_url) {
-            Some(url) => self.account.order(url).await?,
+            Some(url) => match self.account.order(url).await {
+                Ok(mut resumed) => {
+                    // `state` takes `&mut`, so the drivability check lives here
+                    // in the body rather than in a match guard.
+                    if matches!(
+                        resumed.state().status,
+                        OrderStatus::Pending | OrderStatus::Ready
+                    ) {
+                        resumed
+                    } else {
+                        tracing::warn!(
+                            org = slug.as_str(),
+                            status = ?resumed.state().status,
+                            "resumed order is past driving; starting a fresh order"
+                        );
+                        self.fresh_order(org_id, slug, &identifier, replaces_der)
+                            .await?
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        org = slug.as_str(),
+                        %error,
+                        "persisted order is unreachable at the CA; starting a fresh order"
+                    );
+                    self.fresh_order(org_id, slug, &identifier, replaces_der)
+                        .await?
+                }
+            },
             None => {
-                let order = self
-                    .account
-                    .new_order(&NewOrder::new(std::slice::from_ref(&identifier)))
-                    .await?;
-                db::cert_mark_pending(&self.pool, org_id, order.url())
-                    .await
-                    .map_err(IssueError::Db)?;
-                order
+                self.fresh_order(org_id, slug, &identifier, replaces_der)
+                    .await?
             }
         };
-
-        let status = order.state().status;
-        if matches!(status, OrderStatus::Processing | OrderStatus::Valid) {
-            // finalize already ran in a prior process; the key it generated was
-            // lost with that process. The order's certificate is unusable without
-            // it, so start fresh (see the crash-window map, window 4).
-            tracing::warn!(
-                org = slug.as_str(),
-                ?status,
-                "resumed order is past finalize but its key is gone; starting a fresh order"
-            );
-            order = self
-                .account
-                .new_order(&NewOrder::new(std::slice::from_ref(&identifier)))
-                .await?;
-            db::cert_mark_pending(&self.pool, org_id, order.url())
-                .await
-                .map_err(IssueError::Db)?;
-        }
 
         // Complete any pending authorizations. Cleanup is best-effort on every
         // exit path; collect the challenge record names to remove afterwards.
@@ -255,8 +349,8 @@ impl CertIssuer {
 
         for name in &challenge_records {
             if let Err(e) = self.dns.remove_txt(name).await {
-                // A stale challenge TXT is harmless; an accumulation is a mess.
-                // Log and move on — the reconciler sweeps what this misses.
+                // A stale challenge TXT is harmless (single-use value, short
+                // TTL). Log and move on — nothing reaps these yet.
                 tracing::warn!(%e, name, "could not clean up challenge record");
             }
         }
@@ -330,12 +424,116 @@ impl CertIssuer {
         // 'issued' with no cert would not be.
         let slug = db_org_slug(&self.pool, org_id).await?;
         self.store.store(&slug, &cert).await?;
-        let (not_after, renew_after) = not_after_and_renewal(&cert)?;
+        let (not_after, renew_after) = self.capture_schedule(&cert.cert_pem).await?;
         db::cert_mark_issued(&self.pool, org_id, not_after, renew_after)
             .await
             .map_err(IssueError::Db)?;
         Ok(())
     }
+
+    /// Start a fresh order and persist its URL before any challenge work, so a
+    /// crash from here on resumes rather than restarts.
+    async fn fresh_order(
+        &self,
+        org_id: OrgId,
+        slug: &OrgSlug,
+        identifier: &Identifier,
+        replaces_der: Option<&[u8]>,
+    ) -> Result<Order, IssueError> {
+        let order = self.new_order(slug, identifier, replaces_der).await?;
+        db::cert_mark_pending(&self.pool, org_id, order.url())
+            .await
+            .map_err(IssueError::Db)?;
+        Ok(order)
+    }
+
+    /// Start a new ACME order for `identifier`, setting `replaces` when this is a
+    /// renewal (the DER of the certificate being replaced). The `replaces` link
+    /// is what makes a renewal rate-limit-exempt (RFC 9773); its absence on a
+    /// renewal would make the renewal count against the new-certificate bucket.
+    /// When the old certificate's DER yields no ARI identifier, the order goes
+    /// out WITHOUT `replaces` — and loudly so (error log naming the bucket),
+    /// because a quiet fallback here is a silent rate-limit consumer.
+    async fn new_order(
+        &self,
+        slug: &OrgSlug,
+        identifier: &Identifier,
+        replaces_der: Option<&[u8]>,
+    ) -> Result<Order, IssueError> {
+        let identifiers = std::slice::from_ref(identifier);
+        match replaces_der {
+            Some(der) => {
+                let cert_der = CertificateDer::from(der);
+                // `into_owned` frees the order from borrowing the DER buffer.
+                match CertificateIdentifier::try_from(&cert_der) {
+                    Ok(replaces) => Ok(self
+                        .account
+                        .new_order(&NewOrder::new(identifiers).replaces(replaces.into_owned()))
+                        .await?),
+                    Err(error) => {
+                        tracing::error!(
+                            org = slug.as_str(),
+                            %error,
+                            "old certificate yields no ARI identifier; ordering WITHOUT \
+                             replaces (counts against the new-certificate rate-limit bucket)"
+                        );
+                        Ok(self.account.new_order(&NewOrder::new(identifiers)).await?)
+                    }
+                }
+            }
+            None => Ok(self.account.new_order(&NewOrder::new(identifiers)).await?),
+        }
+    }
+
+    /// From the just-issued certificate, capture its real `notAfter` and the time
+    /// to renew after. The renewal time is the ARI-suggested window start
+    /// (RFC 9773) when the CA offers ARI; when it does not (or the call fails),
+    /// it falls back to two-thirds through the certificate's lifetime — the
+    /// reconciler keeps renewing on the certificate's own clock rather than
+    /// stalling because ARI is down. The fallback is logged as degraded.
+    async fn capture_schedule(
+        &self,
+        cert_pem: &[u8],
+    ) -> Result<(DateTime<Utc>, DateTime<Utc>), IssueError> {
+        let der = first_cert_der(cert_pem)?;
+        let (_, parsed) = x509_parser::parse_x509_certificate(&der)
+            .map_err(|e| IssueError::CertParse(format!("x509: {e}")))?;
+        let to_utc = |secs: i64| {
+            DateTime::from_timestamp(secs, 0)
+                .ok_or_else(|| IssueError::CertParse("certificate time out of range".to_owned()))
+        };
+        let not_after = to_utc(parsed.validity().not_after.timestamp())?;
+        let not_before = to_utc(parsed.validity().not_before.timestamp())?;
+
+        let cert_der = CertificateDer::from(der.as_slice());
+        let renew_after = match CertificateIdentifier::try_from(&cert_der) {
+            Ok(id) => match self.account.renewal_info(&id).await {
+                Ok((info, _retry)) => to_utc(info.suggested_window.start.unix_timestamp())?,
+                Err(error) => {
+                    tracing::warn!(%error, "ARI unavailable; renewing at 2/3 lifetime (degraded)");
+                    two_thirds(not_before, not_after)
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, "no ARI cert id; renewing at 2/3 lifetime (degraded)");
+                two_thirds(not_before, not_after)
+            }
+        };
+        Ok((not_after, renew_after))
+    }
+}
+
+/// The first certificate's DER from a PEM chain.
+fn first_cert_der(cert_pem: &[u8]) -> Result<Vec<u8>, IssueError> {
+    let (_, pem) = x509_parser::pem::parse_x509_pem(cert_pem)
+        .map_err(|e| IssueError::CertParse(format!("PEM: {e}")))?;
+    Ok(pem.contents)
+}
+
+/// Two-thirds through `[not_before, not_after]` — the ARI-unavailable fallback
+/// renewal time. Inside a typical lifetime with margin to retry before expiry.
+fn two_thirds(not_before: DateTime<Utc>, not_after: DateTime<Utc>) -> DateTime<Utc> {
+    not_before + (not_after - not_before) * 2 / 3
 }
 
 /// The org's slug, needed to key the certificate store. Read here rather than
@@ -353,21 +551,6 @@ async fn db_org_slug(pool: &PgPool, org_id: OrgId) -> Result<OrgSlug, IssueError
             "stored org slug is not a valid label",
         ))
     })
-}
-
-/// Extract the certificate's notAfter and derive a renewal time. This is a
-/// placeholder: Phase 4 replaces the halfway-point heuristic with an
-/// ARI-coordinated window (`Account::renewal_info`). Kept simple here so the
-/// reconciler has a value to schedule against.
-fn not_after_and_renewal(_cert: &StoredCert) -> Result<(DateTime<Utc>, DateTime<Utc>), IssueError> {
-    // ponytail: not parsing the cert yet — Phase 4 owns notAfter + ARI. Until
-    // then, schedule a renewal check in ~60 days (inside a 90-day Let's Encrypt
-    // lifetime) so nothing goes unrenewed while the real logic lands.
-    let now = Utc::now();
-    Ok((
-        now + chrono::Duration::days(90),
-        now + chrono::Duration::days(60),
-    ))
 }
 
 #[cfg(test)]

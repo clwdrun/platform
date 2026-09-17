@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update certificates set last_renewal_attempt = now() - ($1::bigint * interval '1 second') where org_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c8112e3d09fb9b415d4642a6e71def7c6c15378be1c4e9d35c8c1d2c48796b12"
+}

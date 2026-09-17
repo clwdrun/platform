@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use control_plane::acme::{CertIssuer, DnsError, DnsProvider};
 use control_plane::db;
 use instant_acme::{Account, NewAccount};
-use shared::cert::{CertStore, DirCertStore, OrgSlug};
+use shared::cert::{CertStore, CertStoreError, DirCertStore, OrgSlug, StoredCert};
 use sqlx::PgPool;
 
 fn env_or(key: &str, default: &str) -> String {
@@ -207,6 +207,260 @@ async fn an_interrupted_order_is_resumed_not_restarted(pool: PgPool) {
     assert!(
         cert_store.cert_for(&slug).await.expect("read").is_some(),
         "the resumed issuance stored a certificate"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn renewal_replaces_the_stored_certificate(pool: PgPool) {
+    let org = db::create_org(&pool, "gamma").await.expect("org");
+    let slug = OrgSlug::parse("gamma").expect("slug");
+    let (cert_store, dir) = store(slug.as_str());
+    let cert_store = std::sync::Arc::new(cert_store);
+    let issuer = CertIssuer::new(
+        pebble_account().await,
+        std::sync::Arc::new(ChallTestSrvDns::new()),
+        cert_store.clone(),
+        pool.clone(),
+        "clwd.run",
+    );
+
+    // First issuance stores a cert and, via ARI (Pebble supports it), a real
+    // not_after and renewal time.
+    issuer.issue(org.id, &slug).await.expect("first issuance");
+    let first = cert_store
+        .cert_for(&slug)
+        .await
+        .expect("read")
+        .expect("issued")
+        .cert_pem;
+    let before = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(before.state, "issued");
+
+    // Renew: a new order that `replaces` the stored cert (RFC 9773, rate-limit
+    // exempt). The stored certificate must change to the renewed one. That
+    // `replaces` is on the wire, not just in the code, is proven by
+    // `a_renewal_from_another_account_is_rejected` — without it the renewal
+    // would succeed as an ordinary order from any account.
+    issuer.renew(org.id, &slug).await.expect("renewal");
+    let renewed = cert_store
+        .cert_for(&slug)
+        .await
+        .expect("read")
+        .expect("renewed")
+        .cert_pem;
+    assert_ne!(
+        first, renewed,
+        "renewal replaced the stored certificate with a new one"
+    );
+    let after = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(after.state, "issued");
+    assert_eq!(
+        after.order_url, None,
+        "the renewal order is cleared once done"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_renewal_failure_is_recorded_not_silent(pool: PgPool) {
+    let org = db::create_org(&pool, "delta").await.expect("org");
+    let slug = OrgSlug::parse("delta").expect("slug");
+    let (inner, dir) = store(slug.as_str());
+
+    // A store that fails every write after the first: the first issuance
+    // stores fine, the renewal's persist fails deterministically.
+    //
+    // Deliberately NOT a failing DNS provider. Pebble reuses a valid
+    // authorization 50% of the time (its startup log says so), which lets a
+    // renewal skip the challenge entirely and succeed despite a broken DNS
+    // provider — a coin flip, not a test. The store write, by contrast, runs
+    // on every renewal path, reused authorization or not.
+    struct FailSecondWriteStore {
+        inner: DirCertStore,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+    #[async_trait]
+    impl CertStore for FailSecondWriteStore {
+        async fn cert_for(&self, org: &OrgSlug) -> Result<Option<StoredCert>, CertStoreError> {
+            self.inner.cert_for(org).await
+        }
+        async fn store(&self, org: &OrgSlug, cert: &StoredCert) -> Result<(), CertStoreError> {
+            if self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                == 0
+            {
+                self.inner.store(org, cert).await
+            } else {
+                Err(CertStoreError::Unavailable(
+                    "simulated store outage".to_owned(),
+                ))
+            }
+        }
+    }
+    let cert_store = std::sync::Arc::new(FailSecondWriteStore {
+        inner,
+        writes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let issuer = CertIssuer::new(
+        pebble_account().await,
+        std::sync::Arc::new(ChallTestSrvDns::new()),
+        cert_store.clone(),
+        pool.clone(),
+        "clwd.run",
+    );
+    issuer.issue(org.id, &slug).await.expect("first issuance");
+
+    let result = issuer.renew(org.id, &slug).await;
+    assert!(result.is_err(), "a failing store fails the renewal");
+
+    // The failure is visible in the row, not silent — a certificate that fails
+    // to renew must leave a signal, or it expires with no deploy behind it.
+    let record = sqlx::query!(
+        "select state, last_renewal_error from certificates where org_id = $1",
+        org.id.as_uuid()
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("row");
+    assert_eq!(record.state, "failed");
+    assert!(
+        record
+            .last_renewal_error
+            .as_deref()
+            .is_some_and(|e| e.contains("simulated store outage")),
+        "the failure reason is recorded: {:?}",
+        record.last_renewal_error
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A renewal from a different ACME account is rejected: `replaces` binds the
+/// order to the account holding the replaced certificate, which is what makes
+/// it the exempt path rather than an ordinary issuance any account may place.
+///
+/// This is also the test that proves `replaces` is on the wire, not just in
+/// the code — without it this would succeed as a fresh order. Deleting
+/// `.replaces(...)` from `new_order` must turn this green-success red.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_renewal_from_another_account_is_rejected(pool: PgPool) {
+    let org = db::create_org(&pool, "zeta").await.expect("org");
+    let slug = OrgSlug::parse("zeta").expect("slug");
+    let (cert_store, dir) = store(slug.as_str());
+    let cert_store = std::sync::Arc::new(cert_store);
+    let issuer = CertIssuer::new(
+        pebble_account().await,
+        std::sync::Arc::new(ChallTestSrvDns::new()),
+        cert_store.clone(),
+        pool.clone(),
+        "clwd.run",
+    );
+    issuer.issue(org.id, &slug).await.expect("first issuance");
+
+    let stranger = CertIssuer::new(
+        pebble_account().await,
+        std::sync::Arc::new(ChallTestSrvDns::new()),
+        cert_store.clone(),
+        pool.clone(),
+        "clwd.run",
+    );
+    let result = stranger.renew(org.id, &slug).await;
+    assert!(
+        result.is_err(),
+        "a renewal from another account must be rejected, got success"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The reconciler's drive step end to end: a certificate whose ARI window has
+/// passed is claimed and renewed by `reconcile_once`, and a second pass finds
+/// nothing left to do.
+///
+/// **Required, not optional, like every test in this file:** if Pebble is
+/// unreachable this fails RED — it never skips.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
+    let org = db::create_org(&pool, "epsilon").await.expect("org");
+    let slug = OrgSlug::parse("epsilon").expect("slug");
+    let (cert_store, dir) = store(slug.as_str());
+    let cert_store = std::sync::Arc::new(cert_store);
+    let issuer = CertIssuer::new(
+        pebble_account().await,
+        std::sync::Arc::new(ChallTestSrvDns::new()),
+        cert_store.clone(),
+        pool.clone(),
+        "clwd.run",
+    );
+    issuer.issue(org.id, &slug).await.expect("first issuance");
+    let first = cert_store
+        .cert_for(&slug)
+        .await
+        .expect("read")
+        .expect("issued")
+        .cert_pem;
+
+    // Force the ARI window into the past: the row is now due.
+    sqlx::query!(
+        "update certificates set ari_renewal_after = now() - interval '1 hour' \
+          where org_id = $1",
+        org.id.as_uuid(),
+    )
+    .execute(&pool)
+    .await
+    .expect("backdate the renewal window");
+
+    let report = control_plane::reconcile::reconcile_once(&pool, &issuer).await;
+    assert_eq!(
+        report,
+        control_plane::reconcile::ReconcileReport {
+            claimed: 1,
+            renewed: 1,
+            failed: 0,
+        },
+        "one due row claimed and renewed, reported as counts"
+    );
+
+    let renewed = cert_store
+        .cert_for(&slug)
+        .await
+        .expect("read")
+        .expect("renewed")
+        .cert_pem;
+    assert_ne!(
+        first, renewed,
+        "the pass replaced the stored certificate with a new one"
+    );
+    let row = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(row.state, "issued");
+    assert_eq!(
+        row.order_url, None,
+        "the renewal order is cleared once done"
+    );
+
+    // A second pass is quiet: nothing due, nothing claimed.
+    let again = control_plane::reconcile::reconcile_once(&pool, &issuer).await;
+    assert_eq!(
+        again,
+        control_plane::reconcile::ReconcileReport {
+            claimed: 0,
+            renewed: 0,
+            failed: 0,
+        },
+        "rotation drained — a pass with nothing due claims nothing"
     );
 
     let _ = std::fs::remove_dir_all(&dir);

@@ -149,6 +149,11 @@ pub async fn cert_record(
 /// Record that issuance is in flight for `org`, persisting the ACME order URL so
 /// a later attempt resumes it. Idempotent: repeated calls (a retry) update the
 /// URL in place rather than failing on the primary key.
+///
+/// A row the reconciler already claimed (`renewing`) keeps that state: the
+/// claim is what the stale-reclaim arm of [`claim_due_for_renewal`] looks for,
+/// so clobbering it back to `pending` here would hide an in-flight renewal
+/// from the very query that recovers it after a crash.
 pub async fn cert_mark_pending(
     ex: impl PgExecutor<'_>,
     org_id: OrgId,
@@ -158,7 +163,9 @@ pub async fn cert_mark_pending(
         r#"insert into certificates (org_id, state, order_url)
            values ($1, 'pending', $2)
            on conflict (org_id) do update
-             set state = 'pending', order_url = $2, last_renewal_error = null"#,
+             set order_url = $2, last_renewal_error = null,
+                 state = case when certificates.state = 'renewing'
+                              then 'renewing' else 'pending' end"#,
         org_id.as_uuid(),
         order_url,
     )
@@ -189,6 +196,113 @@ pub async fn cert_mark_issued(
     .execute(ex)
     .await
     .map(|_| ())
+}
+
+/// An org the renewal reconciler claimed: due for renewal and marked
+/// `renewing` in the same statement (see [`claim_due_for_renewal`]). The slug
+/// is what the driver needs to find the stored certificate and to build the
+/// `_acme-challenge` name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueCert {
+    pub org_id: OrgId,
+    pub slug: String,
+}
+
+/// Claim up to `limit` certificates due for renewal, marking each `renewing`.
+///
+/// Due means one of three things: `issued` with `ari_renewal_after` passed
+/// (its time has come); `renewing` with no attempt since `stale_after` (a
+/// worker died between the claim commit and `cert_mark_issued`, and the row
+/// must re-enter rotation rather than strand — the next pass resumes it via
+/// `order_url`, the same shape as #7's pending rows being finished by a later
+/// attempt); or `failed` with no attempt since `retry_after` (a transient
+/// failure gets another try, with a backoff that respects the
+/// 5-failed-validations-per-identifier-per-hour budget).
+///
+/// Orgs that are soft-deleted are never claimed: there is nothing left to serve
+/// under their names.
+///
+/// `pending` rows are NOT claimed: they belong to the creation path's direct
+/// `issue()` call, which drives them synchronously. No production caller mints
+/// `pending` today; when issuance is wired into org creation, extend this
+/// claim (or that path's retry) to resume them — until then, a crashed direct
+/// issuance would strand `pending`, which is why new callers must go through
+/// this claim rather than calling `issue`/`renew` directly.
+///
+/// # Why `FOR UPDATE SKIP LOCKED`, not an advisory lock
+///
+/// An advisory lock serialises the whole reconciler — every worker queues
+/// behind one global lock and renewals proceed one cert at a time. `SKIP
+/// LOCKED` locks only the rows this claim takes, so workers on several nodes
+/// proceed in parallel over disjoint sets. The failed-validation budget is per
+/// identifier (per cert), so per-row is exactly the granularity the guarantee
+/// needs: two workers can never drive the same cert concurrently, and neither
+/// blocks the other.
+///
+/// # Why the transaction is short
+///
+/// Selection, locking and marking happen in a single statement, which commits
+/// before issuance runs — so the row locks release with it and the slow work
+/// (DNS writes, ACME polling) never holds a database transaction open. A crash
+/// after the mark leaves a `renewing` row with no worker, reclaimed by the
+/// stale arm above rather than stranded.
+pub async fn claim_due_for_renewal(
+    pool: &sqlx::PgPool,
+    limit: i64,
+    stale_after_secs: i64,
+    retry_after_secs: i64,
+) -> sqlx::Result<Vec<DueCert>> {
+    let ids = sqlx::query_scalar!(
+        r#"with due as (
+               select c.org_id as org_id
+               from certificates as c
+               join orgs as o on o.id = c.org_id and o.deleted_at is null
+               where (c.state = 'issued'
+                      and c.ari_renewal_after <= now())
+                  or (c.state = 'renewing'
+                      and c.last_renewal_attempt
+                          < now() - ($2::bigint * interval '1 second'))
+                  or (c.state = 'failed'
+                      and c.last_renewal_attempt
+                          < now() - ($3::bigint * interval '1 second'))
+               order by c.ari_renewal_after nulls last
+               limit $1
+               for update of c skip locked
+           )
+           update certificates as c
+              set state = 'renewing',
+                  last_renewal_attempt = now(),
+                  last_renewal_error = null
+             from due
+            where c.org_id = due.org_id
+        returning c.org_id as "org_id: OrgId""#,
+        limit,
+        stale_after_secs,
+        retry_after_secs,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    // The slugs the driver needs. A second read, not the same statement: the
+    // rows are already marked, so no lock is needed — and an org deleted
+    // between the claim and this read simply yields no slug, which the driver
+    // retires visibly rather than driving blind.
+    let uuids: Vec<uuid::Uuid> = ids.iter().map(|id| id.as_uuid()).collect();
+    let slugs = sqlx::query!(
+        r#"select id as "id: OrgId", slug from orgs
+            where id = any($1) and deleted_at is null"#,
+        &uuids,
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(slugs
+        .into_iter()
+        .map(|row| DueCert {
+            org_id: row.id,
+            slug: row.slug,
+        })
+        .collect())
 }
 
 /// Record that issuance or renewal failed, visibly. A silent failure is an

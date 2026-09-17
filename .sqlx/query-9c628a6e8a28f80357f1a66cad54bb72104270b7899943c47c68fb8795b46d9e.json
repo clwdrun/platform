@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update orgs set deleted_at = now() where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9c628a6e8a28f80357f1a66cad54bb72104270b7899943c47c68fb8795b46d9e"
+}

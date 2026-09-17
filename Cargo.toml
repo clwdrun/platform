@@ -69,7 +69,14 @@ async-nats = { version = "0.50.0", features = ["tokio"] }
 # and the per-org SNI callback is the wrong place to be its first user); it
 # needs the C toolchain #42 added to the Dockerfile.
 pingora = { version = "0.8.1", features = ["boringssl"] }
-instant-acme = "0.8.5"
+instant-acme = { version = "0.8.5", default-features = true, features = [
+  "rcgen",
+  # ARI renewal (#5 Phase 4): `time` gates `Account::renewal_info`;
+  # `x509-parser` gates `CertificateIdentifier: TryFrom<&CertificateDer>` (the
+  # ARI cert id, and what `NewOrder::replaces` needs for rate-limit exemption).
+  "time",
+  "x509-parser",
+] }
 moka = { version = "0.12", features = ["future"] }
 tower-cookies = "0.11.0"
 # The gateway's HTTP client: the internal route-lookup call now, and the ACME
@@ -92,6 +99,11 @@ reqwest = { version = "0.13", default-features = false, features = [
 # recursive resolver's view lags, and validating before the authoritative NS
 # serves the record burns a failed-validation attempt.
 hickory-resolver = "0.26"
+# ARI renewal (#5 Phase 4): x509-parser reads the issued cert's notAfter/notBefore
+# for the fallback renewal schedule; `time` handles the OffsetDateTime the ARI
+# window is expressed in. Versions match what instant-acme pulls, so no duplicate.
+x509-parser = "0.18"
+time = "0.3"
 # `http` types for the pingora `ServeHttp` response; `async-trait` for its trait.
 # Both are already in the graph transitively, so they add no crates.
 http = "1"
