@@ -29,6 +29,9 @@ tracing-subscriber = { workspace = true }
 # the vendored OpenAPI 3.1 JSON Schema. No HTTP or file resolution: every schema
 # it needs is in the repository, so the check is offline and deterministic.
 jsonschema = { version = "0.56.0", default-features = false }
+# A mock HTTP server for the Cloudflare provider test: exercises request
+# construction and error mapping without hitting live Cloudflare.
+wiremock = "0.6"
 
 [dependencies]
 axum = { workspace = true }
@@ -43,9 +46,33 @@ tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+async-trait = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
+# ACME certificate issuance (#5). The `rcgen` feature makes `Order::finalize()`
+# generate the keypair and CSR and return the key PEM — so the control plane
+# needs no separate TLS/crypto stack (boring lives in the gateway, via pingora,
+# and issuance does not run there). ARI's types are base API, but the two
+# methods renewal uses are feature-gated in the workspace pin:
+# `Account::renewal_info` needs `time`, `CertificateIdentifier` needs
+# `x509-parser` — both enabled there, so both are available here.
+instant-acme = { workspace = true, features = ["rcgen"] }
+# Only to install the process-level CryptoProvider instant-acme's rustls needs.
+# When both `aws-lc-rs` and `ring` end up linked (feature unification across the
+# workspace pulls both), rustls 0.23 refuses to auto-select one and panics at
+# runtime — so the provider must be chosen explicitly. aws-lc-rs matches
+# instant-acme's default. See `acme::install_crypto_provider`.
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
+# The Cloudflare DnsProvider: reqwest for the API, hickory-resolver for the
+# authoritative-NS propagation check.
+reqwest = { workspace = true }
+hickory-resolver = { workspace = true }
+# ARI renewal: parse the issued cert's validity, handle the ARI window's OffsetDateTime.
+x509-parser = { workspace = true }
+time = { workspace = true }
+# CertificateDer, to build the ARI CertificateIdentifier from the issued cert.
+rustls-pki-types = "1"
 # Load-bearing, unlike the last time control-plane depended on this. The
 # publish route calls `validate` and `ArtifactStore::put`; #45 took the
 # dependency only to read one constant, which pulled 39 crates in for a

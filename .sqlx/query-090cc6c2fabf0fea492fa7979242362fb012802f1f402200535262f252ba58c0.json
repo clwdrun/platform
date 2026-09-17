@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update certificates set ari_renewal_after = now() - interval '1 hour' where org_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "090cc6c2fabf0fea492fa7979242362fb012802f1f402200535262f252ba58c0"
+}

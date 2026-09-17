@@ -123,6 +123,11 @@ impl Fixture {
             "org_id" => self.org.to_string(),
             "token_id" => self.target.to_string(),
             "id" => "dashboard".to_owned(),
+            // The internal resolution route. Its `require_internal` layer denies
+            // the probe's customer token before the handler runs, so these are
+            // never resolved — any valid path segment is enough to reach the 401.
+            "org" => "acme".to_owned(),
+            "app" => "dashboard".to_owned(),
             other => panic!("the envelope probe has no fixture for path parameter {{{other}}}"),
         }
     }
@@ -312,7 +317,15 @@ async fn walk(state: &AppState, bare_errors: BareErrors, fixture: &Fixture) -> C
                                 }
                                 Some(_) => {}
                             }
-                            if authenticated && code == "identity.unauthenticated" {
+                            // The probe's customer token is *meant* to be
+                            // refused on an internal route — that route answers
+                            // to the platform credential, not a customer token —
+                            // so a 401 there is correct, not the probe being
+                            // blinded. Exclude it from the blinded count.
+                            if authenticated
+                                && code == "identity.unauthenticated"
+                                && !matches!(route.access, crate::http::Access::Internal)
+                            {
                                 counts.blinded_unauthenticated += 1;
                             }
                         }

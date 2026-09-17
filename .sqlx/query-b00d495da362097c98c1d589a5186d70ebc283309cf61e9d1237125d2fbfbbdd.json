@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select state, last_renewal_error from certificates where org_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "last_renewal_error",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "last_renewal_error"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "b00d495da362097c98c1d589a5186d70ebc283309cf61e9d1237125d2fbfbbdd"
+}

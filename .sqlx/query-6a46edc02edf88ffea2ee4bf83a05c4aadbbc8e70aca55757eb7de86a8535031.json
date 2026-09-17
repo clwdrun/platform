@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select state, order_url from certificates where org_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "order_url",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "order_url"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      true
+    ]
+  },
+  "hash": "6a46edc02edf88ffea2ee4bf83a05c4aadbbc8e70aca55757eb7de86a8535031"
+}

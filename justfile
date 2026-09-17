@@ -218,6 +218,51 @@ db-up:
 db-down:
     docker rm -f clwd-pg
 
+# A local ACME test environment: Pebble (a test ACME CA) plus challtestsrv (a
+# mock DNS server with an HTTP API to set TXT records). The certificate
+# issuance test (`crates/control-plane/tests/acme_issue.rs`) drives real ACME
+# against this — and fails RED if it is not up, never skips. See the test's
+# header for what this harness does and does NOT prove (no real rate limits,
+# no real ARI, no real propagation latency).
+[doc('start Pebble + challtestsrv for the ACME issuance test')]
+pebble-up:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    docker rm -f clwd-pebble clwd-challtestsrv >/dev/null 2>&1 || true
+    docker network create clwd-acme >/dev/null 2>&1 || true
+    docker run -d --name clwd-challtestsrv --network clwd-acme \
+      -p 8055:8055 ghcr.io/letsencrypt/pebble-challtestsrv:latest \
+      -dnsserver :8053 -management :8055 -http01 "" -https01 "" -tlsalpn01 "" -doh "" >/dev/null
+    docker run -d --name clwd-pebble --network clwd-acme \
+      -e PEBBLE_VA_NOSLEEP=1 -p 14000:14000 ghcr.io/letsencrypt/pebble:latest \
+      -config /test/config/pebble-config.json -dnsserver clwd-challtestsrv:8053 >/dev/null
+    # The CA that signs Pebble's ACME directory cert — the test must trust it.
+    cid=$(docker create ghcr.io/letsencrypt/pebble:latest)
+    mkdir -p .pebble
+    docker cp "$cid:/test/certs/pebble.minica.pem" .pebble/pebble.minica.pem >/dev/null
+    docker rm "$cid" >/dev/null
+    # Bounded wait: an unbounded `until` would hang CI to the job timeout if a
+    # container failed to start, reading as a hang rather than the startup
+    # failure it is.
+    for _ in $(seq 1 100); do
+      curl -ks https://localhost:14000/dir >/dev/null 2>&1 && break
+      sleep 0.2
+    done
+    if ! curl -ks https://localhost:14000/dir >/dev/null 2>&1; then
+      echo "error: Pebble did not become ready; logs follow" >&2
+      docker logs clwd-pebble 2>&1 | tail -20 >&2
+      exit 1
+    fi
+    echo 'PEBBLE_DIR=https://localhost:14000/dir'
+    echo 'CHALLTESTSRV=http://localhost:8055'
+    echo 'PEBBLE_CA='"$(pwd)"'/.pebble/pebble.minica.pem'
+    echo 'export these, or the ACME test reads the defaults above'
+
+[doc('stop Pebble + challtestsrv')]
+pebble-down:
+    docker rm -f clwd-pebble clwd-challtestsrv >/dev/null 2>&1 || true
+    docker network rm clwd-acme >/dev/null 2>&1 || true
+
 # `database create` first, and it is a no-op when the database is already
 # there. Without it the gate assumes a database someone made by hand, which is
 # exactly the assumption CI does not get to make.

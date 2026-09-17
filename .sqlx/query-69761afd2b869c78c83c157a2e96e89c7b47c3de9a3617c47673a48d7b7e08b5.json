@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with due as (\n               select c.org_id as org_id\n               from certificates as c\n               join orgs as o on o.id = c.org_id and o.deleted_at is null\n               where (c.state = 'issued'\n                      and c.ari_renewal_after <= now())\n                  or (c.state = 'renewing'\n                      and c.last_renewal_attempt\n                          < now() - ($2::bigint * interval '1 second'))\n                  or (c.state = 'failed'\n                      and c.last_renewal_attempt\n                          < now() - ($3::bigint * interval '1 second'))\n               order by c.ari_renewal_after nulls last\n               limit $1\n               for update of c skip locked\n           )\n           update certificates as c\n              set state = 'renewing',\n                  last_renewal_attempt = now(),\n                  last_renewal_error = null\n             from due\n            where c.org_id = due.org_id\n        returning c.org_id as \"org_id: OrgId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "org_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "69761afd2b869c78c83c157a2e96e89c7b47c3de9a3617c47673a48d7b7e08b5"
+}
