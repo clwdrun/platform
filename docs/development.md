@@ -132,6 +132,19 @@ make it fail there:
   reported from the same command. **Knowing the pattern does not protect you from it.
   Only looking does**, which is why this is a rule to apply rather than a fact to recall.
 
+- **A captured exit code must belong to the process you meant.** `$?` after a
+  pipeline is the *last* stage's status, so `cmd | tee log; echo $?` and
+  `just check | tail; echo $?` report `tee`/`tail` succeeding — a passing pipe
+  masks a failing `cmd`. This is count-not-colour in a new form: not a check
+  that ran nothing, but a green read off the wrong process. A manual gate run
+  was reported "EXIT 0" this way while `cargo test` had exited 101 underneath;
+  re-reading the actual `test result:` lines caught it. When capturing exit
+  through a pipe, use `${PIPESTATUS[0]}` (or `set -o pipefail` so the pipeline
+  itself carries the failure), never bare `$?`. The committed recipes are
+  already safe — `test` is unpiped and `envelope-probe`/`openapi-check` test
+  `if ! out=$(cmd)` (command-substitution exit, not a pipe) under `pipefail` —
+  but the trap is one keystroke away in any ad-hoc invocation.
+
 - **A mutation that did not rebuild proved nothing.** Proving a guard by breaking it
   (above) has a failure mode of its own: restoring the file from a backup copy can
   restore an *older* modification time, older than the build that compiled the mutant.
