@@ -119,9 +119,14 @@ governor = { version = "0.10.4", default-features = false, features = [
 sha2 = "0.10.9"
 getrandom = "0.3.4"
 
-# identity — share grants modeled as Cedar entities from day one
-openidconnect = "4.0.1"
-oauth2 = "5.0.0"
+# identity — share grants modeled as Cedar entities from day one.
+# default-features off: their defaults bundle reqwest with its own TLS, pulling
+# native-tls + an OpenSSL build into a rustls-only workspace. The flow's HTTP
+# runs through the platform's own reqwest 0.13 via an executor closure, so only
+# the (non-feature-gated) JWT crypto is needed. This restores deny.toml's ban on
+# native-tls/openssl-sys. #9 owns this; see the note in deny.toml.
+openidconnect = { version = "4.0.1", default-features = false }
+oauth2 = { version = "5.0.0", default-features = false }
 jsonwebtoken = "11.0.0"
 cedar-policy = "4"
 
