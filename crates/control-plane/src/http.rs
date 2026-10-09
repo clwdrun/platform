@@ -97,6 +97,10 @@ pub struct AppState {
     /// called — fail closed. Set via [`AppState::with_internal_secret`]; #22
     /// (the secret broker) will own where it comes from and how it rotates.
     pub internal_secret: Option<std::sync::Arc<str>>,
+    /// Google sign-in. `None` means the sign-in routes answer
+    /// `control-plane.internal` — fail closed. Set via
+    /// [`AppState::with_signin`].
+    pub signin: Option<std::sync::Arc<crate::signin::SignIn>>,
 }
 
 impl AppState {
@@ -126,6 +130,7 @@ impl AppState {
             artifacts,
             limiter: std::sync::Arc::new(Limiter::keyed(quota)),
             internal_secret: None,
+            signin: None,
         }
     }
 
@@ -134,6 +139,13 @@ impl AppState {
     #[must_use]
     pub fn with_internal_secret(mut self, secret: impl Into<std::sync::Arc<str>>) -> Self {
         self.internal_secret = Some(secret.into());
+        self
+    }
+
+    /// Enable the Google sign-in routes.
+    #[must_use]
+    pub fn with_signin(mut self, signin: crate::signin::SignIn) -> Self {
+        self.signin = Some(std::sync::Arc::new(signin));
         self
     }
 }
@@ -267,6 +279,20 @@ pub fn production_routes() -> Vec<Route> {
             Access::Public,
             openapi::doc(),
             openapi::serve,
+        ),
+        Route::new(
+            Verb::Get,
+            "/auth/google",
+            Access::Public,
+            crate::signin::start_doc(),
+            crate::signin::start,
+        ),
+        Route::new(
+            Verb::Get,
+            "/auth/google/callback",
+            Access::Public,
+            crate::signin::callback_doc(),
+            crate::signin::callback,
         ),
         Route::new(
             Verb::Post,

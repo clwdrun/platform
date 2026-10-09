@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into users (id, email, google_subject) values ($1, $2, $3)\n           on conflict (google_subject) do update set email = excluded.email\n             where users.deleted_at is null\n           returning id as \"id: UserId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "b11f6464f856d8232ebc93688f2ffcd3cd3473dc531f2145251d25b85e08179c"
+}

@@ -169,7 +169,7 @@ pub async fn authenticate(
     key: &CookieKey,
     headers: &HeaderMap,
 ) -> Result<ActiveSession, Error> {
-    let value = single_cookie(headers).ok_or(Error::Unauthenticated {})?;
+    let value = single_cookie(headers, COOKIE_NAME).ok_or(Error::Unauthenticated {})?;
 
     let mut validation = Validation::new(Algorithm::HS256);
     validation.set_required_spec_claims(&["exp"]);
@@ -183,19 +183,19 @@ pub async fn authenticate(
         .ok_or(Error::Unauthenticated {})
 }
 
-/// The session cookie's value, if exactly one is present.
+/// The value of the cookie called `name`, if exactly one is present.
 ///
 /// Two is refused rather than resolved: a second one is what a subdomain
 /// planting its own cookie on the apex looks like, and picking either would
 /// let the attacker choose which session the victim is in.
-fn single_cookie(headers: &HeaderMap) -> Option<&str> {
+pub(crate) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
     let mut found = headers
         .get_all(header::COOKIE)
         .iter()
         .filter_map(|v| v.to_str().ok())
         .flat_map(|v| v.split(';'))
         .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(name, _)| *name == COOKIE_NAME)
+        .filter(|(found, _)| *found == name)
         .map(|(_, value)| value);
     let first = found.next()?;
     found.next().is_none().then_some(first)
@@ -234,18 +234,21 @@ mod tests {
     #[test]
     fn one_session_cookie_among_others_is_found() {
         let h = headers("a=1; __Secure-clwd_session=xyz; b=2");
-        assert_eq!(single_cookie(&h), Some("xyz"));
+        assert_eq!(single_cookie(&h, COOKIE_NAME), Some("xyz"));
     }
 
     #[test]
     fn two_session_cookies_are_refused() {
         let h = headers("__Secure-clwd_session=mine; __Secure-clwd_session=planted");
-        assert_eq!(single_cookie(&h), None);
+        assert_eq!(single_cookie(&h, COOKIE_NAME), None);
     }
 
     #[test]
     fn a_differently_named_cookie_is_not_the_session() {
-        assert_eq!(single_cookie(&headers("clwd_session=xyz")), None);
+        assert_eq!(
+            single_cookie(&headers("clwd_session=xyz"), COOKIE_NAME),
+            None
+        );
     }
 
     #[test]

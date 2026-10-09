@@ -30,8 +30,19 @@
 //! security boundary. Do not add "the cookie is single-use" to this design —
 //! it is not, by construction, and the code exchange is what makes replay safe.
 
+use axum::Extension;
+use axum::extract::{RawQuery, State};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::{IntoResponse, Response};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use shared::{Error, RequestId};
+
+use crate::auth::unavailable;
+use crate::db;
+use crate::http::{AppState, render};
+use crate::openapi::{Doc, Success};
+use crate::session;
 
 /// The signing algorithm for the flow cookie.
 const ALG: Algorithm = Algorithm::HS256;
@@ -150,6 +161,257 @@ pub fn open_flow(key: &CookieKey, cookie: &str) -> Result<FlowState, FlowCookieE
         nonce: claims.nonce,
         pkce_verifier: claims.pkce,
     })
+}
+
+// ---------------------------------------------------------------- routes ----
+
+/// The flow cookie's name.
+///
+/// `__Host-`: host-only, `Path=/`, `Secure` — the browser refuses anything else,
+/// so no subdomain can plant or read one. Unlike the session cookie it has no
+/// reason to be seen anywhere but the control plane's own origin.
+pub const FLOW_COOKIE: &str = "__Host-clwd_signin";
+
+/// How long a sign-in may take between the redirect and the callback.
+const FLOW_TTL_SECS: u64 = 600;
+
+/// Everything the two sign-in routes need: the discovered flow, the HTTP
+/// client it runs over, the cookie key, and the apex the session is scoped to.
+pub struct SignIn {
+    flow: identity::Flow,
+    http: reqwest::Client,
+    key: CookieKey,
+    apex: String,
+}
+
+impl SignIn {
+    /// Discover the issuer and assemble the sign-in configuration.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`identity::Flow::discover`] reports, and
+    /// [`identity::FlowError::Unavailable`] if the HTTP client cannot be built.
+    pub async fn discover(
+        config: identity::OidcConfig,
+        key: CookieKey,
+        apex: impl Into<String>,
+    ) -> Result<Self, identity::FlowError> {
+        crate::acme::install_crypto_provider();
+        // No redirects: the token endpoint is a credentialed POST, and a
+        // followed redirect is how a client secret reaches a host nobody chose.
+        let http = reqwest::Client::builder()
+            .redirect(reqwest::redirect::Policy::none())
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| identity::FlowError::Unavailable(e.to_string()))?;
+        let flow = identity::Flow::discover(config, &http).await?;
+        Ok(Self {
+            flow,
+            http,
+            key,
+            apex: apex.into(),
+        })
+    }
+}
+
+fn flow_cookie(value: &str, max_age_secs: u64) -> String {
+    format!("{FLOW_COOKIE}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax")
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+fn not_configured() -> Error {
+    Error::Internal {
+        source: anyhow::anyhow!("sign-in is not configured on this control plane"),
+    }
+}
+
+/// `GET /auth/google`: set the flow cookie and send the browser to Google.
+///
+/// Takes no `return_to`/`next` parameter, deliberately: the callback always
+/// lands on the apex root, so there is no redirect target to validate and no
+/// open redirect to get wrong.
+pub(crate) async fn start(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    let Some(signin) = state.signin.as_deref() else {
+        return render(&not_configured(), &request_id);
+    };
+    let auth = signin.flow.authorize();
+    let sealed = match seal_flow(
+        &signin.key,
+        auth.state(),
+        auth.nonce(),
+        auth.pkce_verifier(),
+        now_unix(),
+        FLOW_TTL_SECS,
+    ) {
+        Ok(sealed) => sealed,
+        Err(e) => return render(&Error::Internal { source: e.into() }, &request_id),
+    };
+    (
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, auth.redirect_to().to_owned()),
+            (header::SET_COOKIE, flow_cookie(&sealed, FLOW_TTL_SECS)),
+        ],
+    )
+        .into_response()
+}
+
+/// `GET /auth/google/callback`: finish sign-in and issue a session.
+///
+/// In order, each a denial before the next runs: the flow cookie must open;
+/// `state` must equal the cookie's (so a forged callback never reaches the
+/// exchange); the code is exchanged under the cookie's PKCE verifier and the
+/// ID token verified against its nonce; the user is found **by Google
+/// subject**; a session is issued. The flow cookie is cleared on every
+/// outcome, success or not.
+///
+/// # A fresh session, always
+///
+/// The session cookie the browser arrived with is never read here. Sign-in
+/// mints a new session whatever came in, so a session planted before sign-in
+/// (fixation) is not the one the user ends up authenticated as.
+pub(crate) async fn callback(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    RawQuery(query): RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    let mut response = match finish(&state, query.as_deref().unwrap_or(""), &headers).await {
+        Ok(response) => response,
+        Err(error) => render(&error, &request_id),
+    };
+    if let Ok(clear) = HeaderValue::from_str(&flow_cookie("", 0)) {
+        response.headers_mut().append(header::SET_COOKIE, clear);
+    }
+    response
+}
+
+async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Response, Error> {
+    let signin = state.signin.as_deref().ok_or_else(not_configured)?;
+
+    let cookie =
+        crate::session::single_cookie(headers, FLOW_COOKIE).ok_or(Error::Unauthenticated {})?;
+    let flow = open_flow(&signin.key, cookie).map_err(|_| Error::Unauthenticated {})?;
+
+    let mut presented_state = None;
+    let mut code = None;
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        match &*name {
+            "state" => presented_state = Some(value.into_owned()),
+            "code" => code = Some(value.into_owned()),
+            _ => {}
+        }
+    }
+
+    // Before the exchange: a callback whose state is not this browser's is a
+    // forgery, and must not cost a round trip to Google or burn a code.
+    let presented_state = presented_state.ok_or(Error::Unauthenticated {})?;
+    if !constant_time_eq(presented_state.as_bytes(), flow.state.as_bytes()) {
+        return Err(Error::Unauthenticated {});
+    }
+    // An `error=access_denied` callback has no code: one more denial.
+    let code = code.ok_or(Error::Unauthenticated {})?;
+
+    let identity = signin
+        .flow
+        .exchange(&signin.http, &code, &flow.pkce_verifier, &flow.nonce)
+        .await
+        .map_err(|e| match e {
+            identity::FlowError::Unavailable(reason) => {
+                tracing::warn!(%reason, "the identity provider is unavailable");
+                Error::Timeout {
+                    dependency: "the identity provider".to_owned(),
+                }
+            }
+            other => {
+                tracing::info!(reason = %other, "sign-in rejected");
+                Error::Unauthenticated {}
+            }
+        })?;
+
+    // `users.email` is required, and only a verified address is carried at
+    // all; an account without one cannot sign in.
+    let email = identity
+        .email
+        .as_deref()
+        .ok_or(Error::Unauthenticated {})?
+        .to_lowercase();
+
+    let user = match db::upsert_google_user(&state.pool, identity.subject.as_str(), &email).await {
+        Ok(Some(user)) => user,
+        Ok(None) => return Err(Error::Unauthenticated {}),
+        Err(sqlx::Error::Database(e)) if e.constraint() == Some("users_email_key") => {
+            return Err(Error::Conflict {
+                what: "another account already uses this email address".to_owned(),
+            });
+        }
+        Err(e) => return Err(unavailable(e)),
+    };
+
+    let issued = session::issue(&state.pool, &signin.key, user, &signin.apex)
+        .await?
+        .ok_or(Error::Unauthenticated {})?;
+
+    Ok((
+        StatusCode::SEE_OTHER,
+        [
+            (header::LOCATION, format!("https://{}/", signin.apex)),
+            (header::SET_COOKIE, issued.set_cookie),
+        ],
+    )
+        .into_response())
+}
+
+/// Compare without an early exit, so the time taken does not say how much of
+/// a guessed `state` was right.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+pub(crate) fn start_doc() -> Doc {
+    Doc {
+        operation_id: "sign_in_start",
+        summary: "Start Google sign-in",
+        description: "Sets a short-lived, signed flow cookie carrying the OIDC `state`, `nonce` and \
+                      PKCE verifier, and redirects the browser to Google. Takes no redirect-target \
+                      parameter: the callback always lands on the apex root.",
+        params: &[],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::SEE_OTHER,
+            description: "Redirect to Google's authorization endpoint.",
+            body: None,
+        }],
+        errors: &[],
+    }
+}
+
+pub(crate) fn callback_doc() -> Doc {
+    Doc {
+        operation_id: "sign_in_callback",
+        summary: "Finish Google sign-in",
+        description: "Google redirects here with `code` and `state`. Validates the flow cookie and \
+                      `state`, exchanges the code under PKCE, verifies the ID token, finds the user \
+                      by Google subject, and issues a fresh session cookie. Every rejection — a \
+                      missing or tampered flow cookie, a mismatched `state`, a refused or replayed \
+                      code, a failed ID token — is the same `identity.unauthenticated`.",
+        params: &[],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::SEE_OTHER,
+            description: "Signed in: a session cookie is set and the browser is sent to the apex root.",
+            body: None,
+        }],
+        errors: &["identity.unauthenticated", "control-plane.conflict"],
+    }
 }
 
 #[cfg(test)]

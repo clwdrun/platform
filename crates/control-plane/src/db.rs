@@ -338,6 +338,37 @@ pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<U
     .await
 }
 
+/// The user Google account `subject` signs in as, created on first sign-in,
+/// with `email` refreshed on every one. `None` if that account's user is
+/// deleted — a deleted user does not come back by signing in again.
+///
+/// Keyed on `subject` alone. A row that already holds `email` under a
+/// different (or no) subject is **not** linked: the insert fails the email's
+/// unique constraint and the caller denies the sign-in. Linking by email is
+/// the takeover a reassigned address enables.
+///
+/// # Errors
+///
+/// A `23505` unique violation on `users_email_key` when another user holds
+/// `email`; otherwise whatever the driver reports.
+pub async fn upsert_google_user(
+    ex: impl PgExecutor<'_>,
+    subject: &str,
+    email: &str,
+) -> sqlx::Result<Option<UserId>> {
+    sqlx::query_scalar!(
+        r#"insert into users (id, email, google_subject) values ($1, $2, $3)
+           on conflict (google_subject) do update set email = excluded.email
+             where users.deleted_at is null
+           returning id as "id: UserId""#,
+        UserId::new().as_uuid(),
+        email,
+        subject,
+    )
+    .fetch_optional(ex)
+    .await
+}
+
 /// Records that a user belongs to an org. Membership only: what a member may
 /// do is a Cedar policy (#14), not a column here.
 pub async fn add_org_member(
