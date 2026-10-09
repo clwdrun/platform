@@ -333,3 +333,116 @@ async fn certificate_rows_are_one_per_org_with_a_bounded_state(pool: PgPool) {
         .expect_err("a certificate with no org");
     assert_eq!(sqlstate(orphan), FK_VIOLATION);
 }
+
+// ------------------------------------------------------------- sessions ----
+
+fn in_an_hour() -> chrono::DateTime<chrono::Utc> {
+    chrono::Utc::now() + chrono::Duration::hours(1)
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_for_a_live_user_is_recorded_and_found(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    let id = db::insert_session(&pool, user.id, &[1u8; 32], in_an_hour())
+        .await
+        .expect("insert")
+        .expect("a live user gets a session");
+
+    let found = db::lookup_active_session(&pool, &[1u8; 32])
+        .await
+        .expect("lookup")
+        .expect("a fresh session is active");
+    assert_eq!(
+        found,
+        db::ActiveSession {
+            id,
+            user_id: user.id
+        }
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_deleted_user_gets_no_session(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    sqlx::query!(
+        "update users set deleted_at = now() where id = $1",
+        user.id.as_uuid()
+    )
+    .execute(&pool)
+    .await
+    .expect("delete");
+
+    let id = db::insert_session(&pool, user.id, &[1u8; 32], in_an_hour())
+        .await
+        .expect("insert runs");
+    assert_eq!(id, None);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_digest_is_unique(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    db::insert_session(&pool, user.id, &[1u8; 32], in_an_hour())
+        .await
+        .expect("first");
+    let err = db::insert_session(&pool, user.id, &[1u8; 32], in_an_hour())
+        .await
+        .expect_err("same digest twice");
+    assert_eq!(sqlstate(err), UNIQUE_VIOLATION);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_must_end_after_it_starts(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    let err = db::insert_session(
+        &pool,
+        user.id,
+        &[1u8; 32],
+        chrono::Utc::now() - chrono::Duration::hours(1),
+    )
+    .await
+    .expect_err("expiry in the past");
+    assert_eq!(sqlstate(err), CHECK_VIOLATION);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_session_digest_must_be_32_bytes(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    let err = sqlx::query!(
+        "insert into sessions (id, user_id, secret_sha256, expires_at)
+         values (gen_random_uuid(), $1, '\\x00', now() + interval '1 hour')",
+        user.id.as_uuid()
+    )
+    .execute(&pool)
+    .await
+    .expect_err("short digest");
+    assert_eq!(sqlstate(err), CHECK_VIOLATION);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn revoking_a_session_twice_keeps_the_first_timestamp(pool: PgPool) {
+    let user = db::create_user(&pool, "a@example.com").await.expect("user");
+    let id = db::insert_session(&pool, user.id, &[1u8; 32], in_an_hour())
+        .await
+        .expect("insert")
+        .expect("session");
+
+    assert!(db::revoke_session(&pool, id).await.expect("revoke"));
+    let first = sqlx::query_scalar!(
+        "select revoked_at from sessions where id = $1",
+        id.as_uuid()
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+    assert!(db::revoke_session(&pool, id).await.expect("revoke again"));
+    let second = sqlx::query_scalar!(
+        "select revoked_at from sessions where id = $1",
+        id.as_uuid()
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("read");
+
+    assert!(first.is_some());
+    assert_eq!(first, second);
+}
