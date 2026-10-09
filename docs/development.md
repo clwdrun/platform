@@ -204,6 +204,17 @@ make it fail there:
   surface — its `Cargo.toml` features and its cached source under
   `~/.cargo/registry/src/` — not its docs or memory of it.
 
+- **A dependency that compiles is not a dependency that works.** `jsonwebtoken`
+  10+ ships no crypto unless exactly one backend feature (`aws_lc_rs` or
+  `rust_crypto`) is on; with neither, it builds clean and every sign/verify
+  panics at runtime. `identity` had declared it for months without ever signing
+  anything, so the gap stayed green until #9's flow cookie made the first real
+  call — and only a unit test that actually signed caught it. A crypto library
+  with no backend feature enabled is a runtime panic behind a green build:
+  count-not-colour one layer deeper, where the check that passed was the
+  compiler. A declared-but-unexercised dependency is unverified until a test
+  calls through it.
+
 ## Crates
 
 | Crate | Role |

@@ -127,7 +127,10 @@ getrandom = "0.3.4"
 # native-tls/openssl-sys. #9 owns this; see the note in deny.toml.
 openidconnect = { version = "4.0.1", default-features = false }
 oauth2 = { version = "5.0.0", default-features = false }
-jsonwebtoken = "11.0.0"
+# jsonwebtoken 10+ ships no crypto unless exactly one backend feature is on;
+# with neither, every sign/verify panics at runtime (not at compile time).
+# aws_lc_rs: already in the tree via rustls, so no new crypto stack.
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
 cedar-policy = "4"
 
 # builder
