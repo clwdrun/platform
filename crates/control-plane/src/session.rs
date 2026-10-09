@@ -50,14 +50,18 @@ use crate::signin::CookieKey;
 ///   already refuses a request carrying two of these, but the gateway is where
 ///   the planting is stopped.
 ///
+/// Stripping in the gateway does not stop script on an app subdomain setting
+/// one with `Domain=<apex>` in the browser, which plants a session on a
+/// visitor who has none. Whether the apex scope survives is #62.
+///
 /// `__Secure-` makes the browser refuse to set it without `Secure`. `__Host-`
 /// would be stronger but forbids `Domain`, which is the whole point here.
 pub const COOKIE_NAME: &str = "__Secure-clwd_session";
 
 /// How long a session lives from sign-in.
 ///
-/// ponytail: one fixed lifetime, no sliding refresh. #9's "refresh" lands with
-/// the callback; a sliding window is an `update ... set expires_at` there.
+/// ponytail: one fixed lifetime, no sliding refresh. A sliding window with an
+/// absolute cap is #63; until then users sign in again daily.
 pub const TTL: chrono::Duration = chrono::Duration::hours(24);
 
 const SECRET_BYTES: usize = 32;

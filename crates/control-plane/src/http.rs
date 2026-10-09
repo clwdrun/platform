@@ -296,6 +296,13 @@ pub fn production_routes() -> Vec<Route> {
         ),
         Route::new(
             Verb::Post,
+            "/auth/logout",
+            Access::Public,
+            crate::signin::logout_doc(),
+            crate::signin::logout,
+        ),
+        Route::new(
+            Verb::Post,
             "/v1/apps/{app_id}/versions",
             Access::Scoped(Scope::Publish),
             crate::publish::doc(),

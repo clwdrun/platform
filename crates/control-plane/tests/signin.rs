@@ -360,7 +360,11 @@ impl Reply {
 }
 
 async fn get_(state: &AppState, uri: &str, cookie: Option<&str>) -> Reply {
-    let mut request = Request::builder().method("GET").uri(uri);
+    send(state, "GET", uri, cookie).await
+}
+
+async fn send(state: &AppState, method: &str, uri: &str, cookie: Option<&str>) -> Reply {
+    let mut request = Request::builder().method(method).uri(uri);
     if let Some(cookie) = cookie {
         request = request.header(header::COOKIE, cookie);
     }
@@ -718,4 +722,95 @@ async fn discovery_against_a_down_issuer_fails() {
         matches!(result, Err(identity::FlowError::Unavailable(_))),
         "discovery with no issuer must fail as unavailable"
     );
+}
+
+// ----------------------------------------------------------------- logout ----
+
+async fn signed_in(state: &AppState, issuer: &Issuer) -> String {
+    let (flow, authorize) = begin(state).await;
+    let query = issuer.mock.consent(&authorize);
+    let reply = get_(
+        state,
+        &format!("/auth/google/callback?{query}"),
+        Some(&flow),
+    )
+    .await;
+    reply.cookie(session::COOKIE_NAME).expect("signed in")
+}
+
+async fn verdict(pool: &PgPool, cookie: &str) -> Result<(), String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::COOKIE,
+        HeaderValue::from_str(cookie).expect("ascii"),
+    );
+    session::authenticate(pool, &key(), &headers)
+        .await
+        .map(|_| ())
+        .map_err(|e| e.code().to_owned())
+}
+
+/// Logout is a server-side revoke: the old cookie, byte for byte, no longer
+/// authenticates — asserted on the reuse, not on the column.
+#[sqlx::test(migrations = "../../migrations")]
+async fn logging_out_revokes_the_session_server_side(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    assert_eq!(verdict(&pool, &cookie).await, Ok(()));
+
+    let reply = send(&state, "POST", "/auth/logout", Some(&cookie)).await;
+    assert_eq!(reply.status, StatusCode::NO_CONTENT, "{:?}", reply.json);
+    assert!(
+        reply.set_cookies().iter().any(|c| {
+            c.starts_with(&format!("{}=;", session::COOKIE_NAME))
+                && c.contains("Domain=clwd.run")
+                && c.contains("Max-Age=0")
+        }),
+        "the session cookie is cleared: {:?}",
+        reply.set_cookies()
+    );
+
+    assert_eq!(
+        verdict(&pool, &cookie).await,
+        Err("identity.unauthenticated".to_owned()),
+        "the old cookie must not authenticate after logout"
+    );
+}
+
+/// No session, a forged one, an already-revoked one: the same `204` and the
+/// same headers, so the reply says nothing about what the cookie was.
+#[sqlx::test(migrations = "../../migrations")]
+async fn logout_is_idempotent_and_reveals_nothing(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let first = send(&state, "POST", "/auth/logout", Some(&cookie)).await;
+    assert_eq!(first.status, StatusCode::NO_CONTENT);
+
+    let forged = format!("{}=not.a.jwt", session::COOKIE_NAME);
+    for presented in [None, Some(forged.as_str()), Some(cookie.as_str())] {
+        let reply = send(&state, "POST", "/auth/logout", presented).await;
+        assert_eq!(reply.status, StatusCode::NO_CONTENT, "{presented:?}");
+        assert_eq!(reply.json, serde_json::Value::Null, "{presented:?}");
+        assert_eq!(reply.set_cookies(), first.set_cookies(), "{presented:?}");
+    }
+}
+
+/// A GET cannot sign anyone out: an `<img src>` on any page could fire one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn logout_by_get_is_refused_and_revokes_nothing(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+
+    let reply = get_(&state, "/auth/logout", Some(&cookie)).await;
+    assert_eq!(
+        reply.status,
+        StatusCode::METHOD_NOT_ALLOWED,
+        "{:?}",
+        reply.json
+    );
+    assert_eq!(reply.cookie(session::COOKIE_NAME), None);
+    assert_eq!(verdict(&pool, &cookie).await, Ok(()));
 }

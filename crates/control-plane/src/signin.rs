@@ -370,6 +370,60 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
         .into_response())
 }
 
+/// `POST /auth/logout`: revoke the session server-side and clear its cookie.
+///
+/// Always `204`, whatever the request carried: no cookie, a forged one, an
+/// expired or already-revoked one. Distinguishing those would tell a caller
+/// whether a cookie it holds was live. Only a database failure is reported,
+/// as what it is.
+///
+/// `POST`, never `GET`: an `<img src>` on any page can fire a GET logout. A
+/// cross-site POST does not carry the `SameSite=Lax` session cookie, so it
+/// revokes nothing. A same-*site* one — script on an app subdomain — does;
+/// that exposure is the shared-registrable-domain problem in #62.
+pub(crate) async fn logout(
+    State(state): State<AppState>,
+    Extension(request_id): Extension<RequestId>,
+    headers: HeaderMap,
+) -> Response {
+    let Some(signin) = state.signin.as_deref() else {
+        return render(&not_configured(), &request_id);
+    };
+    match session::authenticate(&state.pool, &signin.key, &headers).await {
+        Ok(live) => {
+            if let Err(e) = db::revoke_session(&state.pool, live.id).await {
+                return render(&unavailable(e), &request_id);
+            }
+        }
+        Err(Error::Unauthenticated {}) => {}
+        Err(other) => return render(&other, &request_id),
+    }
+    (
+        StatusCode::NO_CONTENT,
+        [(header::SET_COOKIE, session::clear_cookie(&signin.apex))],
+    )
+        .into_response()
+}
+
+pub(crate) fn logout_doc() -> Doc {
+    Doc {
+        operation_id: "sign_out",
+        summary: "Sign out",
+        description: "Revokes the session the session cookie names, server-side, and clears the \
+                      cookie. Idempotent and uninformative: a request with no session, or with an \
+                      expired, revoked or forged one, gets the same `204`. A `POST` so that a \
+                      cross-site image tag cannot sign anyone out.",
+        params: &[],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::NO_CONTENT,
+            description: "Signed out: any session the cookie named is revoked, and the cookie is cleared.",
+            body: None,
+        }],
+        errors: &[],
+    }
+}
+
 /// Compare without an early exit, so the time taken does not say how much of
 /// a guessed `state` was right.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
