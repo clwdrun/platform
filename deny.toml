@@ -85,12 +85,15 @@ multiple-versions = "warn"
 wildcards = "deny"
 
 # clwd denies openssl-sys and native-tls outright, having committed to rustls.
-# Platform cannot: openidconnect and oauth2 reach reqwest with default features
-# on, which pulls native-tls and an OpenSSL build dependency into a workspace
-# whose selling point is auditability. Deliberately recorded rather than
-# banned, because banning it today fails the build instead of fixing it —
-# #9 owns turning reqwest's default features off and restoring the ban.
-deny = []
+# Platform now matches: #9 turned openidconnect's and oauth2's default features
+# off (they otherwise reach reqwest with its default TLS, pulling native-tls and
+# an OpenSSL build into a workspace whose selling point is auditability). With
+# that path gone the ban is restored here, so a future dependency that reaches
+# for either fails the build rather than slipping in silently.
+deny = [
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+]
 
 [sources]
 unknown-registry = "deny"

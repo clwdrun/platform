@@ -14,6 +14,14 @@ name = "control-plane"
 path = "src/main.rs"
 
 [dev-dependencies]
+# The mock OIDC issuer the sign-in route tests run against: it signs real ID
+# tokens with a throwaway RSA key generated at runtime (no key material in the
+# repo), and checks the client's Basic auth and PKCE as Google does. All four
+# are already in the tree via identity and openidconnect.
+openidconnect = { workspace = true }
+rsa = "0.9"
+rand = "0.8"
+base64 = "0.22"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
 # Only to build a body with no known length, for the chunked-upload test.
@@ -82,3 +90,14 @@ builder = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 governor = { workspace = true }
+# OIDC sign-in (#9): the flow cookie carrying state/nonce/PKCE-verifier between
+# the redirect and the callback is signed as an HS256 JWT. jsonwebtoken is
+# already in the tree (identity depends on it); reusing it means tamper and
+# expiry come for free and are unit-testable with no HTTP.
+jsonwebtoken = { workspace = true }
+# The OIDC flow and ID-token verification; the router, cookies and sessions
+# live here. Only `&str`s and `VerifiedIdentity` cross the boundary.
+identity = { workspace = true }
+# Parsing the callback's query by hand, so a malformed one is an envelope
+# rather than an extractor's plain-text rejection. Already in the tree via url.
+form_urlencoded = "1"

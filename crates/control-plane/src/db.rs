@@ -9,7 +9,7 @@
 //! a control plane running on several nodes has one clock its writers already
 //! agree on rather than several that drift.
 
-use crate::ids::{AppId, OrgId, TokenId, UserId, VersionId};
+use crate::ids::{AppId, OrgId, SessionId, TokenId, UserId, VersionId};
 use chrono::{DateTime, Utc};
 use sqlx::PgExecutor;
 
@@ -338,6 +338,37 @@ pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<U
     .await
 }
 
+/// The user Google account `subject` signs in as, created on first sign-in,
+/// with `email` refreshed on every one. `None` if that account's user is
+/// deleted — a deleted user does not come back by signing in again.
+///
+/// Keyed on `subject` alone. A row that already holds `email` under a
+/// different (or no) subject is **not** linked: the insert fails the email's
+/// unique constraint and the caller denies the sign-in. Linking by email is
+/// the takeover a reassigned address enables.
+///
+/// # Errors
+///
+/// A `23505` unique violation on `users_email_key` when another user holds
+/// `email`; otherwise whatever the driver reports.
+pub async fn upsert_google_user(
+    ex: impl PgExecutor<'_>,
+    subject: &str,
+    email: &str,
+) -> sqlx::Result<Option<UserId>> {
+    sqlx::query_scalar!(
+        r#"insert into users (id, email, google_subject) values ($1, $2, $3)
+           on conflict (google_subject) do update set email = excluded.email
+             where users.deleted_at is null
+           returning id as "id: UserId""#,
+        UserId::new().as_uuid(),
+        email,
+        subject,
+    )
+    .fetch_optional(ex)
+    .await
+}
+
 /// Records that a user belongs to an org. Membership only: what a member may
 /// do is a Cedar policy (#14), not a column here.
 pub async fn add_org_member(
@@ -607,6 +638,91 @@ pub async fn revoke_token(
         id.as_uuid(),
         org_id.as_uuid(),
         app_id.map(|app| app.as_uuid()),
+    )
+    .fetch_optional(ex)
+    .await
+    .map(|row| row.is_some())
+}
+
+/// Records a session for a live user, under the digest of its cookie secret,
+/// ending at `expires_at`. `None` if the user does not exist or is deleted.
+///
+/// Liveness is folded into the insert, as [`insert_token`] does, so a user
+/// deleted mid-sign-in cannot gain a session from a stale read.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports, including the `sessions` checks
+/// if `expires_at` is not in the future.
+pub async fn insert_session(
+    ex: impl PgExecutor<'_>,
+    user_id: UserId,
+    digest: &[u8; 32],
+    expires_at: DateTime<Utc>,
+) -> sqlx::Result<Option<SessionId>> {
+    sqlx::query_scalar!(
+        r#"insert into sessions (id, user_id, secret_sha256, expires_at)
+           select $1, $2, $3, $4
+           where exists (select 1 from users where id = $2 and deleted_at is null)
+           returning id as "id: SessionId""#,
+        SessionId::new().as_uuid(),
+        user_id.as_uuid(),
+        &digest[..],
+        expires_at,
+    )
+    .fetch_optional(ex)
+    .await
+}
+
+/// A live session, as the request path sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActiveSession {
+    pub id: SessionId,
+    pub user_id: UserId,
+}
+
+/// The live session with this digest.
+///
+/// # One outcome for every failure
+///
+/// Unknown, revoked, expired, or belonging to a deleted user: all `None`,
+/// from one query with one shape — the same property [`token_by_digest`]
+/// holds. Expiry is judged by the database's clock, the one every writer
+/// shares.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports. The caller must treat an error as
+/// a denial, never as a pass.
+pub async fn lookup_active_session(
+    ex: impl PgExecutor<'_>,
+    digest: &[u8; 32],
+) -> sqlx::Result<Option<ActiveSession>> {
+    sqlx::query_as!(
+        ActiveSession,
+        r#"select s.id, s.user_id
+           from sessions s
+           where s.secret_sha256 = $1
+             and s.revoked_at is null
+             and s.expires_at > now()
+             and exists (select 1 from users u where u.id = s.user_id and u.deleted_at is null)"#,
+        &digest[..],
+    )
+    .fetch_optional(ex)
+    .await
+}
+
+/// Revokes a session. `true` if it exists.
+///
+/// Revoking twice is revoking once: `coalesce` keeps the first timestamp.
+///
+/// # Errors
+///
+/// Propagates whatever the driver reports.
+pub async fn revoke_session(ex: impl PgExecutor<'_>, id: SessionId) -> sqlx::Result<bool> {
+    sqlx::query_scalar!(
+        "update sessions set revoked_at = coalesce(revoked_at, now()) where id = $1 returning id",
+        id.as_uuid(),
     )
     .fetch_optional(ex)
     .await

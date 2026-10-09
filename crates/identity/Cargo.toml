@@ -6,8 +6,16 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
+# Default features off, deliberately: openidconnect and oauth2 default to
+# bundling reqwest with its own default TLS, which drags native-tls and an
+# OpenSSL build into a workspace that has committed to rustls. We use neither
+# bundled client — the flow's HTTP goes through `reqwest` below (the same 0.13
+# the rest of the platform uses) via a small executor closure — so the JWT
+# crypto is all that is needed here, and it is not feature-gated. This is what
+# lets `deny.toml` ban native-tls/openssl-sys again. See #9 / #48.
 openidconnect = { workspace = true }
 oauth2 = { workspace = true }
+reqwest = { workspace = true }
 jsonwebtoken = { workspace = true }
 cedar-policy = { workspace = true }
 tokio = { workspace = true }
@@ -15,3 +23,13 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 shared = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+chrono = { workspace = true }
+# Test-only: generate throwaway RSA keys at runtime so the harness signs real
+# tokens against a key the test controls — without committing any key material
+# (the repo ignores `*.pem`, and gitleaks would flag an inline one). Keys are
+# generated once per run and cached.
+rsa = "0.9"
+rand = "0.8"

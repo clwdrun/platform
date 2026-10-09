@@ -70,6 +70,17 @@ just migrate                         # sqlx migrate run
 just db-down
 ```
 
+Two traps when running tests by hand rather than through `just check`:
+
+- **`.env` is not the test's environment.** `sqlx`'s macros read `.env` at
+  compile time, so the build succeeds — but the integration tests read
+  `DATABASE_URL` at *runtime*, and fail ("DATABASE_URL must be set") unless it
+  is exported in the shell. `export DATABASE_URL=...`, don't rely on `.env`.
+- **`PEBBLE_CA` must be absolute.** The ACME tests default it to
+  `.pebble/pebble.minica.pem`, which `cargo test` resolves from the *crate*
+  directory, not the workspace root — so it is not found even with Pebble up.
+  Export the absolute path `just pebble-up` prints.
+
 `sqlx` macros are compile-time checked, and `.sqlx/` is what lets CI build with no
 database at all. After changing any query or migration, run `just prepare` and
 commit `.sqlx/` — `just check` fails if it is stale, and `offline-build` proves the
@@ -203,6 +214,17 @@ make it fail there:
   each was a one-line finding. Before building on a pinned crate, read its real
   surface — its `Cargo.toml` features and its cached source under
   `~/.cargo/registry/src/` — not its docs or memory of it.
+
+- **A dependency that compiles is not a dependency that works.** `jsonwebtoken`
+  10+ ships no crypto unless exactly one backend feature (`aws_lc_rs` or
+  `rust_crypto`) is on; with neither, it builds clean and every sign/verify
+  panics at runtime. `identity` had declared it for months without ever signing
+  anything, so the gap stayed green until #9's flow cookie made the first real
+  call — and only a unit test that actually signed caught it. A crypto library
+  with no backend feature enabled is a runtime panic behind a green build:
+  count-not-colour one layer deeper, where the check that passed was the
+  compiler. A declared-but-unexercised dependency is unverified until a test
+  calls through it.
 
 ## Crates
 

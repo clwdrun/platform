@@ -134,6 +134,14 @@ id! {
 }
 
 id! {
+    /// A browser session's row — never its cookie secret.
+    ///
+    /// Safe to log: the cookie carries a separate random secret, and only its
+    /// digest is stored, so knowing this grants nothing.
+    SessionId
+}
+
+id! {
     /// An API token's row — never its secret.
     ///
     /// Safe to log, return and put in a URL: knowing it grants nothing, which

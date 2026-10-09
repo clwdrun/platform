@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into sessions (id, user_id, secret_sha256, expires_at)\n           select $1, $2, $3, $4\n           where exists (select 1 from users where id = $2 and deleted_at is null)\n           returning id as \"id: SessionId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: SessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Bytea",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "98e2e37f00ccbf2ea895ae3b29c315adce4c23d20aa637827e96fee1e368e2fb"
+}

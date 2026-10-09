@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select revoked_at from sessions where id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "revoked_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "revoked_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "4b5b50247901e8d33081bf14fe89db89aff6f229d5d0708267979b29d9a9aa39"
+}

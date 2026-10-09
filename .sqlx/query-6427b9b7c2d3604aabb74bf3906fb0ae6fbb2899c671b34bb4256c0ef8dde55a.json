@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update sessions set revoked_at = coalesce(revoked_at, now()) where id = $1 returning id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "6427b9b7c2d3604aabb74bf3906fb0ae6fbb2899c671b34bb4256c0ef8dde55a"
+}

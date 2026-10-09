@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into sessions (id, user_id, secret_sha256, expires_at)\n         values (gen_random_uuid(), $1, '\\x00', now() + interval '1 hour')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e155479cb57fc74a6b70820bb6047acfba1544254b4fad8cc6f370f2a9a7b011"
+}
