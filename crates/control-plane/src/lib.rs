@@ -12,4 +12,5 @@ pub mod openapi;
 pub mod publish;
 pub mod reconcile;
 pub mod resolve;
+pub mod signin;
 pub mod token;

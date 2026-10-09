@@ -82,3 +82,8 @@ builder = { workspace = true }
 sha2 = { workspace = true }
 getrandom = { workspace = true }
 governor = { workspace = true }
+# OIDC sign-in (#9): the flow cookie carrying state/nonce/PKCE-verifier between
+# the redirect and the callback is signed as an HS256 JWT. jsonwebtoken is
+# already in the tree (identity depends on it); reusing it means tamper and
+# expiry come for free and are unit-testable with no HTTP.
+jsonwebtoken = { workspace = true }

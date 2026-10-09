@@ -57,18 +57,45 @@ pub struct Flow {
 /// three secrets the callback must recover to finish safely.
 ///
 /// The `state`, `nonce` and `pkce_verifier` are stored browser-bound in a
-/// single-use signed cookie between the redirect and the callback (a later
-/// slice). None of them may be guessable by, or readable to, another browser.
-#[non_exhaustive]
+/// signed cookie between the redirect and the callback. None of them may be
+/// guessable by, or readable to, another browser.
+///
+/// All four are exposed as `&str`, deliberately: the caller (`control-plane`)
+/// stores them in a cookie and passes them back to [`Flow`] verbatim, and must
+/// not need to depend on `openidconnect`'s types to do it. Keeping the OIDC
+/// library out of the router is what lets the flow cookie's serialization stay
+/// trivial and a provider swap stay contained here.
 pub struct Authorization {
+    url: Url,
+    state: CsrfToken,
+    nonce: Nonce,
+    pkce_verifier: PkceCodeVerifier,
+}
+
+impl Authorization {
     /// Where to redirect the browser to begin sign-in.
-    pub url: Url,
+    #[must_use]
+    pub fn redirect_to(&self) -> &str {
+        self.url.as_str()
+    }
+
     /// The CSRF token echoed back as `state`; the callback rejects a mismatch.
-    pub state: CsrfToken,
+    #[must_use]
+    pub fn state(&self) -> &str {
+        self.state.secret()
+    }
+
     /// The nonce bound into the ID token; the callback rejects a mismatch.
-    pub nonce: Nonce,
+    #[must_use]
+    pub fn nonce(&self) -> &str {
+        self.nonce.secret()
+    }
+
     /// The PKCE verifier the callback presents at the token exchange.
-    pub pkce_verifier: PkceCodeVerifier,
+    #[must_use]
+    pub fn pkce_verifier(&self) -> &str {
+        self.pkce_verifier.secret()
+    }
 }
 
 impl Flow {
@@ -158,7 +185,8 @@ mod tests {
     #[test]
     fn authorize_redirect_carries_pkce_state_nonce_and_scopes() {
         let auth = flow().authorize();
-        let q = query(&auth.url);
+        let url = Url::parse(auth.redirect_to()).expect("a valid redirect url");
+        let q = query(&url);
 
         assert_eq!(q.get("response_type").map(String::as_str), Some("code"));
         assert_eq!(q.get("client_id").map(String::as_str), Some(CLIENT_ID));
@@ -176,18 +204,12 @@ mod tests {
         );
         assert!(q.contains_key("code_challenge"), "a PKCE challenge");
 
-        // The URL's state/nonce are exactly the ones handed back for the
-        // callback to check against.
-        assert_eq!(
-            q.get("state").map(String::as_str),
-            Some(auth.state.secret().as_str())
-        );
-        assert_eq!(
-            q.get("nonce").map(String::as_str),
-            Some(auth.nonce.secret().as_str())
-        );
+        // The URL's state/nonce are exactly the ones handed back (as strings)
+        // for the callback to check against.
+        assert_eq!(q.get("state").map(String::as_str), Some(auth.state()));
+        assert_eq!(q.get("nonce").map(String::as_str), Some(auth.nonce()));
 
         // The verifier is a real, non-empty PKCE secret.
-        assert!(!auth.pkce_verifier.secret().is_empty(), "a PKCE verifier");
+        assert!(!auth.pkce_verifier().is_empty(), "a PKCE verifier");
     }
 }
