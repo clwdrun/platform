@@ -42,8 +42,8 @@ const ALG: Algorithm = Algorithm::HS256;
 /// never print it. Built from a secret supplied by configuration (#22 will own
 /// where that secret comes from and how it rotates).
 pub struct CookieKey {
-    encoding: EncodingKey,
-    decoding: DecodingKey,
+    pub(crate) encoding: EncodingKey,
+    pub(crate) decoding: DecodingKey,
 }
 
 impl CookieKey {
