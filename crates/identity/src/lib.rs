@@ -16,5 +16,5 @@
 pub mod flow;
 pub mod oidc;
 
-pub use flow::{Authorization, Flow, OidcConfig};
+pub use flow::{Authorization, Flow, FlowError, OidcConfig};
 pub use oidc::{GoogleClaims, GoogleIdToken, GoogleSubject, VerifiedIdentity, VerifyError};
