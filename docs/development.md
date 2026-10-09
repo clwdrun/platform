@@ -70,6 +70,17 @@ just migrate                         # sqlx migrate run
 just db-down
 ```
 
+Two traps when running tests by hand rather than through `just check`:
+
+- **`.env` is not the test's environment.** `sqlx`'s macros read `.env` at
+  compile time, so the build succeeds — but the integration tests read
+  `DATABASE_URL` at *runtime*, and fail ("DATABASE_URL must be set") unless it
+  is exported in the shell. `export DATABASE_URL=...`, don't rely on `.env`.
+- **`PEBBLE_CA` must be absolute.** The ACME tests default it to
+  `.pebble/pebble.minica.pem`, which `cargo test` resolves from the *crate*
+  directory, not the workspace root — so it is not found even with Pebble up.
+  Export the absolute path `just pebble-up` prints.
+
 `sqlx` macros are compile-time checked, and `.sqlx/` is what lets CI build with no
 database at all. After changing any query or migration, run `just prepare` and
 commit `.sqlx/` — `just check` fails if it is stale, and `offline-build` proves the
