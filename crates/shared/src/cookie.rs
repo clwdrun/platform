@@ -96,6 +96,28 @@ pub fn find<'h>(headers: impl IntoIterator<Item = &'h [u8]>, name: &str) -> Foun
     }
 }
 
+/// Every cookie whose name starts with exactly `prefix` (case-sensitive), as
+/// `(name, value)`, in header order. For a family of platform cookies named
+/// by a suffix, like one handshake state per tab; reading one of them is
+/// still [`find`] by its exact name. Pairs that are not UTF-8 are skipped.
+#[must_use]
+pub fn with_prefix<'h>(
+    headers: impl IntoIterator<Item = &'h [u8]>,
+    prefix: &str,
+) -> Vec<(&'h str, &'h str)> {
+    headers
+        .into_iter()
+        .flat_map(pairs)
+        .filter(|(name, _)| name.starts_with(prefix.as_bytes()))
+        .filter_map(|(name, value)| {
+            Some((
+                std::str::from_utf8(name).ok()?,
+                std::str::from_utf8(value).ok()?,
+            ))
+        })
+        .collect()
+}
+
 /// The name prefixes the platform's own cookies use. Matched
 /// case-insensitively wherever the platform *removes* cookies, because
 /// browsers match the `__Host-`/`__Secure-` prefixes case-insensitively
@@ -180,6 +202,21 @@ mod tests {
     use super::*;
 
     const NAME: &str = "__Host-clwd_session";
+
+    #[test]
+    fn with_prefix_lists_exactly_the_family_case_sensitively() {
+        let headers: [&[u8]; 2] = [
+            b"__Host-clwd_state.aa=1.x; app=1; __HOST-clwd_state.bb=2",
+            b"__Host-clwd_state.cc=3.y; __Host-clwd_statecc=4",
+        ];
+        assert_eq!(
+            with_prefix(headers, "__Host-clwd_state."),
+            vec![
+                ("__Host-clwd_state.aa", "1.x"),
+                ("__Host-clwd_state.cc", "3.y")
+            ]
+        );
+    }
 
     fn find_in(header: &[u8]) -> Found<'_> {
         find([header], NAME)

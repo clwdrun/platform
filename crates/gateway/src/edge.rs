@@ -24,7 +24,8 @@ use crate::host::parse_host;
 use crate::lookup::{Route, RouteLookup};
 use crate::signin::{
     APP_SESSION_COOKIE, AppSession, COUNTER_COOKIE, COUNTER_WINDOW_SECS, MAX_HANDSHAKES,
-    STATE_COOKIE, SigninClient, begun_state_cookie, constant_time_eq, counter_cookie, state_cookie,
+    MAX_IN_FLIGHT, STATE_COOKIE_PREFIX, STATE_ID_LEN, SigninClient, begun_state_cookie,
+    constant_time_eq, counter_cookie, parse_state_cookie_value, state_cookie, state_cookie_name,
 };
 use crate::upstream::{
     AppTarget, AppUpstream, UpstreamRequest, drop_platform_set_cookies, strip_client_identity,
@@ -390,12 +391,42 @@ impl Edge {
                 return render_disposition(Disposition::Unavailable);
             }
         };
+        // Wall-clock microseconds, only to tell which handshake is oldest.
+        let begun_us = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_micros());
+        let Some(set_state) = begun_state_cookie(&state, begun_us) else {
+            tracing::warn!("the control plane began a handshake with a malformed state");
+            return render_disposition(Disposition::Unavailable);
+        };
+        let mut set_cookies = vec![
+            set_state,
+            counter_cookie(started.saturating_add(1), COUNTER_WINDOW_SECS),
+        ];
+        // Other tabs' handshakes stay in flight (#83); past MAX_IN_FLIGHT the
+        // oldest go, and their tabs restart when their callback finds no
+        // cookie. Only names of our own exact shape are counted or evicted.
+        let mut in_flight: Vec<(u128, &str)> =
+            shared::cookie::with_prefix(cookies.iter().map(Vec::as_slice), STATE_COOKIE_PREFIX)
+                .into_iter()
+                .filter(|(name, _)| {
+                    name.strip_prefix(STATE_COOKIE_PREFIX).is_some_and(|id| {
+                        id.len() == STATE_ID_LEN && id.bytes().all(|b| b.is_ascii_hexdigit())
+                    })
+                })
+                .map(|(name, value)| {
+                    let begun = parse_state_cookie_value(value).map_or(0, |(ms, _)| ms);
+                    (begun, name)
+                })
+                .collect();
+        in_flight.sort_unstable();
+        let excess = (in_flight.len() + 1).saturating_sub(MAX_IN_FLIGHT);
+        for (_, name) in in_flight.into_iter().take(excess) {
+            set_cookies.push(state_cookie(name, "", 0));
+        }
         redirect(
             &format!("{}/authorize?state={state}", serving.control_plane.origin()),
-            vec![
-                begun_state_cookie(&state),
-                counter_cookie(started.saturating_add(1), COUNTER_WINDOW_SECS),
-            ],
+            set_cookies,
         )
     }
 
@@ -421,20 +452,26 @@ impl Edge {
             }
         }
         let slices = || cookies.iter().map(Vec::as_slice);
-        let matches = match (&state, shared::cookie::find(slices(), STATE_COOKIE)) {
-            (Some(state), Found::One(cookie)) => {
-                constant_time_eq(state.as_bytes(), cookie.as_bytes())
-            }
+        // This handshake's own cookie, named by its state: another tab's
+        // handshake in flight is a different cookie and is left alone.
+        let own = state.as_deref().and_then(state_cookie_name);
+        let matches = match (&state, &own) {
+            (Some(state), Some(name)) => match shared::cookie::find(slices(), name) {
+                Found::One(value) => parse_state_cookie_value(value)
+                    .is_some_and(|(_, held)| constant_time_eq(state.as_bytes(), held.as_bytes())),
+                // Absent (evicted, expired, another browser's) or duplicated.
+                _ => false,
+            },
             _ => false,
         };
 
-        if let (true, Some(code), Some(state)) = (matches, code, state) {
+        if let (true, Some(code), Some(state), Some(own)) = (matches, code, state, own.as_deref()) {
             return match serving.signin.exchange(&code, &state).await {
                 Ok(Some(exchanged)) => redirect(
                     exchanged.return_path.as_str(),
                     vec![
                         exchanged.set_cookie(),
-                        state_cookie("", 0),
+                        state_cookie(own, "", 0),
                         counter_cookie(0, 0),
                     ],
                 ),

@@ -21,8 +21,22 @@ use thiserror::Error;
 
 /// The app-host session cookie.
 pub const APP_SESSION_COOKIE: &str = "__Host-clwd_app_session";
-/// The handshake state cookie, binding a callback to the browser that began it.
-pub const STATE_COOKIE: &str = "__Host-clwd_state";
+/// The handshake state cookies, one per handshake in flight, binding a
+/// callback to the browser that began it. Each is named
+/// `__Host-clwd_state.<id>`, where `<id>` is the first [`STATE_ID_LEN`]
+/// characters of the handshake's state, so the callback, which carries the
+/// state, reads only its own cookie and clears only that one. One cookie per
+/// host, overwritten by the second tab, made two concurrent sign-ins
+/// invalidate each other until the loop guard stopped them (#83).
+pub const STATE_COOKIE_PREFIX: &str = "__Host-clwd_state.";
+/// How much of the state names its cookie: 64 bits, unique among a browser's
+/// handful of handshakes in flight. The cookie's value still holds the whole
+/// state, compared in constant time.
+pub const STATE_ID_LEN: usize = 16;
+/// How many handshakes one browser may have in flight for one host. A page
+/// that opens many tabs must not grow the `Cookie` header without limit: a
+/// handshake beyond this evicts the oldest, whose tab then restarts.
+pub const MAX_IN_FLIGHT: usize = 4;
 /// The handshake counter, for the loop guard.
 pub const COUNTER_COOKIE: &str = "__Host-clwd_hs";
 /// How many handshakes one browser may start for one app host inside
@@ -56,14 +70,38 @@ pub fn app_session_cookie(value: &str, max_age_secs: i64) -> String {
     )
 }
 
-/// The `Set-Cookie` value for the handshake state. Same attributes as the
-/// session for the same reasons; `Lax` in particular, because the callback
-/// arrives as a top-level navigation from the control plane, another site.
+/// The state cookie's name for `state`, or `None` if `state` is not the
+/// control plane's shape (hex, at least [`STATE_ID_LEN`] long): the id goes
+/// into a header name, so only hex ever does.
 #[must_use]
-pub fn state_cookie(value: &str, max_age_secs: u64) -> String {
-    format!(
-        "{STATE_COOKIE}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax"
-    )
+pub fn state_cookie_name(state: &str) -> Option<String> {
+    let id = state.get(..STATE_ID_LEN)?;
+    id.bytes()
+        .all(|b| b.is_ascii_hexdigit())
+        .then(|| format!("{STATE_COOKIE_PREFIX}{id}"))
+}
+
+/// The `Set-Cookie` value for one handshake state cookie, named `name`. Same
+/// attributes as the session for the same reasons; `Lax` in particular,
+/// because the callback arrives as a top-level navigation from the control
+/// plane, another site.
+#[must_use]
+pub fn state_cookie(name: &str, value: &str, max_age_secs: u64) -> String {
+    format!("{name}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax")
+}
+
+/// A state cookie's value: when the handshake began (Unix microseconds, for
+/// evicting the oldest) and the state itself.
+#[must_use]
+pub fn state_cookie_value(begun_us: u128, state: &str) -> String {
+    format!("{begun_us}.{state}")
+}
+
+/// The `(begun_us, state)` a state cookie's value holds, if well formed.
+#[must_use]
+pub fn parse_state_cookie_value(value: &str) -> Option<(u128, &str)> {
+    let (ms, state) = value.split_once('.')?;
+    Some((ms.parse().ok()?, state))
 }
 
 /// The `Set-Cookie` value for the loop guard's counter.
@@ -74,10 +112,15 @@ pub fn counter_cookie(count: u8, max_age_secs: u64) -> String {
     )
 }
 
-/// A fresh state cookie for a begun handshake.
+/// A fresh state cookie for a begun handshake begun at `begun_us`, or `None`
+/// if `state` is not the control plane's shape.
 #[must_use]
-pub fn begun_state_cookie(state: &str) -> String {
-    state_cookie(state, STATE_TTL_SECS)
+pub fn begun_state_cookie(state: &str, begun_us: u128) -> Option<String> {
+    Some(state_cookie(
+        &state_cookie_name(state)?,
+        &state_cookie_value(begun_us, state),
+        STATE_TTL_SECS,
+    ))
 }
 
 /// An app-host session secret, as read from its cookie. Redacted `Debug`.
@@ -309,7 +352,7 @@ mod tests {
     fn every_cookie_is_host_only_and_lax() {
         for c in [
             app_session_cookie("v", 60),
-            state_cookie("v", 60),
+            begun_state_cookie(&"ab".repeat(32), 1).expect("hex state"),
             counter_cookie(1, 60),
         ] {
             assert!(c.starts_with("__Host-clwd_"), "{c}");
@@ -321,6 +364,24 @@ mod tests {
             app_session_cookie("v", 60),
             "__Host-clwd_app_session=v; Path=/; Max-Age=60; HttpOnly; Secure; SameSite=Lax"
         );
+    }
+
+    #[test]
+    fn a_state_cookie_is_named_by_its_state_and_only_hex_names_one() {
+        let state = "0123456789abcdef".repeat(4);
+        assert_eq!(
+            state_cookie_name(&state).as_deref(),
+            Some("__Host-clwd_state.0123456789abcdef")
+        );
+        let set = begun_state_cookie(&state, 42).expect("hex state");
+        assert!(set.starts_with(&format!("__Host-clwd_state.0123456789abcdef=42.{state};")));
+        assert_eq!(
+            parse_state_cookie_value(&format!("42.{state}")),
+            Some((42, state.as_str()))
+        );
+        for bad in ["short", "0123456789abcdeg0000", "0123456789abcde;=x", ""] {
+            assert_eq!(state_cookie_name(bad), None, "{bad}");
+        }
     }
 
     #[test]
