@@ -8798,6 +8798,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "builder",
+ "bytes",
  "clwd-bundle",
  "clwd-runtime",
  "futures",
