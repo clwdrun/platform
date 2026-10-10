@@ -176,12 +176,11 @@ pub const FLOW_COOKIE: &str = "__Host-clwd_signin";
 const FLOW_TTL_SECS: u64 = 600;
 
 /// Everything the two sign-in routes need: the discovered flow, the HTTP
-/// client it runs over, the cookie key, and the apex the session is scoped to.
+/// client it runs over, the cookie key, and the control plane's own origin.
 pub struct SignIn {
     flow: identity::Flow,
     http: reqwest::Client,
     key: CookieKey,
-    apex: String,
     origin: String,
 }
 
@@ -209,7 +208,6 @@ impl SignIn {
     pub async fn discover(
         config: identity::OidcConfig,
         key: CookieKey,
-        apex: impl Into<String>,
     ) -> Result<Self, identity::FlowError> {
         crate::acme::install_crypto_provider();
         let origin = reqwest::Url::parse(&config.redirect_uri)
@@ -227,7 +225,6 @@ impl SignIn {
             flow,
             http,
             key,
-            apex: apex.into(),
             origin,
         })
     }
@@ -252,7 +249,7 @@ fn not_configured() -> Error {
 /// `GET /auth/google`: set the flow cookie and send the browser to Google.
 ///
 /// Takes no `return_to`/`next` parameter, deliberately: the callback always
-/// lands on the apex root, so there is no redirect target to validate and no
+/// lands on the control plane's own root, so there is no redirect target to validate and no
 /// open redirect to get wrong.
 pub(crate) async fn start(
     State(state): State<AppState>,
@@ -381,14 +378,14 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
     // see `orgs` for the rule and why the email's domain plays no part.
     crate::orgs::resolve_at_sign_in(&state.pool, user, hd).await?;
 
-    let issued = session::issue(&state.pool, &signin.key, user, &signin.apex)
+    let issued = session::issue(&state.pool, &signin.key, user)
         .await?
         .ok_or(Error::Unauthenticated {})?;
 
     Ok((
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, format!("https://{}/", signin.apex)),
+            (header::LOCATION, format!("{}/", signin.origin)),
             (header::SET_COOKIE, issued.set_cookie),
         ],
     )
@@ -425,7 +422,7 @@ pub(crate) async fn logout(
     }
     (
         StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session::clear_cookie(&signin.apex))],
+        [(header::SET_COOKIE, session::clear_cookie())],
     )
         .into_response()
 }
@@ -461,7 +458,7 @@ pub(crate) fn start_doc() -> Doc {
         summary: "Start Google sign-in",
         description: "Sets a short-lived, signed flow cookie carrying the OIDC `state`, `nonce` and \
                       PKCE verifier, and redirects the browser to Google. Takes no redirect-target \
-                      parameter: the callback always lands on the apex root.",
+                      parameter: the callback always lands on the control plane's own root.",
         params: &[],
         request: None,
         success: vec![Success {
@@ -486,7 +483,7 @@ pub(crate) fn callback_doc() -> Doc {
         request: None,
         success: vec![Success {
             status: StatusCode::SEE_OTHER,
-            description: "Signed in: a session cookie is set and the browser is sent to the apex root.",
+            description: "Signed in: a session cookie is set and the browser is sent to the control plane's own root.",
             body: None,
         }],
         errors: &["identity.unauthenticated", "control-plane.conflict"],

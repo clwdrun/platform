@@ -348,7 +348,7 @@
       "sessionCookie": {
         "description": "**Authentication:** a browser session cookie, set by Google sign-in (`GET /auth/google`). A state-changing request must also come from the control plane's own origin: `Sec-Fetch-Site: same-origin`, or, without that header, an exact `Origin` match. Other pages on the same site, including every app under the apex, are refused.",
         "in": "cookie",
-        "name": "__Secure-clwd_session",
+        "name": "__Host-clwd_session",
         "type": "apiKey"
       }
     }
@@ -362,7 +362,7 @@
   "paths": {
     "/auth/google": {
       "get": {
-        "description": "Sets a short-lived, signed flow cookie carrying the OIDC `state`, `nonce` and PKCE verifier, and redirects the browser to Google. Takes no redirect-target parameter: the callback always lands on the apex root.\n\n**Authentication:** none.",
+        "description": "Sets a short-lived, signed flow cookie carrying the OIDC `state`, `nonce` and PKCE verifier, and redirects the browser to Google. Takes no redirect-target parameter: the callback always lands on the control plane's own root.\n\n**Authentication:** none.",
         "operationId": "sign_in_start",
         "responses": {
           "303": {
@@ -456,7 +456,7 @@
         "operationId": "sign_in_callback",
         "responses": {
           "303": {
-            "description": "Signed in: a session cookie is set and the browser is sent to the apex root."
+            "description": "Signed in: a session cookie is set and the browser is sent to the control plane's own root."
           },
           "401": {
             "content": {

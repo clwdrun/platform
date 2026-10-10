@@ -47,7 +47,6 @@ use tower::ServiceExt as _;
 const CLIENT_ID: &str = "test-client.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "test-client-secret";
 const REDIRECT: &str = "https://api.clwd.run/auth/google/callback";
-const APEX: &str = "clwd.run";
 const SUBJECT: &str = "google-subject-1";
 const EMAIL: &str = "person@example.com";
 
@@ -331,7 +330,6 @@ async fn state(pool: &PgPool, issuer: &Issuer) -> AppState {
             issuer.mock.issuer.clone(),
         ),
         key(),
-        APEX,
     )
     .await
     .expect("discovery against the mock issuer");
@@ -498,7 +496,27 @@ async fn a_full_sign_in_ends_in_a_session_that_authenticates(pool: PgPool) {
     .await;
 
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{:?}", reply.json);
-    assert_eq!(reply.headers[header::LOCATION], "https://clwd.run/");
+    // The session is host-only, so sign-in lands on the host that holds it.
+    assert_eq!(reply.headers[header::LOCATION], "https://api.clwd.run/");
+    // The literal header: `__Host-`, and no `Domain` attribute at all. A
+    // `Domain` here is what let any app host plant this cookie (#62).
+    let session_set_cookie = reply
+        .set_cookies()
+        .into_iter()
+        .find(|c| c.starts_with(&format!("{}=", session::COOKIE_NAME)))
+        .expect("a session Set-Cookie");
+    assert!(
+        session_set_cookie.starts_with("__Host-clwd_session="),
+        "{session_set_cookie}"
+    );
+    assert!(
+        session_set_cookie.ends_with("; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax"),
+        "{session_set_cookie}"
+    );
+    assert!(
+        !session_set_cookie.to_ascii_lowercase().contains("domain"),
+        "{session_set_cookie}"
+    );
     let user = authenticates(&pool, &reply)
         .await
         .expect("the session the callback issued authenticates");
@@ -778,7 +796,6 @@ async fn discovery_against_a_down_issuer_fails() {
     let result = SignIn::discover(
         OidcConfig::new(CLIENT_ID, CLIENT_SECRET, REDIRECT, url),
         key(),
-        APEX,
     )
     .await;
     assert!(
@@ -827,7 +844,7 @@ async fn logging_out_revokes_the_session_server_side(pool: PgPool) {
     assert!(
         reply.set_cookies().iter().any(|c| {
             c.starts_with(&format!("{}=;", session::COOKIE_NAME))
-                && c.contains("Domain=clwd.run")
+                && !c.to_ascii_lowercase().contains("domain")
                 && c.contains("Max-Age=0")
         }),
         "the session cookie is cleared: {:?}",
