@@ -17,7 +17,11 @@ default:
 # `migrate` runs before anything that compiles the workspace: sqlx checks its
 # queries against the live database at macro expansion, so a fresh `just db-up`
 # with no schema fails `clippy` rather than failing something about schema.
-check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe openapi-check deny release-has-no-test-upstream
+check: gate release-worker-has-no-dev-caller
+
+# Everything in `check` except the release worker build. CI runs the two as
+# parallel jobs; neither is ever skipped (ci.yml).
+gate: secrets fmt-check seam rollback-plans migrate fixture clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe openapi-check deny release-has-no-test-upstream
 
 # Secret scan over full history. This repository is private, so GitHub's own
 # secret scanning and push protection — both Advanced Security features — are
@@ -178,6 +182,38 @@ rollback-plans:
 
 # .sqlx is what lets CI build with no database. It rots silently the moment a
 # query changes, so the gate checks it rather than trusting it.
+# The whoami component the identity tests run (#11), built for wasm32-wasip2
+# against clwd-sdk at the pinned tag. Before anything compiles the e2e tests,
+# which embed it: a missing build is a compile error, never a skip, and a
+# missing target fails here.
+[doc('build the whoami fixture component (wasm32-wasip2)')]
+fixture:
+    cargo build --release --locked --target wasm32-wasip2 \
+      --manifest-path crates/e2e/fixtures/whoami/Cargo.toml --target-dir target/fixtures
+
+# The production worker has no dev or fake caller (#11). The only caller it
+# can present is the one in the hop's frame. The local `local@local` caller
+# lives in clwd-cli, and the runtime's scripted backends sit behind
+# `test-util`/`conformance`, so none of those may be in the worker's tree. The
+# positive control proves the tree really lists clwd-runtime's features, so an
+# empty tree cannot pass. The release build itself must also succeed.
+[doc('the release worker contains no dev or fake caller')]
+release-worker-has-no-dev-caller:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    tree=$(cargo tree --locked -p worker -e normal,features)
+    if grep -qE 'clwd-cli|clwd-runtime feature "(test-util|conformance)"' <<<"$tree"; then
+      echo "error: the worker's tree reaches a dev or fake caller:"
+      grep -E 'clwd-cli|clwd-runtime feature "(test-util|conformance)"' <<<"$tree"
+      exit 1
+    fi
+    if ! grep -q 'clwd-runtime feature "wasm"' <<<"$tree"; then
+      echo "error: positive control failed: the tree does not show clwd-runtime's features"
+      exit 1
+    fi
+    cargo build --release --locked -p worker --bin worker
+    echo "ok: the release worker contains no dev or fake caller"
+
 # The gateway's app hop has exactly one HTTP implementation: the browser
 # tests' test upstream, which lives in crates/e2e and must never reach a
 # release build (#62). Built and searched, not assumed: the test upstream

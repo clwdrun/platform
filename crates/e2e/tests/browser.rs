@@ -1038,12 +1038,26 @@ async fn a_misbehaving_worker_is_contained(pool: PgPool) {
                     "/oversized" => {
                         let _ = stream.write_all(&(hop::MAX_HEAD + 1).to_be_bytes()).await;
                     }
+                    // Complete, well-formed frames that break a cap: a gateway
+                    // without the cap would read them whole and answer 200.
                     "/huge-body" => {
                         let answer = serde_json::to_vec(&ResponseHead::answer(200, vec![]))
                             .expect("encodes");
                         let _ = stream.write_all(&(answer.len() as u32).to_be_bytes()).await;
                         let _ = stream.write_all(&answer).await;
                         let _ = stream.write_all(&(hop::MAX_BODY + 1).to_be_bytes()).await;
+                        let body = vec![b'x'; usize::try_from(hop::MAX_BODY + 1).expect("fits")];
+                        let _ = stream.write_all(&body).await;
+                    }
+                    "/many-headers" => {
+                        let headers = (0..=hop::MAX_HEADERS)
+                            .map(|i| (format!("x-h{i}"), b"1".to_vec()))
+                            .collect();
+                        let answer = serde_json::to_vec(&ResponseHead::answer(200, headers))
+                            .expect("encodes");
+                        let _ = stream.write_all(&(answer.len() as u32).to_be_bytes()).await;
+                        let _ = stream.write_all(&answer).await;
+                        let _ = stream.write_all(&0u64.to_be_bytes()).await;
                     }
                     _ => {
                         let _ = stream.write_all(&5u32.to_be_bytes()).await;
@@ -1091,7 +1105,7 @@ async fn a_misbehaving_worker_is_contained(pool: PgPool) {
             cookies.iter().all(|c| !c.contains("planted")),
             "a platform cookie from the worker reached the browser: {cookies:?}"
         );
-        for path in ["/oversized", "/huge-body", "/malformed"] {
+        for path in ["/oversized", "/huge-body", "/many-headers", "/malformed"] {
             let (status, json) = on_notes(&client, path, &v.cookie, &[]).await;
             assert_eq!(status, 502, "{path}: {json}");
             assert_eq!(json["code"], "gateway.app_unreachable", "{path}");

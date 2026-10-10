@@ -372,6 +372,39 @@ fn unavailable() -> clwd_runtime::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt as _;
+
+    fn my_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self")
+            .map(|m| m.uid())
+            .unwrap_or(0)
+    }
+
+    /// A peer that is not the gateway cannot hand the worker a caller: the
+    /// connection is dropped before a frame is read, and nothing runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_peer_that_is_not_the_gateway_runs_nothing() {
+        let operator =
+            opendal::Operator::new(opendal::services::Memory::default()).expect("operator");
+        let worker = Arc::new(
+            Worker::new(ArtifactStore::new(operator), my_uid().wrapping_add(1)).expect("worker"),
+        );
+        let socket = std::env::temp_dir().join(format!("wk-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = UnixListener::bind(&socket).expect("bind");
+        tokio::spawn(Arc::clone(&worker).serve(listener));
+
+        let mut stream = UnixStream::connect(&socket).await.expect("connect");
+        let mut answer = Vec::new();
+        let read = stream.read_to_end(&mut answer).await;
+        assert!(
+            read.is_err() || answer.is_empty(),
+            "the worker answered an impostor"
+        );
+        assert_eq!(worker.invocations(), 0);
+        let _ = std::fs::remove_file(&socket);
+    }
 
     #[test]
     fn a_forbidden_variable_is_named_and_others_pass() {

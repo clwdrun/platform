@@ -125,3 +125,59 @@ impl AppUpstream for WorkerUpstream {
             .map_err(|_| UpstreamError("the worker did not answer in time".to_owned()))?
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use http::Method;
+    use shared::hop::{AppSubject, Caller};
+    use tokio::io::AsyncReadExt as _;
+
+    fn my_uid() -> u32 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata("/proc/self")
+            .map(|m| m.uid())
+            .unwrap_or(0)
+    }
+
+    /// A process that wins the socket path, running as anyone but the worker,
+    /// receives nothing: not the caller, not a header, not a byte.
+    #[tokio::test]
+    async fn a_listener_under_the_wrong_uid_gets_no_request() {
+        let socket = std::env::temp_dir().join(format!("gw-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+        let received = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept");
+            let mut got = Vec::new();
+            let _ = stream.read_to_end(&mut got).await;
+            got.len()
+        });
+
+        let hop = WorkerUpstream::new(&socket, my_uid().wrapping_add(1));
+        let target = AppTarget::new(
+            "a".into(),
+            "o".into(),
+            clwd_bundle::BundleRef::of_stream(b"x"),
+        );
+        let request = UpstreamRequest::new(
+            Caller::new(
+                AppSubject::new("s"),
+                Some("ada@example.com".into()),
+                OrgId::new("o"),
+            ),
+            Method::GET,
+            "/".into(),
+            HeaderMap::new(),
+            Bytes::from_static(b"body"),
+        );
+        let error = hop.forward(&target, request).await.expect_err("refused");
+        assert!(error.0.contains("not the worker's"), "{error}");
+        assert_eq!(
+            received.await.expect("listener"),
+            0,
+            "the impostor received bytes"
+        );
+        let _ = std::fs::remove_file(&socket);
+    }
+}
