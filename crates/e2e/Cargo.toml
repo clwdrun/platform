@@ -15,6 +15,8 @@ path = "src/lib.rs"
 [dev-dependencies]
 control-plane = { version = "0.1.0", path = "../control-plane" }
 gateway = { version = "0.1.0", path = "../gateway" }
+worker = { workspace = true }
+clwd-bundle = { workspace = true }
 shared = { workspace = true }
 identity = { workspace = true }
 builder = { workspace = true }
@@ -47,3 +49,4 @@ rsa = "0.9"
 rand = "0.8"
 base64 = "0.22"
 sha2 = { workspace = true }
+zstd = { workspace = true }

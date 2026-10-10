@@ -14,9 +14,11 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use gateway::cert::CertResolver;
-use gateway::edge::Edge;
+use gateway::edge::{Edge, Serving};
 use gateway::lookup::RouteLookup;
+use gateway::signin::SigninClient;
 use gateway::tls::DynamicCert;
+use gateway::worker::WorkerUpstream;
 use pingora::apps::http_app::HttpServer;
 use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
@@ -50,8 +52,31 @@ fn main() -> anyhow::Result<()> {
 
     tracing::info!(%listen, %apps, control_plane = control_plane_domain.as_str(), %cert_dir, "gateway serving");
 
-    let lookup = Arc::new(RouteLookup::new(control_plane, internal_secret)?);
-    let edge = Edge::new(lookup, apps.clone());
+    let lookup = Arc::new(RouteLookup::new(
+        control_plane.clone(),
+        internal_secret.clone(),
+    )?);
+    let mut edge = Edge::new(lookup, apps.clone());
+    // Apps are served when a worker is configured; without one a live app
+    // answers `gateway.not_ready`, as before #11. The worker is a separate
+    // process and user: app code never runs in this one, which holds every
+    // org's TLS key and the internal credential.
+    match env::var("CLWD_WORKER_SOCKET") {
+        Ok(socket) => {
+            let worker_uid: u32 = env::var("CLWD_WORKER_UID")
+                .context("CLWD_WORKER_UID must name the worker's user id")?
+                .parse()
+                .context("CLWD_WORKER_UID must be a number")?;
+            let signin = Arc::new(SigninClient::new(control_plane, internal_secret)?);
+            tracing::info!(%socket, worker_uid, "serving apps through the worker");
+            edge = edge.serving(Serving::new(
+                signin,
+                control_plane_domain.clone(),
+                Arc::new(WorkerUpstream::new(socket, worker_uid)),
+            ));
+        }
+        Err(_) => tracing::warn!("CLWD_WORKER_SOCKET is unset; live apps answer gateway.not_ready"),
+    }
 
     let store = Arc::new(DirCertStore::new(&cert_dir));
     let resolver = CertResolver::new(store, apps);

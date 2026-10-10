@@ -1,0 +1,21 @@
+# The app the identity tests (#11) run: a real component, built for
+# wasm32-wasip2 against clwd-sdk at the pinned tag. Its own workspace, so the
+# platform workspace never builds it for the host.
+[workspace]
+
+[package]
+name = "whoami"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clwd-sdk = { version = "0.0.2", git = "https://github.com/clwdrun/clwd", tag = "v0.0.2" }
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
