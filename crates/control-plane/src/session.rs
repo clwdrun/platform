@@ -220,22 +220,23 @@ pub(crate) async fn require(
     }
 }
 
-/// The value of the cookie called `name`, if exactly one is present.
+/// The value of the cookie called exactly `name`, if exactly one is present.
 ///
-/// Two is refused rather than resolved: a second one is what a subdomain
-/// planting its own cookie on the apex looks like, and picking either would
-/// let the attacker choose which session the victim is in.
+/// Through [`shared::cookie::find`], the platform's one cookie parser: an
+/// exact byte match on the name, never a repaired one, and two is refused
+/// rather than resolved — a second one is what a planted cookie looks like,
+/// and picking either would let the planter choose the session.
 pub(crate) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
-    let mut found = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(found, _)| *found == name)
-        .map(|(_, value)| value);
-    let first = found.next()?;
-    found.next().is_none().then_some(first)
+    match shared::cookie::find(
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+        name,
+    ) {
+        shared::cookie::Found::One(value) => Some(value),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
