@@ -13,6 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shared::cert::{CertStore, StoredCert};
+use shared::domains::AppsDomain;
 
 use crate::host::parse_host;
 
@@ -61,17 +62,17 @@ impl HandshakeMetrics {
 /// so it can be tested without a TLS handshake.
 pub struct CertResolver {
     store: Arc<dyn CertStore>,
-    apex: String,
+    apps: AppsDomain,
     metrics: Arc<HandshakeMetrics>,
 }
 
 impl CertResolver {
-    /// A resolver over `store`, treating SNI names under `apex` (e.g. `clwd.run`).
+    /// A resolver over `store`, treating SNI names under the apps domain.
     #[must_use]
-    pub fn new(store: Arc<dyn CertStore>, apex: impl Into<String>) -> Self {
+    pub fn new(store: Arc<dyn CertStore>, apps: AppsDomain) -> Self {
         Self {
             store,
-            apex: apex.into(),
+            apps,
             metrics: Arc::new(HandshakeMetrics::default()),
         }
     }
@@ -91,7 +92,7 @@ impl CertResolver {
             return Selection::NotAppHost;
         };
 
-        let org = match parse_host(sni, &self.apex) {
+        let org = match parse_host(sni, self.apps.as_str()) {
             Ok(app_host) => app_host.org,
             Err(_) => {
                 self.metrics.not_app_host.fetch_add(1, Ordering::Relaxed);
@@ -172,14 +173,17 @@ mod tests {
             .iter()
             .map(|o| ((*o).to_owned(), cert()))
             .collect::<HashMap<_, _>>();
-        CertResolver::new(Arc::new(MapStore { certs, down }), "clwd.run")
+        CertResolver::new(
+            Arc::new(MapStore { certs, down }),
+            AppsDomain::parse("clwd-apps.test").expect("apps domain"),
+        )
     }
 
     #[tokio::test]
     async fn a_known_org_is_served() {
         let r = resolver(false, &["acme"]);
         assert!(matches!(
-            r.select(Some("dashboard.acme.clwd.run")).await,
+            r.select(Some("dashboard.acme.clwd-apps.test")).await,
             Selection::Serve(_)
         ));
         assert_eq!(HandshakeMetrics::get(&r.metrics().served), 1);
@@ -189,7 +193,7 @@ mod tests {
     async fn an_org_without_a_cert_is_a_counted_no_cert() {
         let r = resolver(false, &[]); // store has no cert for acme
         assert!(matches!(
-            r.select(Some("dashboard.acme.clwd.run")).await,
+            r.select(Some("dashboard.acme.clwd-apps.test")).await,
             Selection::NoCert
         ));
         assert_eq!(
@@ -203,7 +207,7 @@ mod tests {
     async fn a_non_app_host_sni_and_a_missing_sni_are_counted() {
         let r = resolver(false, &["acme"]);
         assert!(matches!(
-            r.select(Some("clwd.run")).await, // apex, not an app host
+            r.select(Some("clwd-apps.test")).await, // apex, not an app host
             Selection::NotAppHost
         ));
         assert!(matches!(r.select(None).await, Selection::NotAppHost));
@@ -214,7 +218,7 @@ mod tests {
     async fn a_store_outage_is_a_counted_unavailable() {
         let r = resolver(true, &["acme"]);
         assert!(matches!(
-            r.select(Some("dashboard.acme.clwd.run")).await,
+            r.select(Some("dashboard.acme.clwd-apps.test")).await,
             Selection::Unavailable
         ));
         assert_eq!(HandshakeMetrics::get(&r.metrics().unavailable), 1);

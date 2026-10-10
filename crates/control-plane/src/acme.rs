@@ -1,9 +1,9 @@
 //! ACME certificate issuance: one DNS-01 wildcard certificate per org
-//! (`*.{slug}.clwd.run`, #5/#18), via `instant-acme`.
+//! (`*.{slug}.<apps domain>`, #5/#18), via `instant-acme`.
 //!
 //! `instant-acme` is transport-only — it hands out a challenge value but never
 //! touches DNS. So DNS-01 validation is a collaboration: the ACME client gives
-//! us the value, we publish it as a `_acme-challenge.{slug}.clwd.run` TXT
+//! us the value, we publish it as a `_acme-challenge.{slug}.<apps domain>` TXT
 //! record, wait for it to propagate, tell the CA to validate, and clean up.
 //! [`DnsProvider`] is the seam over whichever DNS API does that.
 //!
@@ -25,6 +25,7 @@ use instant_acme::{
 };
 use rustls_pki_types::CertificateDer;
 use shared::cert::{CertStore, OrgSlug, StoredCert};
+use shared::domains::AppsDomain;
 use sqlx::PgPool;
 use thiserror::Error;
 
@@ -50,7 +51,7 @@ pub fn install_crypto_provider() {
 ///
 /// Implementations must be cheap to share and safe to call concurrently — org
 /// creation and the renewal reconciler both drive issuance. For a per-org
-/// wildcard the record is `_acme-challenge.{slug}.clwd.run`: a fixed one-label
+/// wildcard the record is `_acme-challenge.{slug}.<apps domain>`: a fixed one-label
 /// depth under the apex, not arbitrary nesting.
 #[async_trait]
 pub trait DnsProvider: Send + Sync {
@@ -94,7 +95,7 @@ pub enum DnsError {
     Timeout,
 }
 
-/// Issues one per-org wildcard certificate (`*.{slug}.clwd.run`) via DNS-01,
+/// Issues one per-org wildcard certificate (`*.{slug}.<apps domain>`) via DNS-01,
 /// and stores it.
 ///
 /// # Persisted state spans three stores, and the crash windows between them are
@@ -126,7 +127,7 @@ pub struct CertIssuer {
     dns: Arc<dyn DnsProvider>,
     store: Arc<dyn CertStore>,
     pool: PgPool,
-    apex: String,
+    apps: AppsDomain,
 }
 
 /// Why issuance did not produce a stored certificate.
@@ -164,15 +165,20 @@ impl From<instant_acme::Error> for IssueError {
 
 impl CertIssuer {
     /// An issuer over an existing ACME `account`, using `dns` for DNS-01 and
-    /// storing certificates in `store`; `pool` holds the lifecycle state and
-    /// `apex` is the platform apex (`clwd.run`).
+    /// storing certificates in `store`; `pool` holds the lifecycle state, and
+    /// certificates are for `*.{org}.<apps>`.
+    ///
+    /// Certificates are only ever for the apps domain, so `dns` must be scoped
+    /// to the apps zone alone. The control plane's zone is a different zone
+    /// with its own token, and this issuer never needs it (#62): a leaked
+    /// issuance token can then touch app DNS only.
     #[must_use]
     pub fn new(
         account: Account,
         dns: Arc<dyn DnsProvider>,
         store: Arc<dyn CertStore>,
         pool: PgPool,
-        apex: impl Into<String>,
+        apps: AppsDomain,
     ) -> Self {
         // Safety net: ensure the rustls provider is installed even if the caller
         // forgot. Idempotent; the account passed in was likely already created
@@ -183,11 +189,11 @@ impl CertIssuer {
             dns,
             store,
             pool,
-            apex: apex.into(),
+            apps,
         }
     }
 
-    /// Issue (or resume issuing) `org`'s `*.{slug}.clwd.run` certificate, storing
+    /// Issue (or resume issuing) `org`'s `*.{slug}.<apps domain>` certificate, storing
     /// it and recording the lifecycle state. Idempotent and resumable: safe to
     /// call again after any crash above.
     ///
@@ -283,10 +289,10 @@ impl CertIssuer {
         slug: &OrgSlug,
         replaces_der: Option<&[u8]>,
     ) -> Result<(), IssueError> {
-        // The wildcard goes in the IDENTIFIER — `*.{slug}.clwd.run` — not the
+        // The wildcard goes in the IDENTIFIER — `*.{slug}.<apps domain>` — not the
         // challenge name. Ordering the base domain here yields a non-wildcard
         // certificate that works for one host and fails for every app.
-        let wildcard = format!("*.{}.{}", slug.as_str(), self.apex);
+        let wildcard = self.apps.org_wildcard(slug);
         let identifier = Identifier::Dns(wildcard);
 
         // Resume an in-flight order if one is persisted and still drivable;

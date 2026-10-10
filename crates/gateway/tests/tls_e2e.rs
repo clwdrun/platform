@@ -26,7 +26,7 @@ use boring::rsa::Rsa;
 use boring::ssl::{SslConnector, SslMethod, SslVerifyMode};
 use boring::x509::{X509, X509NameBuilder};
 
-const APEX: &str = "clwd.run";
+const APEX: &str = "clwd-apps.test";
 
 fn free_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -135,7 +135,8 @@ fn sni_selects_each_orgs_own_certificate_and_a_missing_cert_fails_the_handshake(
 
     let child = Command::new(env!("CARGO_BIN_EXE_gateway"))
         .env("CLWD_GATEWAY_LISTEN", format!("127.0.0.1:{port}"))
-        .env("CLWD_APEX", APEX)
+        .env("CLWD_APPS_DOMAIN", APEX)
+        .env("CLWD_CONTROL_PLANE_DOMAIN", "api.clwd.test")
         .env("CLWD_CONTROL_PLANE", "http://127.0.0.1:1") // unreachable; HTTP body is a gateway envelope regardless
         .env("CLWD_INTERNAL_SECRET", "unused")
         .env("CLWD_CERT_DIR", &dir)
@@ -149,7 +150,7 @@ fn sni_selects_each_orgs_own_certificate_and_a_missing_cert_fails_the_handshake(
     // Each org's SNI is served that org's OWN certificate — the assertion a
     // resolver that ignored SNI could not pass.
     let (served, response) =
-        tls_request(port, "app.acme.clwd.run").expect("acme handshake succeeds");
+        tls_request(port, "app.acme.clwd-apps.test").expect("acme handshake succeeds");
     assert_eq!(
         served, acme_cert,
         "acme host must be served acme's certificate"
@@ -174,7 +175,7 @@ fn sni_selects_each_orgs_own_certificate_and_a_missing_cert_fails_the_handshake(
     );
 
     let (served_other, _) =
-        tls_request(port, "app.other.clwd.run").expect("other handshake succeeds");
+        tls_request(port, "app.other.clwd-apps.test").expect("other handshake succeeds");
     assert_eq!(
         served_other, other_cert,
         "other host must be served other's certificate, not acme's"
@@ -187,7 +188,7 @@ fn sni_selects_each_orgs_own_certificate_and_a_missing_cert_fails_the_handshake(
     // An org with no certificate: the handshake FAILS. (The counter side of this
     // miss — no_cert incremented — is asserted in cert.rs's unit tests, which can
     // read the resolver's metrics; a subprocess cannot.)
-    let miss = tls_request(port, "app.ghost.clwd.run");
+    let miss = tls_request(port, "app.ghost.clwd-apps.test");
     assert!(
         miss.is_err(),
         "an org with no certificate must fail the handshake, got {miss:?}"

@@ -1,9 +1,9 @@
 //! Parsing an inbound `Host` / SNI name into the org and app it addresses.
 //!
-//! App traffic is served on `{app}.{org}.clwd.run` (#18). This module owns the
+//! App traffic is served on `{app}.{org}.<apps domain>` (#18, #62). This module owns the
 //! single definition of that shape: an app host has exactly two DNS labels —
-//! the app, then the org — in front of the platform apex. Everything else
-//! (`clwd.run`, `api.clwd.run`, a bare `{org}.clwd.run`, a foreign domain) is
+//! the app, then the org — in front of the apps domain. Everything else
+//! (the apps domain itself, a bare `{org}.<apps domain>`, a foreign domain) is
 //! deliberately *not* an app host, and the gateway answers those with a 404
 //! rather than routing them.
 //!
@@ -20,7 +20,7 @@ use thiserror::Error;
 // keep using `host::OrgSlug`.
 pub use shared::cert::{MAX_LABEL_LEN, OrgSlug, is_valid_label};
 
-/// An app name: the `{app}` in `{app}.{org}.clwd.run`. Same DNS-label rule as a
+/// An app name: the `{app}` in `{app}.{org}.<apps domain>`. Same DNS-label rule as a
 /// slug, but mutable and unique only within its org (#18), so it carries no
 /// reserved-word list.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -96,7 +96,7 @@ impl fmt::Debug for AppHost {
 ///
 /// `host` is the raw `Host` header or SNI name; an `:port` suffix, a trailing
 /// dot, and upper-case letters are all tolerated and normalised. `apex` is the
-/// platform apex (`clwd.run` in production, overridable for tests and dev).
+/// apps domain (`shared::domains::AppsDomain`, configured, never the control plane's).
 ///
 /// Returns [`AppHost`] only for exactly `{app}.{org}.{apex}`. The apex itself, a
 /// bare `{org}.{apex}`, deeper names, and foreign domains all return an error —
@@ -115,9 +115,9 @@ pub fn parse_host(host: &str, apex: &str) -> Result<AppHost, HostError> {
     let remainder = host.strip_suffix(&apex).ok_or(HostError::ForeignApex)?;
     let prefix = match remainder.strip_suffix('.') {
         Some(prefix) => prefix,
-        // Empty remainder means the host *is* the apex (`clwd.run`) — under the
+        // Empty remainder means the host *is* the apex (`clwd-apps.test`) — under the
         // apex, just not an app host. A non-empty remainder with no trailing dot
-        // is the apex appearing as a non-boundary substring (`notclwd.run`).
+        // is the apex appearing as a non-boundary substring (`notclwd-apps.test`).
         None if remainder.is_empty() => return Err(HostError::NotAppHost),
         None => return Err(HostError::ForeignApex),
     };
@@ -140,18 +140,19 @@ pub fn parse_host(host: &str, apex: &str) -> Result<AppHost, HostError> {
 mod tests {
     use super::*;
 
-    const APEX: &str = "clwd.run";
+    const APEX: &str = "clwd-apps.test";
 
     #[test]
     fn parses_a_well_formed_app_host() {
-        let h = parse_host("dashboard.acme.clwd.run", APEX).expect("valid app host");
+        let h = parse_host("dashboard.acme.clwd-apps.test", APEX).expect("valid app host");
         assert_eq!(h.app.as_str(), "dashboard");
         assert_eq!(h.org.as_str(), "acme");
     }
 
     #[test]
     fn normalises_case_port_and_trailing_dot() {
-        let h = parse_host("Dashboard.ACME.clwd.run.:443", APEX).expect("valid after normalise");
+        let h =
+            parse_host("Dashboard.ACME.clwd-apps.test.:443", APEX).expect("valid after normalise");
         assert_eq!(h.app.as_str(), "dashboard");
         assert_eq!(h.org.as_str(), "acme");
     }
@@ -159,21 +160,24 @@ mod tests {
     #[test]
     fn single_character_labels_are_valid() {
         // The DB regex permits a one-character label; so must this.
-        let h = parse_host("a.b.clwd.run", APEX).expect("single-char labels ok");
+        let h = parse_host("a.b.clwd-apps.test", APEX).expect("single-char labels ok");
         assert_eq!(h.app.as_str(), "a");
         assert_eq!(h.org.as_str(), "b");
     }
 
     #[test]
     fn apex_itself_is_not_an_app_host() {
-        assert_eq!(parse_host("clwd.run", APEX), Err(HostError::NotAppHost));
+        assert_eq!(
+            parse_host("clwd-apps.test", APEX),
+            Err(HostError::NotAppHost)
+        );
     }
 
     #[test]
     fn bare_org_root_is_not_an_app_host() {
-        // acme.clwd.run is the org root, not an app — one label short.
+        // acme.clwd-apps.test is the org root, not an app — one label short.
         assert_eq!(
-            parse_host("acme.clwd.run", APEX),
+            parse_host("acme.clwd-apps.test", APEX),
             Err(HostError::NotAppHost)
         );
     }
@@ -181,7 +185,7 @@ mod tests {
     #[test]
     fn deeper_names_are_not_app_hosts() {
         assert_eq!(
-            parse_host("a.b.c.clwd.run", APEX),
+            parse_host("a.b.c.clwd-apps.test", APEX),
             Err(HostError::NotAppHost)
         );
     }
@@ -196,10 +200,10 @@ mod tests {
 
     #[test]
     fn apex_as_substring_is_not_a_match() {
-        // "notclwd.run" ends with "clwd.run" as text but not on a label
+        // "notclwd-apps.test" ends with "clwd-apps.test" as text but not on a label
         // boundary; the leading-dot strip is what rejects it.
         assert_eq!(
-            parse_host("dashboard.acme.notclwd.run", APEX),
+            parse_host("dashboard.acme.notclwd-apps.test", APEX),
             Err(HostError::ForeignApex)
         );
     }
@@ -207,13 +211,13 @@ mod tests {
     #[test]
     fn invalid_labels_are_rejected() {
         for bad in [
-            "-app.acme.clwd.run", // leading hyphen
-            "app-.acme.clwd.run", // trailing hyphen
-            "app.acme-.clwd.run", // trailing hyphen in org
-            "ap_p.acme.clwd.run", // underscore
-            "app.ACME_.clwd.run", // underscore in org
-            ".acme.clwd.run",     // empty app label
-            "app..clwd.run",      // empty org label
+            "-app.acme.clwd-apps.test", // leading hyphen
+            "app-.acme.clwd-apps.test", // trailing hyphen
+            "app.acme-.clwd-apps.test", // trailing hyphen in org
+            "ap_p.acme.clwd-apps.test", // underscore
+            "app.ACME_.clwd-apps.test", // underscore in org
+            ".acme.clwd-apps.test",     // empty app label
+            "app..clwd-apps.test",      // empty org label
         ] {
             assert_eq!(
                 parse_host(bad, APEX),
@@ -226,11 +230,11 @@ mod tests {
     #[test]
     fn over_long_label_is_rejected() {
         let long = "a".repeat(MAX_LABEL_LEN + 1);
-        let host = format!("{long}.acme.clwd.run");
+        let host = format!("{long}.acme.clwd-apps.test");
         assert_eq!(parse_host(&host, APEX), Err(HostError::InvalidLabel));
         // The boundary value itself is accepted.
         let exact = "a".repeat(MAX_LABEL_LEN);
-        let ok = format!("{exact}.acme.clwd.run");
+        let ok = format!("{exact}.acme.clwd-apps.test");
         assert!(parse_host(&ok, APEX).is_ok());
     }
 

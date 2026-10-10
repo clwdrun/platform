@@ -31,6 +31,12 @@ use instant_acme::{Account, NewAccount};
 use shared::cert::{CertStore, CertStoreError, DirCertStore, OrgSlug, StoredCert};
 use sqlx::PgPool;
 
+/// The apps domain certificates are issued under: a placeholder until the
+/// real one is chosen (#62). Pebble and challtestsrv accept any name.
+fn apps() -> shared::domains::AppsDomain {
+    shared::domains::AppsDomain::parse("clwd-apps.test").expect("apps domain")
+}
+
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_owned())
 }
@@ -129,7 +135,7 @@ async fn full_issuance_stores_a_certificate(pool: PgPool) {
         Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
 
     issuer.issue(org.id, &slug).await.expect("issuance");
@@ -168,7 +174,7 @@ async fn an_interrupted_order_is_resumed_not_restarted(pool: PgPool) {
 
     // Simulate a crash right after new_order: an order exists on the CA and its
     // URL is persisted, but no challenge work has happened.
-    let identifier = instant_acme::Identifier::Dns("*.beta.clwd.run".to_owned());
+    let identifier = instant_acme::Identifier::Dns("*.beta.clwd-apps.test".to_owned());
     let interrupted = account
         .new_order(&instant_acme::NewOrder::new(std::slice::from_ref(
             &identifier,
@@ -188,7 +194,7 @@ async fn an_interrupted_order_is_resumed_not_restarted(pool: PgPool) {
         Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
 
     issuer.issue(org.id, &slug).await.expect("resumed issuance");
@@ -223,7 +229,7 @@ async fn renewal_replaces_the_stored_certificate(pool: PgPool) {
         std::sync::Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
 
     // First issuance stores a cert and, via ARI (Pebble supports it), a real
@@ -316,7 +322,7 @@ async fn a_renewal_failure_is_recorded_not_silent(pool: PgPool) {
         std::sync::Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
     issuer.issue(org.id, &slug).await.expect("first issuance");
 
@@ -363,7 +369,7 @@ async fn a_renewal_from_another_account_is_rejected(pool: PgPool) {
         std::sync::Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
     issuer.issue(org.id, &slug).await.expect("first issuance");
 
@@ -372,7 +378,7 @@ async fn a_renewal_from_another_account_is_rejected(pool: PgPool) {
         std::sync::Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
     let result = stranger.renew(org.id, &slug).await;
     assert!(
@@ -400,7 +406,7 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
         std::sync::Arc::new(ChallTestSrvDns::new()),
         cert_store.clone(),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
     issuer.issue(org.id, &slug).await.expect("first issuance");
     let first = cert_store
@@ -507,7 +513,7 @@ async fn two_reconcilers_issue_a_pending_certificate_once(pool: PgPool) {
             Arc::new(ChallTestSrvDns::new()),
             counting.clone(),
             pool.clone(),
-            "clwd.run",
+            apps(),
         )
     };
     let (a, b) = (
@@ -581,7 +587,7 @@ async fn a_queued_certificate_issues_once_issuance_recovers(pool: PgPool) {
         dns.clone(),
         Arc::new(cert_store),
         pool.clone(),
-        "clwd.run",
+        apps(),
     );
     let pass = || {
         control_plane::reconcile::reconcile_with(

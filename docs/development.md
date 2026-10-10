@@ -349,14 +349,24 @@ control plane, scheduling, or tenancy model.
 
 ## Domain and routing
 
-Apps are served on **org-scoped subdomains**: `myapp.acme.clwd.run`. This was chosen
-over flat `myapp.clwd.run` deliberately — it costs one nesting level on the wildcard
-cert and avoids a global namespace collision the first time two customers both want
-`dashboard`. Do not introduce flat app subdomains as a shortcut.
+Apps are served on **org-scoped subdomains of a separate registrable domain**:
+`myapp.acme.<apps domain>`, never under `clwd.run`. Apps run untrusted code, and a
+host on the control plane's registrable domain is *same-site* to a browser: it can
+plant cookies the control plane reads, share its renderer process, and get the
+control plane blocklisted with one phishing page (#62). Org-scoped rather than flat
+`myapp.<apps domain>` avoids a global namespace collision the first time two
+customers both want `dashboard`. Do not introduce flat app subdomains, and do not
+serve an app from the control plane's domain, as a shortcut.
 
 - `clwd.run` — marketing + sharing UI
-- `*.clwd.run` — per-app, wildcard cert via DNS-01 (`instant-acme`)
-- `api.clwd.run` — control plane
+- `api.clwd.run` — control plane; its session cookie is `__Host-`, host-only
+- `<apps domain>` — apps; `*.{org}.<apps domain>` wildcard cert per org via DNS-01
+  (`instant-acme`), with a DNS token scoped to the apps zone only
+
+The two are separate configuration values and separate types
+(`shared::domains::ControlPlaneDomain`, `shared::domains::AppsDomain`); the gateway
+refuses to start if they share a registrable domain. The apps domain is a
+placeholder (`clwd-apps.test`) until one is registered.
 
 ## Identity and sharing
 

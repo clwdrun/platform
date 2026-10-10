@@ -21,7 +21,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 
 const SECRET: &str = "internal-secret";
-const APEX: &str = "clwd.run";
+const APEX: &str = "clwd-apps.test";
 const APP_ID: &str = "00000000-0000-7000-8000-0000000000a1";
 const ORG_ID: &str = "00000000-0000-7000-8000-0000000000b2";
 
@@ -75,7 +75,7 @@ async fn closed_port() -> SocketAddr {
 async fn a_second_lookup_is_a_fresh_cache_hit_and_cheaper_than_a_round_trip() {
     let (addr, shutdown, handle) = start_server().await;
     let lookup = RouteLookup::new(format!("http://{addr}"), SECRET).expect("lookup");
-    let host = parse_host("dashboard.acme.clwd.run", APEX).expect("host");
+    let host = parse_host("dashboard.acme.clwd-apps.test", APEX).expect("host");
 
     // Miss: a real HTTP round trip to the control plane.
     let started = Instant::now();
@@ -112,7 +112,7 @@ async fn a_second_lookup_is_a_fresh_cache_hit_and_cheaper_than_a_round_trip() {
 async fn an_unknown_host_is_unknown() {
     let (addr, shutdown, handle) = start_server().await;
     let lookup = RouteLookup::new(format!("http://{addr}"), SECRET).expect("lookup");
-    let host = parse_host("ghost.acme.clwd.run", APEX).expect("host");
+    let host = parse_host("ghost.acme.clwd-apps.test", APEX).expect("host");
 
     assert_eq!(lookup.resolve(&host).await, Route::Unknown);
 
@@ -132,7 +132,7 @@ async fn a_warm_route_is_served_stale_when_the_control_plane_goes_down() {
     };
     let lookup =
         RouteLookup::with_windows(format!("http://{addr}"), SECRET, windows).expect("lookup");
-    let host = parse_host("dashboard.acme.clwd.run", APEX).expect("host");
+    let host = parse_host("dashboard.acme.clwd-apps.test", APEX).expect("host");
 
     // Warm the cache with a REAL lookup — a full HTTP round trip that stores the
     // entry in the form the stale path reads, not a direct cache insert.
@@ -166,7 +166,7 @@ async fn a_warm_route_is_served_stale_when_the_control_plane_goes_down() {
 async fn a_cold_lookup_with_the_control_plane_down_is_unavailable() {
     let addr = closed_port().await;
     let lookup = RouteLookup::new(format!("http://{addr}"), SECRET).expect("lookup");
-    let host = parse_host("dashboard.acme.clwd.run", APEX).expect("host");
+    let host = parse_host("dashboard.acme.clwd-apps.test", APEX).expect("host");
 
     let started = Instant::now();
     let outcome = lookup.resolve(&host).await;

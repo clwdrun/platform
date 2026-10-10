@@ -17,6 +17,7 @@ use async_trait::async_trait;
 use http::{HeaderValue, Response, StatusCode, header};
 use pingora::apps::http_app::ServeHttp;
 use pingora::protocols::http::ServerSession;
+use shared::domains::AppsDomain;
 use shared::{Envelope, RequestId};
 
 use crate::host::parse_host;
@@ -69,7 +70,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             status: StatusCode::NOT_FOUND,
             code: "gateway.unknown_host",
             message: "no application is served at this host",
-            hint: "check the {app}.{org}.clwd.run host, and that the app is deployed",
+            hint: "check the {app}.{org} host, and that the app is deployed",
             retryable: false,
         },
         Disposition::NotReady => EnvelopeSpec {
@@ -133,22 +134,19 @@ fn requested_host(head: &pingora::http::RequestHeader) -> Option<String> {
 /// The pingora edge application.
 pub struct Edge {
     lookup: Arc<RouteLookup>,
-    apex: String,
+    apps: AppsDomain,
 }
 
 impl Edge {
-    /// An edge that resolves hosts under `apex` (e.g. `clwd.run`) via `lookup`.
+    /// An edge that resolves hosts under the apps domain via `lookup`.
     #[must_use]
-    pub fn new(lookup: Arc<RouteLookup>, apex: impl Into<String>) -> Self {
-        Self {
-            lookup,
-            apex: apex.into(),
-        }
+    pub fn new(lookup: Arc<RouteLookup>, apps: AppsDomain) -> Self {
+        Self { lookup, apps }
     }
 
     /// Resolve a host string to a route, or `None` when it is not an app host.
     async fn route(&self, host: &str) -> Option<Route> {
-        let app_host = parse_host(host, &self.apex).ok()?;
+        let app_host = parse_host(host, self.apps.as_str()).ok()?;
         Some(self.lookup.resolve(&app_host).await)
     }
 }
