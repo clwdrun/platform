@@ -187,6 +187,39 @@ pub async fn authenticate(
         .ok_or(Error::Unauthenticated {})
 }
 
+/// Middleware for [`crate::http::Access::Session`] routes: authenticate the
+/// session cookie and hand the handler its [`ActiveSession`].
+///
+/// One lookup, the same as [`authenticate`]. Org membership is deliberately
+/// **not** read here: this runs on every session request, and per-request
+/// authorization is #12's, cached there.
+pub(crate) async fn require(
+    axum::extract::State(state): axum::extract::State<crate::http::AppState>,
+    mut request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let request_id = request
+        .extensions()
+        .get::<shared::RequestId>()
+        .cloned()
+        .unwrap_or_else(shared::RequestId::generate);
+    let Some(signin) = state.signin.as_deref() else {
+        return crate::http::render(
+            &Error::Internal {
+                source: anyhow::anyhow!("sign-in is not configured on this control plane"),
+            },
+            &request_id,
+        );
+    };
+    match authenticate(&state.pool, signin.key(), request.headers()).await {
+        Ok(session) => {
+            request.extensions_mut().insert(session);
+            next.run(request).await
+        }
+        Err(error) => crate::http::render(&error, &request_id),
+    }
+}
+
 /// The value of the cookie called `name`, if exactly one is present.
 ///
 /// Two is refused rather than resolved: a second one is what a subdomain

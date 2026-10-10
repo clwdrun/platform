@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into org_domains (domain, org_id, claimant_id, auto_join)\n           values ($1, $2, $3, $4)\n           on conflict (domain) do nothing",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e2161d384d3c63353550df1f0c10ceb40ec3ea9aa4cb82b71ef041e4e0cb7210"
+}

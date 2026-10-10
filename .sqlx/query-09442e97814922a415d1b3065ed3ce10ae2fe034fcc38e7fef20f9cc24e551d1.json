@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with inserted as (\n               insert into certificates (org_id) values ($1)\n               on conflict (org_id) do nothing\n               returning state, not_after\n           )\n           select state as \"state!\", not_after is not null as \"ever_issued!\" from inserted\n           union all\n           select state, not_after is not null from certificates\n            where org_id = $1 and not exists (select 1 from inserted)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state!",
+        "type_info": "Text",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "ever_issued!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "09442e97814922a415d1b3065ed3ce10ae2fe034fcc38e7fef20f9cc24e551d1"
+}

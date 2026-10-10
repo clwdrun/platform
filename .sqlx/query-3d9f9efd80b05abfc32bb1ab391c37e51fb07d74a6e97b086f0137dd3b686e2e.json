@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists (\n             select 1 from org_members m join org_domains d on d.org_id = m.org_id\n              where m.org_id = $1 and m.user_id = $2 and d.domain = $3) as \"member!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "member!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "3d9f9efd80b05abfc32bb1ab391c37e51fb07d74a6e97b086f0137dd3b686e2e"
+}

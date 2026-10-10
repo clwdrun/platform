@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "insert into users (id, email, google_subject) values ($1, $2, $3)\n           on conflict (google_subject) do update set email = excluded.email\n             where users.deleted_at is null\n           returning id as \"id: UserId\"",
+  "query": "insert into users (id, email, google_subject, hosted_domain) values ($1, $2, $3, $4)\n           on conflict (google_subject) do update\n             set email = excluded.email, hosted_domain = excluded.hosted_domain\n             where users.deleted_at is null\n           returning id as \"id: UserId\"",
   "describe": {
     "columns": [
       {
@@ -19,6 +19,7 @@
       "Left": [
         "Uuid",
         "Text",
+        "Text",
         "Text"
       ]
     },
@@ -26,5 +27,5 @@
       false
     ]
   },
-  "hash": "b11f6464f856d8232ebc93688f2ffcd3cd3473dc531f2145251d25b85e08179c"
+  "hash": "5147ad75662ca6323e8605cd93e74c7cad9300f8bd922f33c3c46b6ed7a903dc"
 }

@@ -9,6 +9,7 @@ mod envelope_probe;
 pub mod http;
 pub mod ids;
 pub mod openapi;
+pub mod orgs;
 pub mod publish;
 pub mod reconcile;
 pub mod resolve;

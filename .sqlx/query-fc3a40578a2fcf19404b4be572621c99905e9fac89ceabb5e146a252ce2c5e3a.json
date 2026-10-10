@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select state from certificates where org_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "certificates",
+            "name": "state"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fc3a40578a2fcf19404b4be572621c99905e9fac89ceabb5e146a252ce2c5e3a"
+}

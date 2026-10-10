@@ -41,6 +41,7 @@ use crate::db::{self, AppVersion};
 use crate::http::{AppState, render};
 use crate::ids::{AppId, VersionId};
 use crate::openapi::{Body, Doc, EXAMPLE_APP, EXAMPLE_VERSION, Success};
+use crate::orgs::CertificateStatus;
 
 /// What a publish did, and the status it reports.
 ///
@@ -83,22 +84,35 @@ impl Published {
     }
 }
 
-impl IntoResponse for Published {
-    fn into_response(self) -> Response {
-        // No `created: bool` in the body. The status already carries it, and
-        // two encodings of one fact eventually disagree.
-        (self.status(), axum::Json(self.version().clone())).into_response()
-    }
+/// The publish response: the version, and where the org's certificate stands.
+///
+/// `certificate` is here because the first publish is when an org's apps first
+/// need to be reachable: a personal org gets no certificate until then, so its
+/// first publish is also the start of the window in which `{app}.{org}` fails
+/// the TLS handshake. The same field, with the same wording, as org creation.
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
+pub struct PublishResponse {
+    #[serde(flatten)]
+    pub version: AppVersion,
+    /// The org's wildcard certificate.
+    pub certificate: CertificateStatus,
 }
 
 fn version_example() -> serde_json::Result<serde_json::Value> {
-    serde_json::to_value(AppVersion {
+    serde_json::to_value(PublishResponse {
+        version: version_example_inner(),
+        certificate: CertificateStatus::from_state(Some("issued"), true),
+    })
+}
+
+fn version_example_inner() -> AppVersion {
+    AppVersion {
         id: VersionId::from(EXAMPLE_VERSION),
         app_id: AppId::from(EXAMPLE_APP),
         digest: format!("blake3:{}", "5f".repeat(32)),
         state: "ready".to_owned(),
         created_at: chrono::DateTime::UNIX_EPOCH + chrono::TimeDelta::seconds(1_757_764_800),
-    })
+    }
 }
 
 /// The documentation for `POST /v1/apps/{app_id}/versions`.
@@ -119,7 +133,7 @@ pub(crate) fn doc() -> Doc {
             Success {
                 status: StatusCode::CREATED,
                 description: "This request published the version.",
-                body: Some(Body::json::<AppVersion>(
+                body: Some(Body::json::<PublishResponse>(
                     "The version, ready to deploy.",
                     version_example,
                 )),
@@ -127,7 +141,7 @@ pub(crate) fn doc() -> Doc {
             Success {
                 status: StatusCode::OK,
                 description: "These bytes were already published: this is the existing version. Not an error.",
-                body: Some(Body::json::<AppVersion>(
+                body: Some(Body::json::<PublishResponse>(
                     "The existing version.",
                     version_example,
                 )),
@@ -161,7 +175,16 @@ pub async fn publish(
     body: Bytes,
 ) -> Response {
     match publish_inner(&state, &principal, app_id, body).await {
-        Ok(published) => published.into_response(),
+        // No `created: bool` in the body. The status already carries it, and
+        // two encodings of one fact eventually disagree.
+        Ok((published, certificate)) => (
+            published.status(),
+            axum::Json(PublishResponse {
+                version: published.version().clone(),
+                certificate,
+            }),
+        )
+            .into_response(),
         Err(error) => render(&error, &request_id),
     }
 }
@@ -171,7 +194,7 @@ async fn publish_inner(
     principal: &Principal,
     app_id: AppId,
     body: Bytes,
-) -> Result<Published, Error> {
+) -> Result<(Published, CertificateStatus), Error> {
     // First, and before validation: decoding a bundle for an app this token
     // cannot reach is work done for nobody. The org half of the binding is in
     // the claim's own query.
@@ -185,6 +208,13 @@ async fn publish_inner(
     let validated = builder::validate(body)?;
     let digest = validated.digest().to_string();
     let org_id = principal.org_id;
+
+    // The org's certificate, requested on its first publish: a personal org
+    // gets none at creation, so a signup flood cannot spend the 50 new
+    // certificates a week every org under the apex shares. Idempotent, and
+    // after validation so a malformed upload requests nothing. The reconciler
+    // issues it; nothing here waits on a certificate authority.
+    let certificate = crate::orgs::ensure_certificate_row(&state.pool, org_id).await?;
 
     let claimed = db::claim_app_version(&state.pool, org_id, app_id, &digest)
         .await
@@ -206,7 +236,7 @@ async fn publish_inner(
                 let ready = db::mark_app_version_ready(&state.pool, row.id)
                     .await
                     .map_err(internal)?;
-                Ok(Published::AlreadyExisted(ready))
+                Ok((Published::AlreadyExisted(ready), certificate))
             }
             // No row, so the app is absent or deleted. A 404, never a 200:
             // reporting success for a publish that went nowhere is worse than
@@ -221,7 +251,7 @@ async fn publish_inner(
     let ready = db::mark_app_version_ready(&state.pool, row.id)
         .await
         .map_err(internal)?;
-    Ok(Published::Created(ready))
+    Ok((Published::Created(ready), certificate))
 }
 
 /// A driver failure is ours, not the caller's.

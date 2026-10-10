@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from org_members m\n            where m.user_id = $1\n              and m.joined_via in ('domain', 'claimant')\n              and not exists (select 1 from org_domains d\n                               where d.org_id = m.org_id and d.domain = $2)\n        returning m.org_id as \"org_id: OrgId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "org_members",
+            "name": "org_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "04d98b2631e893a19af1f83f8e5ddfe0e322d8f35738bd8f862676fb1c535684"
+}

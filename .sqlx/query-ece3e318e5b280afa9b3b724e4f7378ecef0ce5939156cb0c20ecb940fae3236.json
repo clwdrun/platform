@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select domain from org_domains",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "org_domains",
+            "name": "domain"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ece3e318e5b280afa9b3b724e4f7378ecef0ce5939156cb0c20ecb940fae3236"
+}

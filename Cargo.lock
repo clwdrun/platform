@@ -3033,6 +3033,7 @@ version = "0.1.0"
 dependencies = [
  "cedar-policy",
  "chrono",
+ "idna",
  "jsonwebtoken",
  "oauth2",
  "openidconnect",

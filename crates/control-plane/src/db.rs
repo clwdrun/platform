@@ -210,7 +210,8 @@ pub struct DueCert {
 
 /// Claim up to `limit` certificates due for renewal, marking each `renewing`.
 ///
-/// Due means one of three things: `issued` with `ari_renewal_after` passed
+/// Due means one of four things: `pending` (never driven — see below);
+/// `issued` with `ari_renewal_after` passed
 /// (its time has come); `renewing` with no attempt since `stale_after` (a
 /// worker died between the claim commit and `cert_mark_issued`, and the row
 /// must re-enter rotation rather than strand — the next pass resumes it via
@@ -222,12 +223,25 @@ pub struct DueCert {
 /// Orgs that are soft-deleted are never claimed: there is nothing left to serve
 /// under their names.
 ///
-/// `pending` rows are NOT claimed: they belong to the creation path's direct
-/// `issue()` call, which drives them synchronously. No production caller mints
-/// `pending` today; when issuance is wired into org creation, extend this
-/// claim (or that path's retry) to resume them — until then, a crashed direct
-/// issuance would strand `pending`, which is why new callers must go through
-/// this claim rather than calling `issue`/`renew` directly.
+/// `pending` rows **are** claimed: a `pending` row is a certificate requested
+/// and never yet driven — written by org creation (a verified domain claim) or
+/// by an org's first publish (#10), neither of which calls a certificate
+/// authority. The reconciler is the only production path that issues, so a CA
+/// outage or a full rate-limit bucket delays a certificate and never fails
+/// the request that asked for it. Claimed first-issuance rows have no
+/// `ari_renewal_after`, and sort first: someone is waiting on them.
+///
+/// # The lease
+///
+/// A claim is a lease: it marks the row `renewing` and stamps
+/// `last_renewal_attempt` — the claim time — in the same statement. A worker
+/// that crashes after claiming leaves a `renewing` row whose lease expires
+/// after `stale_after`, and the next claim takes it again, so no row is ever
+/// stuck at `pending` or `renewing`. `last_renewal_attempt` *is* the
+/// claimed-at time; a second column would be a copy that can disagree.
+///
+/// Calling `issue`/`renew` directly bypasses the lease, which is why only
+/// tests do.
 ///
 /// # Why `FOR UPDATE SKIP LOCKED`, not an advisory lock
 ///
@@ -257,7 +271,8 @@ pub async fn claim_due_for_renewal(
                select c.org_id as org_id
                from certificates as c
                join orgs as o on o.id = c.org_id and o.deleted_at is null
-               where (c.state = 'issued'
+               where c.state = 'pending'
+                  or (c.state = 'issued'
                       and c.ari_renewal_after <= now())
                   or (c.state = 'renewing'
                       and c.last_renewal_attempt
@@ -265,7 +280,7 @@ pub async fn claim_due_for_renewal(
                   or (c.state = 'failed'
                       and c.last_renewal_attempt
                           < now() - ($3::bigint * interval '1 second'))
-               order by c.ari_renewal_after nulls last
+               order by c.ari_renewal_after nulls first
                limit $1
                for update of c skip locked
            )
@@ -339,7 +354,7 @@ pub async fn create_user(ex: impl PgExecutor<'_>, email: &str) -> sqlx::Result<U
 }
 
 /// The user Google account `subject` signs in as, created on first sign-in,
-/// with `email` refreshed on every one. `None` if that account's user is
+/// with `email` and `hosted_domain` refreshed on every one. `None` if that account's user is
 /// deleted — a deleted user does not come back by signing in again.
 ///
 /// Keyed on `subject` alone. A row that already holds `email` under a
@@ -355,31 +370,38 @@ pub async fn upsert_google_user(
     ex: impl PgExecutor<'_>,
     subject: &str,
     email: &str,
+    hosted_domain: Option<&identity::HostedDomain>,
 ) -> sqlx::Result<Option<UserId>> {
     sqlx::query_scalar!(
-        r#"insert into users (id, email, google_subject) values ($1, $2, $3)
-           on conflict (google_subject) do update set email = excluded.email
+        r#"insert into users (id, email, google_subject, hosted_domain) values ($1, $2, $3, $4)
+           on conflict (google_subject) do update
+             set email = excluded.email, hosted_domain = excluded.hosted_domain
              where users.deleted_at is null
            returning id as "id: UserId""#,
         UserId::new().as_uuid(),
         email,
         subject,
+        hosted_domain.map(identity::HostedDomain::as_str),
     )
     .fetch_optional(ex)
     .await
 }
 
-/// Records that a user belongs to an org. Membership only: what a member may
-/// do is a Cedar policy (#14), not a column here.
+/// Records that a user belongs to an org, and how they came to. Membership
+/// only: what a member may do is a Cedar policy (#14), not a column here.
+/// `via` decides whether sign-in sync may later remove the row (see
+/// [`crate::orgs`]).
 pub async fn add_org_member(
     ex: impl PgExecutor<'_>,
     org_id: OrgId,
     user_id: UserId,
+    via: crate::orgs::JoinedVia,
 ) -> sqlx::Result<()> {
     sqlx::query!(
-        "insert into org_members (org_id, user_id) values ($1, $2)",
+        "insert into org_members (org_id, user_id, joined_via) values ($1, $2, $3)",
         org_id.as_uuid(),
         user_id.as_uuid(),
+        via.as_str(),
     )
     .execute(ex)
     .await

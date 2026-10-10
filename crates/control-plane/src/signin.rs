@@ -182,9 +182,24 @@ pub struct SignIn {
     http: reqwest::Client,
     key: CookieKey,
     apex: String,
+    origin: String,
 }
 
 impl SignIn {
+    /// The control plane's own origin (`https://api.<apex>`), taken from the
+    /// configured redirect URI: the one origin a cookie-authenticated
+    /// state-changing request is accepted from.
+    #[must_use]
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    /// The key session and flow cookies are signed with.
+    #[must_use]
+    pub(crate) fn key(&self) -> &CookieKey {
+        &self.key
+    }
+
     /// Discover the issuer and assemble the sign-in configuration.
     ///
     /// # Errors
@@ -197,6 +212,9 @@ impl SignIn {
         apex: impl Into<String>,
     ) -> Result<Self, identity::FlowError> {
         crate::acme::install_crypto_provider();
+        let origin = reqwest::Url::parse(&config.redirect_uri)
+            .map(|url| url.origin().ascii_serialization())
+            .map_err(|e| identity::FlowError::Rejected(format!("redirect uri: {e}")))?;
         // No redirects: the token endpoint is a credentialed POST, and a
         // followed redirect is how a client secret reaches a host nobody chose.
         let http = reqwest::Client::builder()
@@ -210,6 +228,7 @@ impl SignIn {
             http,
             key,
             apex: apex.into(),
+            origin,
         })
     }
 }
@@ -345,16 +364,22 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
         .ok_or(Error::Unauthenticated {})?
         .to_lowercase();
 
-    let user = match db::upsert_google_user(&state.pool, identity.subject.as_str(), &email).await {
-        Ok(Some(user)) => user,
-        Ok(None) => return Err(Error::Unauthenticated {}),
-        Err(sqlx::Error::Database(e)) if e.constraint() == Some("users_email_key") => {
-            return Err(Error::Conflict {
-                what: "another account already uses this email address".to_owned(),
-            });
-        }
-        Err(e) => return Err(unavailable(e)),
-    };
+    let hd = identity.hosted_domain.as_ref();
+    let user =
+        match db::upsert_google_user(&state.pool, identity.subject.as_str(), &email, hd).await {
+            Ok(Some(user)) => user,
+            Ok(None) => return Err(Error::Unauthenticated {}),
+            Err(sqlx::Error::Database(e)) if e.constraint() == Some("users_email_key") => {
+                return Err(Error::Conflict {
+                    what: "another account already uses this email address".to_owned(),
+                });
+            }
+            Err(e) => return Err(unavailable(e)),
+        };
+
+    // Which orgs this person belongs to, decided by `hd` and nothing else —
+    // see `orgs` for the rule and why the email's domain plays no part.
+    crate::orgs::resolve_at_sign_in(&state.pool, user, hd).await?;
 
     let issued = session::issue(&state.pool, &signin.key, user, &signin.apex)
         .await?

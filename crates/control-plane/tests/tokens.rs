@@ -527,3 +527,57 @@ async fn a_token_cannot_be_bound_to_another_orgs_app_even_by_hand(pool: PgPool) 
     };
     assert_eq!(code.as_deref(), Some("23503"), "a foreign-key violation");
 }
+
+/// An org's certificate is requested on its first publish, not at creation —
+/// a personal org gets none until it has an app to serve — and the publish
+/// response says where it stands. A malformed upload requests nothing, and a
+/// second publish does not request a second certificate.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_first_publish_requests_the_orgs_certificate(pool: PgPool) {
+    let (org, app) = an_org_and_app(&pool, "p-abcdefghij").await;
+    let state = state(&pool);
+    let (_, publisher) = token(&pool, org, None, &["publish"]).await;
+    let rows = || async {
+        sqlx::query_scalar!(
+            r#"select count(*) as "n!" from certificates where org_id = $1"#,
+            org.as_uuid()
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("count")
+    };
+    assert_eq!(rows().await, 0, "no certificate at creation");
+
+    let uri = format!("/v1/apps/{app}/versions");
+    let garbage = send(
+        &state,
+        "POST",
+        &uri,
+        Some(&publisher),
+        Body::from("not a bundle"),
+    )
+    .await;
+    assert_eq!(garbage.status, StatusCode::BAD_REQUEST);
+    assert_eq!(rows().await, 0, "a malformed upload requests nothing");
+
+    let first = send(&state, "POST", &uri, Some(&publisher), a_bundle(b"one")).await;
+    assert_eq!(first.status, StatusCode::CREATED, "{:?}", first.json);
+    assert_eq!(first.json["certificate"]["status"], "pending");
+    assert!(
+        first.json["certificate"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unexpected EOF")),
+        "{:?}",
+        first.json
+    );
+    assert_eq!(
+        first.json["state"], "ready",
+        "the version is still the body"
+    );
+    assert_eq!(rows().await, 1);
+
+    let again = send(&state, "POST", &uri, Some(&publisher), a_bundle(b"one")).await;
+    assert_eq!(again.status, StatusCode::OK);
+    assert_eq!(again.json["certificate"]["status"], "pending");
+    assert_eq!(rows().await, 1, "one certificate per org");
+}

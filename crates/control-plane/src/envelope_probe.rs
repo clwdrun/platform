@@ -122,6 +122,9 @@ impl Fixture {
             "app_id" => self.app.to_string(),
             "org_id" => self.org.to_string(),
             "token_id" => self.target.to_string(),
+            // A session route: the probe holds no session cookie, so its
+            // same-origin and session layers answer before any claim is read.
+            "claim_id" => NAMES_NOTHING.to_owned(),
             "id" => "dashboard".to_owned(),
             // The internal resolution route. Its `require_internal` layer denies
             // the probe's customer token before the handler runs, so these are

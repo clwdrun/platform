@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists (select 1 from org_members where user_id = $1) as \"belongs!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "belongs!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1a5004f78463556bbf9b8f304e34b789a91816fdf2c5a6ded10334641cac5010"
+}

@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select auto_join from org_domains where domain = 'example.com'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_join",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "org_domains",
+            "name": "auto_join"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ef9389063a23cbeef4e7cee351894ae45152f5e16dbbab4ce51f51ed01756567"
+}

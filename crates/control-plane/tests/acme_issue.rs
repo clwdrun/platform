@@ -465,3 +465,152 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Counts every certificate written to the store. Each completed order writes
+/// once, on every path — unlike a DNS write, which Pebble's 50% authorization
+/// reuse can skip — so this is the count of orders that issued.
+struct CountingStore {
+    inner: DirCertStore,
+    writes: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl CertStore for CountingStore {
+    async fn cert_for(&self, org: &OrgSlug) -> Result<Option<StoredCert>, CertStoreError> {
+        self.inner.cert_for(org).await
+    }
+    async fn store(&self, org: &OrgSlug, cert: &StoredCert) -> Result<(), CertStoreError> {
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.inner.store(org, cert).await
+    }
+}
+
+/// Two reconcilers — two workers, each with its own ACME account — race for
+/// one requested certificate. `SKIP LOCKED` hands it to one: the CA issues
+/// exactly once, because every duplicate order spends the shared quota.
+#[sqlx::test(migrations = "../../migrations")]
+async fn two_reconcilers_issue_a_pending_certificate_once(pool: PgPool) {
+    let org = db::create_org(&pool, "zeta").await.expect("org");
+    let slug = OrgSlug::parse("zeta").expect("slug");
+    control_plane::orgs::ensure_certificate_row(&pool, org.id)
+        .await
+        .expect("requested");
+    let (inner, dir) = store(slug.as_str());
+    let counting = Arc::new(CountingStore {
+        inner,
+        writes: std::sync::atomic::AtomicUsize::new(0),
+    });
+    let worker = |account| {
+        CertIssuer::new(
+            account,
+            Arc::new(ChallTestSrvDns::new()),
+            counting.clone(),
+            pool.clone(),
+            "clwd.run",
+        )
+    };
+    let (a, b) = (
+        worker(pebble_account().await),
+        worker(pebble_account().await),
+    );
+
+    let (first, second) = tokio::join!(
+        control_plane::reconcile::reconcile_once(&pool, &a),
+        control_plane::reconcile::reconcile_once(&pool, &b),
+    );
+
+    assert_eq!(first.claimed + second.claimed, 1, "{first:?} {second:?}");
+    assert_eq!(first.renewed + second.renewed, 1, "{first:?} {second:?}");
+    assert_eq!(
+        counting.writes.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the CA issued exactly one certificate"
+    );
+    let row = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(row.state, "issued");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A DNS provider that fails while `down` is set.
+struct FlakyDns {
+    inner: ChallTestSrvDns,
+    down: std::sync::atomic::AtomicBool,
+}
+
+#[async_trait]
+impl DnsProvider for FlakyDns {
+    async fn upsert_txt(&self, name: &str, value: &str) -> Result<(), DnsError> {
+        if self.down.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(DnsError::Provider("simulated DNS outage".to_owned()));
+        }
+        self.inner.upsert_txt(name, value).await
+    }
+    async fn remove_txt(&self, name: &str) -> Result<(), DnsError> {
+        self.inner.remove_txt(name).await
+    }
+    async fn await_propagation(&self, name: &str, value: &str) -> Result<(), DnsError> {
+        self.inner.await_propagation(name, value).await
+    }
+}
+
+/// Org creation queues the certificate and never calls the CA, so issuance
+/// being down cannot fail it. Here issuance *is* down: the reconciler records
+/// the failure visibly, and issues once it recovers.
+///
+/// A fresh account and identifier, so Pebble has no authorization to reuse
+/// and the outage cannot be skipped by luck.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_queued_certificate_issues_once_issuance_recovers(pool: PgPool) {
+    let org = db::create_org(&pool, "eta").await.expect("org");
+    let slug = OrgSlug::parse("eta").expect("slug");
+    control_plane::orgs::ensure_certificate_row(&pool, org.id)
+        .await
+        .expect("org creation's hand-off");
+    let (cert_store, dir) = store(slug.as_str());
+    let dns = Arc::new(FlakyDns {
+        inner: ChallTestSrvDns::new(),
+        down: std::sync::atomic::AtomicBool::new(true),
+    });
+    let issuer = CertIssuer::new(
+        pebble_account().await,
+        dns.clone(),
+        Arc::new(cert_store),
+        pool.clone(),
+        "clwd.run",
+    );
+    let pass = || {
+        control_plane::reconcile::reconcile_with(
+            &pool,
+            &issuer,
+            10,
+            std::time::Duration::from_secs(900),
+            std::time::Duration::ZERO,
+        )
+    };
+
+    let down = pass().await;
+    assert_eq!((down.claimed, down.failed), (1, 1), "{down:?}");
+    let row = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(row.state, "failed", "the outage is recorded, not silent");
+
+    dns.down.store(false, std::sync::atomic::Ordering::SeqCst);
+    // Past the zero retry backoff on the database clock.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let up = pass().await;
+    assert_eq!((up.claimed, up.renewed), (1, 1), "{up:?}");
+    let row = db::cert_record(&pool, org.id)
+        .await
+        .expect("read")
+        .expect("row");
+    assert_eq!(row.state, "issued");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

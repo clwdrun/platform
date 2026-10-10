@@ -187,3 +187,40 @@ async fn marking_pending_preserves_an_existing_renewing_claim(pool: PgPool) {
         .expect("pending");
     assert_eq!(state_of(&pool, fresh.id).await, "pending");
 }
+
+/// A certificate requested and never driven — what org creation and a first
+/// publish write — is claimed, so no issuance depends on the request that
+/// asked for it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_pending_certificate_is_claimed(pool: PgPool) {
+    let org = db::create_org(&pool, "fresh").await.expect("org");
+    control_plane::orgs::ensure_certificate_row(&pool, org.id)
+        .await
+        .expect("requested");
+    assert_eq!(state_of(&pool, org.id).await, "pending");
+
+    let due = claim(&pool).await;
+    assert_eq!(due.len(), 1);
+    assert_eq!(due[0].org_id, org.id);
+    assert_eq!(state_of(&pool, org.id).await, "renewing");
+}
+
+/// The lease: a worker that claims a pending row and dies leaves it
+/// `renewing`, held until the lease expires and then claimed again — never
+/// stuck.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_claimed_row_whose_worker_died_is_claimed_again_after_its_lease(pool: PgPool) {
+    let org = db::create_org(&pool, "orphan").await.expect("org");
+    control_plane::orgs::ensure_certificate_row(&pool, org.id)
+        .await
+        .expect("requested");
+    assert_eq!(claim(&pool).await.len(), 1, "the first worker claims it");
+
+    // The worker dies here. Inside the lease, nobody else takes it.
+    assert!(claim(&pool).await.is_empty(), "held while the lease runs");
+
+    backdate_attempt(&pool, org.id, STALE_AFTER_SECS + 1).await;
+    let reclaimed = claim(&pool).await;
+    assert_eq!(reclaimed.len(), 1, "an expired lease is claimed again");
+    assert_eq!(reclaimed[0].org_id, org.id);
+}

@@ -13,8 +13,10 @@
 //! `control-plane`, which owns the router, the pool, and the schema. It depends
 //! on this crate for the flow and the verification.
 
+pub mod domain;
 pub mod flow;
 pub mod oidc;
 
+pub use domain::{DomainError, HostedDomain};
 pub use flow::{Authorization, Flow, FlowError, OidcConfig};
 pub use oidc::{GoogleClaims, GoogleIdToken, GoogleSubject, VerifiedIdentity, VerifyError};

@@ -15,6 +15,8 @@ use openidconnect::core::{
 use openidconnect::{AdditionalClaims, IdToken, IdTokenClaims, Nonce};
 use serde::{Deserialize, Serialize};
 
+use crate::domain::HostedDomain;
+
 /// Google's stable, opaque identifier for a person.
 ///
 /// A newtype, not a `String`, because a Google subject, a user id, a session
@@ -75,9 +77,11 @@ pub struct VerifiedIdentity {
     /// The email, present **only** when `email_verified` was true. An
     /// unverified email is an unproven claim and is dropped, not trusted.
     pub email: Option<String>,
-    /// The Workspace hosted domain (`hd`), when present. Consumed by `#10` for
-    /// org mapping; not trusted for anything here.
-    pub hosted_domain: Option<String>,
+    /// The Workspace hosted domain (`hd`), normalised, when present. Consumed
+    /// by `#10` for org mapping. Absent means a consumer Google account. An
+    /// `hd` that does not normalise is treated as absent — the consumer case,
+    /// which never joins a shared org — and logged.
+    pub hosted_domain: Option<HostedDomain>,
 }
 
 /// Why a token was not accepted.
@@ -123,7 +127,13 @@ pub fn verify_id_token(
         _ => None,
     };
 
-    let hosted_domain = claims.additional_claims().hd.clone();
+    let hosted_domain = claims.additional_claims().hd.as_deref().and_then(|raw| {
+        HostedDomain::parse(raw)
+            .map_err(
+                |error| tracing::warn!(%error, hd = raw, "unusable hd claim; treated as absent"),
+            )
+            .ok()
+    });
 
     Ok(VerifiedIdentity {
         subject,
@@ -296,7 +306,10 @@ mod tests {
 
         assert_eq!(identity.subject.as_str(), "google-subject-123");
         assert_eq!(identity.email.as_deref(), Some("person@example.com"));
-        assert_eq!(identity.hosted_domain.as_deref(), Some("example.com"));
+        assert_eq!(
+            identity.hosted_domain.as_ref().map(HostedDomain::as_str),
+            Some("example.com")
+        );
     }
 
     // --- rejects not-X: one negative per verification axis ---
