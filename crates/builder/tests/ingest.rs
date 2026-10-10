@@ -256,3 +256,38 @@ async fn a_template_class_bundle_is_far_under_the_ceiling() {
         bundle.len()
     );
 }
+
+/// The store verifies an artifact against the digest it was asked for, on
+/// every read. A different bundle — well formed, every member intact — stored
+/// under this digest's key comes back as `control-plane.artifact_corrupt`,
+/// never as a bundle. Only the comparison with the requested digest catches
+/// that: the bundle's own member digests all check out. This is the platform's
+/// half of the load-time check; the runtime verifies again when it decodes.
+#[tokio::test]
+async fn a_read_refuses_a_bundle_stored_under_another_digest() {
+    let operator = Operator::new(Memory::default()).expect("operator");
+    let store = ArtifactStore::new(operator.clone());
+    let validated = validate(a_bundle()).expect("valid");
+    let digest = *validated.digest();
+    store.put(&validated).await.expect("stored");
+    store
+        .get(&digest)
+        .await
+        .expect("positive control: the intact artifact reads");
+
+    let other = validate(bundle_with(b"another app")).expect("valid");
+    assert_ne!(*other.digest(), digest);
+    let substituted = zstd::encode_all(other.canonical_bytes().as_ref(), 3).expect("compress");
+    operator
+        .write(builder::ArtifactKey::bundle(&digest).as_str(), substituted)
+        .await
+        .expect("substitute");
+
+    let err = store
+        .get(&digest)
+        .await
+        .expect_err("another bundle must not read under this digest");
+    assert_eq!(err.code(), "control-plane.artifact_corrupt", "{err}");
+    let err = store.get_bytes(&digest).await.expect_err("nor its bytes");
+    assert_eq!(err.code(), "control-plane.artifact_corrupt", "{err}");
+}
