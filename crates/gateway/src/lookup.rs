@@ -319,8 +319,10 @@ mod tests {
     #[tokio::test]
     async fn cache_hit_cost_is_moka_plus_the_result_allocations() {
         let lookup = RouteLookup::new("http://unused.invalid", "secret").expect("lookup");
-        let host = crate::host::parse_host("dashboard.acme.clwd.run", "clwd.run").expect("host");
-        let missing = crate::host::parse_host("ghost.acme.clwd.run", "clwd.run").expect("host");
+        let host = crate::host::parse_host("dashboard.acme.clwd-apps.test", "clwd-apps.test")
+            .expect("host");
+        let missing =
+            crate::host::parse_host("ghost.acme.clwd-apps.test", "clwd-apps.test").expect("host");
 
         // A found entry carries two owned ids (allocations on every clone); an
         // unknown entry carries none. Comparing the two isolates the allocation

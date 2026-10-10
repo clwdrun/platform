@@ -1,0 +1,49 @@
+[package]
+name = "e2e"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+description = "Browser tests for session isolation (#62): a real Chrome against the control plane and the gateway."
+
+# Test-only. Nothing here is a dependency of any binary, which is what keeps
+# the test upstream — the one HTTP implementation of the gateway's app hop —
+# out of every release build (`just release-has-no-test-upstream` checks).
+[lib]
+path = "src/lib.rs"
+
+[dev-dependencies]
+control-plane = { version = "0.1.0", path = "../control-plane" }
+gateway = { version = "0.1.0", path = "../gateway" }
+shared = { workspace = true }
+identity = { workspace = true }
+builder = { workspace = true }
+opendal = { workspace = true }
+# Drives Chrome over the DevTools protocol directly: no second,
+# version-matched driver binary to drift out of step with the browser.
+chromiumoxide = { version = "=0.9.1", default-features = false }
+pingora = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
+rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
+rustls-pemfile = "2"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "tokio", "service", "http1"] }
+rcgen = "0.14"
+axum = { workspace = true }
+sqlx = { workspace = true }
+reqwest = { workspace = true }
+futures = { workspace = true }
+http = { workspace = true }
+bytes = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+openidconnect = { workspace = true }
+rsa = "0.9"
+rand = "0.8"
+base64 = "0.22"
+sha2 = { workspace = true }

@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update handshakes\n              set code_sha256 = $2, parent_session_id = $3,\n                  code_expires_at = now() + ($4::bigint * interval '1 second')\n            where id = $1 and expires_at > now()\n           returning id as \"id: HandshakeId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HandshakeId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "handshakes",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f824de4aa7a5f34a7cd5d6e1f4b6a300e648c6591755156e71b1cb2701fac31f"
+}

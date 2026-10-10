@@ -6,6 +6,11 @@
 # walked *every* route: a route registered anywhere else fails
 # `clippy -D warnings`, and so fails `just check` and CI.
 #
+# The `cookie` crate's parsers are disallowed for the same reason: one parser
+# reads platform cookies (`shared::cookie::find`), and a second, forgiving one
+# is how a stripping bypass gets in. `allow-invalid` because the crate is not
+# in the dependency graph today; the entries bite the moment it is added.
+#
 # It fails the gate, not rustc — `cargo build` alone still compiles an
 # untabled route. The single sanctioned call site carries `#[expect]` with the
 # reason. A test asserts these entries are still here, because deleting one is
@@ -19,4 +24,11 @@ disallowed-methods = [
   { path = "axum::routing::Router::fallback", reason = "the fallback is registered once, in `http::register`" },
   { path = "axum::routing::Router::fallback_service", reason = "the fallback is registered once, in `http::register`" },
   { path = "axum::routing::Router::method_not_allowed_fallback", reason = "405s are rendered by the envelope layer, not a second fallback" },
+  # Platform cookies are read only by `shared::cookie::find`. The `cookie`
+  # crate's parsers trim Unicode whitespace into a name and keep duplicates,
+  # so `\u{3000}__Host-clwd_session` would read as the real session (#62).
+  { path = "cookie::Cookie::parse", reason = "read platform cookies with `shared::cookie::find`: this parser repairs names and keeps duplicates (#62)", allow-invalid = true },
+  { path = "cookie::Cookie::parse_encoded", reason = "read platform cookies with `shared::cookie::find`: this parser repairs names and keeps duplicates (#62)", allow-invalid = true },
+  { path = "cookie::Cookie::split_parse", reason = "read platform cookies with `shared::cookie::find`: this parser repairs names and keeps duplicates (#62)", allow-invalid = true },
+  { path = "cookie::Cookie::split_parse_encoded", reason = "read platform cookies with `shared::cookie::find`: this parser repairs names and keeps duplicates (#62)", allow-invalid = true },
 ]

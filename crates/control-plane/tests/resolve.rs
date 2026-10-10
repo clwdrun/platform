@@ -9,7 +9,7 @@
 use axum::body::{Body, to_bytes};
 use axum::http::{Request, StatusCode, header};
 use control_plane::db;
-use control_plane::http::{AppState, router};
+use control_plane::http::{AppState, internal_router as router};
 use sqlx::PgPool;
 use tower::ServiceExt as _;
 

@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into handshakes (id, state_sha256, app_id, return_path, expires_at)\n           select $1, $2, a.id, $3, now() + ($4::bigint * interval '1 second')\n             from apps a where a.id = $5 and a.deleted_at is null\n           returning id as \"id: HandshakeId\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: HandshakeId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "handshakes",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Bytea",
+        "Text",
+        "Int8",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "02c8def481056c61b3ebaf3d068da67fa5b9115067e8a81357a477fee3c077fc"
+}

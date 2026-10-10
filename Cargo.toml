@@ -79,7 +79,6 @@ instant-acme = { version = "0.8.5", default-features = true, features = [
   "x509-parser",
 ] }
 moka = { version = "0.12", features = ["future"] }
-tower-cookies = "0.11.0"
 # The gateway's HTTP client: the internal route-lookup call now, and the ACME
 # client's transport in #3. No TLS feature — the control-plane lookup is a
 # cluster-internal call; `rustls-tls` goes on when it first crosses a TLS

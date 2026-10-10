@@ -35,28 +35,16 @@ use crate::signin::CookieKey;
 
 /// The session cookie's name.
 ///
-/// # This cookie rides to every app — `#11` must keep it identity-only
+/// # Host-only, on the control plane's own host (#62)
 ///
-/// It is scoped to the apex (`Domain=<apex>`), which is what lets one sign-in
-/// cover every `{app}.{org}.<apex>` — and is also why **every request to every
-/// customer app carries it**. The gateway (`#11`) must therefore treat it as
-/// identity-only:
-///
-/// - strip it from the request before proxying, resolving it to an identity
-///   the gateway vouches for, so no app ever reads the raw cookie (an app that
-///   could read it could replay it against the control plane as the user);
-/// - strip any `Set-Cookie` naming it from app responses, so an app cannot
-///   plant its own session on the apex (cookie tossing). [`authenticate`]
-///   already refuses a request carrying two of these, but the gateway is where
-///   the planting is stopped.
-///
-/// Stripping in the gateway does not stop script on an app subdomain setting
-/// one with `Domain=<apex>` in the browser, which plants a session on a
-/// visitor who has none. Whether the apex scope survives is #62.
-///
-/// `__Secure-` makes the browser refuse to set it without `Secure`. `__Host-`
-/// would be stronger but forbids `Domain`, which is the whole point here.
-pub const COOKIE_NAME: &str = "__Secure-clwd_session";
+/// `__Host-` makes the browser refuse the cookie unless it is `Secure`,
+/// `Path=/`, and carries **no** `Domain` — so it exists on exactly the host that
+/// set it, and no other host can set, overwrite or shadow one in its place.
+/// That is the point: apps run untrusted code, and a session cookie any app
+/// host could plant (`Domain=<apex>`) let an app fix a visitor into the
+/// attacker's session. Apps get their own per-host sessions through the
+/// handshake instead; this cookie never travels to them.
+pub const COOKIE_NAME: &str = "__Host-clwd_session";
 
 /// How long a session lives from sign-in.
 ///
@@ -107,8 +95,8 @@ pub struct Issued {
     pub set_cookie: String,
 }
 
-/// Issue a session for `user_id`, scoped to `apex`. `None` if the user does
-/// not exist or is deleted.
+/// Issue a session for `user_id`. `None` if the user does not exist or is
+/// deleted.
 ///
 /// # Errors
 ///
@@ -118,7 +106,6 @@ pub async fn issue(
     pool: &PgPool,
     key: &CookieKey,
     user_id: UserId,
-    apex: &str,
 ) -> Result<Option<Issued>, Error> {
     let secret = SessionSecret::generate().map_err(|e| Error::Internal { source: e.into() })?;
     let expires_at = Utc::now() + TTL;
@@ -140,17 +127,30 @@ pub async fn issue(
     Ok(Some(Issued {
         id,
         expires_at,
-        set_cookie: set_cookie(&value, apex, TTL.num_seconds()),
+        set_cookie: set_cookie(&value, TTL.num_seconds()),
     }))
 }
 
-/// The `Set-Cookie` value for a session cookie. See [`COOKIE_NAME`] for why
-/// it is apex-scoped and what that obliges the gateway to do.
-fn set_cookie(value: &str, apex: &str, max_age_secs: i64) -> String {
-    format!(
-        "{COOKIE_NAME}={value}; Domain={apex}; Path=/; Max-Age={max_age_secs}; \
-         HttpOnly; Secure; SameSite=Lax"
-    )
+/// The `Set-Cookie` value for the session cookie — the one place its
+/// attributes are written. Each is there for a reason; do not add or drop one
+/// to quiet a browser warning without reading this.
+///
+/// - **No `Domain`.** Required by `__Host-`, and the whole defence: a cookie
+///   with no `Domain` is host-only, so no other host — no app — can set one the
+///   control plane would read. Adding `Domain=` makes the browser reject the
+///   cookie outright (the prefix forbids it), and renaming it to dodge that
+///   reopens cookie tossing (#62).
+/// - **`Path=/`.** Required by `__Host-`; the session covers the whole host.
+/// - **`Secure`.** Required by `__Host-`; never sent over plain HTTP.
+/// - **`HttpOnly`.** Script cannot read it, and cannot overwrite it either:
+///   a cookie set from script never replaces an `HttpOnly` one.
+/// - **`SameSite=Lax`.** Sent on a top-level navigation from another site (a
+///   link into the control plane), withheld from cross-site subrequests and
+///   form posts. CSRF on the same site is the origin check's job
+///   (`http::require_same_origin`), not this attribute's.
+/// - **`Max-Age`.** Matches the row's lifetime; the row still decides.
+fn set_cookie(value: &str, max_age_secs: i64) -> String {
+    format!("{COOKIE_NAME}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax")
 }
 
 /// The `Set-Cookie` value that tells a browser to drop the session cookie.
@@ -158,8 +158,8 @@ fn set_cookie(value: &str, apex: &str, max_age_secs: i64) -> String {
 /// A courtesy, not the logout: logging out is [`db::revoke_session`]. A
 /// browser that ignores this still holds a cookie that no longer authenticates.
 #[must_use]
-pub fn clear_cookie(apex: &str) -> String {
-    set_cookie("", apex, 0)
+pub fn clear_cookie() -> String {
+    set_cookie("", 0)
 }
 
 /// The session this request's cookie names, if it is live.
@@ -220,22 +220,23 @@ pub(crate) async fn require(
     }
 }
 
-/// The value of the cookie called `name`, if exactly one is present.
+/// The value of the cookie called exactly `name`, if exactly one is present.
 ///
-/// Two is refused rather than resolved: a second one is what a subdomain
-/// planting its own cookie on the apex looks like, and picking either would
-/// let the attacker choose which session the victim is in.
+/// Through [`shared::cookie::find`], the platform's one cookie parser: an
+/// exact byte match on the name, never a repaired one, and two is refused
+/// rather than resolved — a second one is what a planted cookie looks like,
+/// and picking either would let the planter choose the session.
 pub(crate) fn single_cookie<'h>(headers: &'h HeaderMap, name: &str) -> Option<&'h str> {
-    let mut found = headers
-        .get_all(header::COOKIE)
-        .iter()
-        .filter_map(|v| v.to_str().ok())
-        .flat_map(|v| v.split(';'))
-        .filter_map(|pair| pair.trim().split_once('='))
-        .filter(|(found, _)| *found == name)
-        .map(|(_, value)| value);
-    let first = found.next()?;
-    found.next().is_none().then_some(first)
+    match shared::cookie::find(
+        headers
+            .get_all(header::COOKIE)
+            .iter()
+            .map(axum::http::HeaderValue::as_bytes),
+        name,
+    ) {
+        shared::cookie::Found::One(value) => Some(value),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -253,11 +254,15 @@ mod tests {
     }
 
     #[test]
-    fn the_cookie_carries_every_flag() {
-        let c = set_cookie("v", "clwd.run", 60);
+    fn the_cookie_is_host_only_with_every_flag() {
+        let c = set_cookie("v", 60);
+        assert_eq!(
+            c, "__Host-clwd_session=v; Path=/; Max-Age=60; HttpOnly; Secure; SameSite=Lax",
+            "the literal header: no Domain attribute"
+        );
+        assert!(!c.to_ascii_lowercase().contains("domain"), "{c}");
         for flag in [
-            "__Secure-clwd_session=v;",
-            "Domain=clwd.run",
+            "__Host-clwd_session=v;",
             "Path=/",
             "Max-Age=60",
             "HttpOnly",
@@ -270,13 +275,13 @@ mod tests {
 
     #[test]
     fn one_session_cookie_among_others_is_found() {
-        let h = headers("a=1; __Secure-clwd_session=xyz; b=2");
+        let h = headers("a=1; __Host-clwd_session=xyz; b=2");
         assert_eq!(single_cookie(&h, COOKIE_NAME), Some("xyz"));
     }
 
     #[test]
     fn two_session_cookies_are_refused() {
-        let h = headers("__Secure-clwd_session=mine; __Secure-clwd_session=planted");
+        let h = headers("__Host-clwd_session=mine; __Host-clwd_session=planted");
         assert_eq!(single_cookie(&h, COOKIE_NAME), None);
     }
 

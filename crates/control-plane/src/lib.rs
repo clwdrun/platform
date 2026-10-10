@@ -6,6 +6,7 @@ pub mod cloudflare;
 pub mod db;
 #[cfg(test)]
 mod envelope_probe;
+pub mod handshake;
 pub mod http;
 pub mod ids;
 pub mod openapi;

@@ -89,6 +89,10 @@ pub struct FlowState {
     pub nonce: String,
     /// The PKCE verifier presented at the token exchange.
     pub pkce_verifier: String,
+    /// An app-host handshake to resume after sign-in (its state), if sign-in
+    /// was started by `/authorize`. Signed with the rest of the cookie, so it
+    /// cannot be swapped in transit, and re-validated before use.
+    pub resume: Option<String>,
 }
 
 /// The JWT claims of a flow cookie.
@@ -99,6 +103,8 @@ struct FlowClaims {
     state: String,
     nonce: String,
     pkce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<String>,
 }
 
 /// Why a flow cookie was not accepted.
@@ -131,12 +137,14 @@ pub fn seal_flow(
     pkce_verifier: &str,
     now_unix: u64,
     ttl_secs: u64,
+    resume: Option<&crate::handshake::HandshakeState>,
 ) -> Result<String, FlowCookieError> {
     let claims = FlowClaims {
         exp: now_unix.saturating_add(ttl_secs),
         state: state.to_owned(),
         nonce: nonce.to_owned(),
         pkce: pkce_verifier.to_owned(),
+        resume: resume.map(|r| r.expose().to_owned()),
     };
     jsonwebtoken::encode(&Header::new(ALG), &claims, &key.encoding)
         .map_err(|_| FlowCookieError::Invalid)
@@ -160,6 +168,7 @@ pub fn open_flow(key: &CookieKey, cookie: &str) -> Result<FlowState, FlowCookieE
         state: claims.state,
         nonce: claims.nonce,
         pkce_verifier: claims.pkce,
+        resume: claims.resume,
     })
 }
 
@@ -176,12 +185,11 @@ pub const FLOW_COOKIE: &str = "__Host-clwd_signin";
 const FLOW_TTL_SECS: u64 = 600;
 
 /// Everything the two sign-in routes need: the discovered flow, the HTTP
-/// client it runs over, the cookie key, and the apex the session is scoped to.
+/// client it runs over, the cookie key, and the control plane's own origin.
 pub struct SignIn {
     flow: identity::Flow,
     http: reqwest::Client,
     key: CookieKey,
-    apex: String,
     origin: String,
 }
 
@@ -209,7 +217,6 @@ impl SignIn {
     pub async fn discover(
         config: identity::OidcConfig,
         key: CookieKey,
-        apex: impl Into<String>,
     ) -> Result<Self, identity::FlowError> {
         crate::acme::install_crypto_provider();
         let origin = reqwest::Url::parse(&config.redirect_uri)
@@ -227,7 +234,6 @@ impl SignIn {
             flow,
             http,
             key,
-            apex: apex.into(),
             origin,
         })
     }
@@ -252,12 +258,20 @@ fn not_configured() -> Error {
 /// `GET /auth/google`: set the flow cookie and send the browser to Google.
 ///
 /// Takes no `return_to`/`next` parameter, deliberately: the callback always
-/// lands on the apex root, so there is no redirect target to validate and no
+/// lands on the control plane's own root, so there is no redirect target to validate and no
 /// open redirect to get wrong.
 pub(crate) async fn start(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `resume` is the only parameter: an app-host handshake's state, which
+    // brings the visitor back to `/authorize` on this host after sign-in. It
+    // is a token in the shape this platform mints, not a URL, so there is
+    // still no redirect target to validate.
+    let resume = form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes())
+        .find(|(name, _)| name == "resume")
+        .and_then(|(_, value)| crate::handshake::HandshakeState::parse(&value));
     let Some(signin) = state.signin.as_deref() else {
         return render(&not_configured(), &request_id);
     };
@@ -269,6 +283,7 @@ pub(crate) async fn start(
         auth.pkce_verifier(),
         now_unix(),
         FLOW_TTL_SECS,
+        resume.as_ref(),
     ) {
         Ok(sealed) => sealed,
         Err(e) => return render(&Error::Internal { source: e.into() }, &request_id),
@@ -381,14 +396,26 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
     // see `orgs` for the rule and why the email's domain plays no part.
     crate::orgs::resolve_at_sign_in(&state.pool, user, hd).await?;
 
-    let issued = session::issue(&state.pool, &signin.key, user, &signin.apex)
+    let issued = session::issue(&state.pool, &signin.key, user)
         .await?
         .ok_or(Error::Unauthenticated {})?;
 
     Ok((
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, format!("https://{}/", signin.apex)),
+            (
+                header::LOCATION,
+                match flow
+                    .resume
+                    .as_deref()
+                    .and_then(crate::handshake::HandshakeState::parse)
+                {
+                    Some(resume) => {
+                        format!("{}/authorize?state={}", signin.origin, resume.expose())
+                    }
+                    None => format!("{}/", signin.origin),
+                },
+            ),
             (header::SET_COOKIE, issued.set_cookie),
         ],
     )
@@ -425,7 +452,7 @@ pub(crate) async fn logout(
     }
     (
         StatusCode::NO_CONTENT,
-        [(header::SET_COOKIE, session::clear_cookie(&signin.apex))],
+        [(header::SET_COOKIE, session::clear_cookie())],
     )
         .into_response()
 }
@@ -461,7 +488,7 @@ pub(crate) fn start_doc() -> Doc {
         summary: "Start Google sign-in",
         description: "Sets a short-lived, signed flow cookie carrying the OIDC `state`, `nonce` and \
                       PKCE verifier, and redirects the browser to Google. Takes no redirect-target \
-                      parameter: the callback always lands on the apex root.",
+                      parameter: the callback always lands on the control plane's own root.",
         params: &[],
         request: None,
         success: vec![Success {
@@ -486,7 +513,7 @@ pub(crate) fn callback_doc() -> Doc {
         request: None,
         success: vec![Success {
             status: StatusCode::SEE_OTHER,
-            description: "Signed in: a session cookie is set and the browser is sent to the apex root.",
+            description: "Signed in: a session cookie is set and the browser is sent to the control plane's own root.",
             body: None,
         }],
         errors: &["identity.unauthenticated", "control-plane.conflict"],
@@ -514,8 +541,16 @@ mod tests {
 
     #[test]
     fn a_sealed_flow_cookie_round_trips() {
-        let sealed = seal_flow(&key(), "the-state", "the-nonce", "the-verifier", now(), 600)
-            .expect("sealing succeeds");
+        let sealed = seal_flow(
+            &key(),
+            "the-state",
+            "the-nonce",
+            "the-verifier",
+            now(),
+            600,
+            None,
+        )
+        .expect("sealing succeeds");
 
         let recovered = open_flow(&key(), &sealed).expect("a fresh cookie opens");
 
@@ -525,13 +560,14 @@ mod tests {
                 state: "the-state".to_owned(),
                 nonce: "the-nonce".to_owned(),
                 pkce_verifier: "the-verifier".to_owned(),
+                resume: None,
             }
         );
     }
 
     #[test]
     fn a_tampered_cookie_is_rejected() {
-        let sealed = seal_flow(&key(), "s", "n", "v", now(), 600).expect("sealing succeeds");
+        let sealed = seal_flow(&key(), "s", "n", "v", now(), 600, None).expect("sealing succeeds");
         // Flip one character of the payload segment; the signature no longer
         // matches.
         let (head, rest) = sealed.split_once('.').expect("a JWT has segments");
@@ -548,7 +584,7 @@ mod tests {
     #[test]
     fn a_cookie_signed_with_another_key_is_rejected() {
         let other = CookieKey::from_secret(b"some-other-secret-entirely-different");
-        let sealed = seal_flow(&other, "s", "n", "v", now(), 600).expect("sealing succeeds");
+        let sealed = seal_flow(&other, "s", "n", "v", now(), 600, None).expect("sealing succeeds");
 
         assert!(matches!(
             open_flow(&key(), &sealed),
@@ -559,7 +595,8 @@ mod tests {
     #[test]
     fn an_expired_cookie_is_rejected() {
         // Expired 400s ago: well past the 60s default leeway.
-        let sealed = seal_flow(&key(), "s", "n", "v", now() - 1000, 600).expect("sealing succeeds");
+        let sealed =
+            seal_flow(&key(), "s", "n", "v", now() - 1000, 600, None).expect("sealing succeeds");
 
         assert!(matches!(
             open_flow(&key(), &sealed),

@@ -47,8 +47,11 @@ use tower::ServiceExt as _;
 const CLIENT_ID: &str = "test-client.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "test-client-secret";
 const REDIRECT: &str = "https://api.clwd.run/auth/google/callback";
-const APEX: &str = "clwd.run";
 const SUBJECT: &str = "google-subject-1";
+/// The apps domain: a placeholder until one is registered (#62).
+const APPS: &str = "clwd-apps.test";
+/// The platform-internal credential the gateway presents.
+const INTERNAL: &str = "test-internal-secret";
 const EMAIL: &str = "person@example.com";
 
 // ------------------------------------------------------------ mock issuer ----
@@ -331,13 +334,14 @@ async fn state(pool: &PgPool, issuer: &Issuer) -> AppState {
             issuer.mock.issuer.clone(),
         ),
         key(),
-        APEX,
     )
     .await
     .expect("discovery against the mock issuer");
     AppState::new(pool.clone(), builder::ArtifactStore::new(operator))
         .with_signin(signin)
         .with_txt_lookup(issuer.dns.clone())
+        .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"))
+        .with_internal_secret(INTERNAL)
 }
 
 /// TXT records the domain-verification lookup sees, set per test.
@@ -498,7 +502,27 @@ async fn a_full_sign_in_ends_in_a_session_that_authenticates(pool: PgPool) {
     .await;
 
     assert_eq!(reply.status, StatusCode::SEE_OTHER, "{:?}", reply.json);
-    assert_eq!(reply.headers[header::LOCATION], "https://clwd.run/");
+    // The session is host-only, so sign-in lands on the host that holds it.
+    assert_eq!(reply.headers[header::LOCATION], "https://api.clwd.run/");
+    // The literal header: `__Host-`, and no `Domain` attribute at all. A
+    // `Domain` here is what let any app host plant this cookie (#62).
+    let session_set_cookie = reply
+        .set_cookies()
+        .into_iter()
+        .find(|c| c.starts_with(&format!("{}=", session::COOKIE_NAME)))
+        .expect("a session Set-Cookie");
+    assert!(
+        session_set_cookie.starts_with("__Host-clwd_session="),
+        "{session_set_cookie}"
+    );
+    assert!(
+        session_set_cookie.ends_with("; Path=/; Max-Age=86400; HttpOnly; Secure; SameSite=Lax"),
+        "{session_set_cookie}"
+    );
+    assert!(
+        !session_set_cookie.to_ascii_lowercase().contains("domain"),
+        "{session_set_cookie}"
+    );
     let user = authenticates(&pool, &reply)
         .await
         .expect("the session the callback issued authenticates");
@@ -778,7 +802,6 @@ async fn discovery_against_a_down_issuer_fails() {
     let result = SignIn::discover(
         OidcConfig::new(CLIENT_ID, CLIENT_SECRET, REDIRECT, url),
         key(),
-        APEX,
     )
     .await;
     assert!(
@@ -827,7 +850,7 @@ async fn logging_out_revokes_the_session_server_side(pool: PgPool) {
     assert!(
         reply.set_cookies().iter().any(|c| {
             c.starts_with(&format!("{}=;", session::COOKIE_NAME))
-                && c.contains("Domain=clwd.run")
+                && !c.to_ascii_lowercase().contains("domain")
                 && c.contains("Max-Age=0")
         }),
         "the session cookie is cleared: {:?}",
@@ -1829,4 +1852,349 @@ async fn a_claimant_who_leaves_the_tenant_loses_the_org(pool: PgPool) {
     )
     .await;
     assert_eq!(reply.status, StatusCode::NOT_FOUND, "{:?}", reply.json);
+}
+
+// --------------------------------------------------------- app handshake ----
+//
+// The control plane's half of the app-host sign-in handshake (#62): begin and
+// exchange are internal (the gateway's), /authorize is public.
+
+/// An org and an app in it, as the handshake sees them.
+async fn an_app(pool: &PgPool, org: &str, app: &str) -> control_plane::ids::AppId {
+    let org = control_plane::db::create_org(pool, org).await.expect("org");
+    control_plane::db::create_app(pool, org.id, app, "wasm")
+        .await
+        .expect("app")
+        .id
+}
+
+async fn internal(
+    state: &AppState,
+    uri: &str,
+    body: &serde_json::Value,
+    secret: Option<&str>,
+) -> Reply {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(uri)
+        .header(header::CONTENT_TYPE, "application/json");
+    if let Some(secret) = secret {
+        request = request.header(header::AUTHORIZATION, format!("Bearer {secret}"));
+    }
+    let response = control_plane::http::internal_router(state.clone())
+        .oneshot(
+            request
+                .body(Body::from(body.to_string()))
+                .expect("a valid request"),
+        )
+        .await
+        .expect("the router answers");
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .expect("body");
+    Reply {
+        status,
+        headers,
+        json: serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    }
+}
+
+async fn begin_handshake(
+    state: &AppState,
+    app: control_plane::ids::AppId,
+    return_path: &str,
+) -> String {
+    let reply = internal(
+        state,
+        "/internal/handshakes",
+        &serde_json::json!({ "app_id": app.to_string(), "return_path": return_path }),
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::CREATED, "{:?}", reply.json);
+    reply.json["state"].as_str().expect("state").to_owned()
+}
+
+fn query_of(location: &str) -> HashMap<String, String> {
+    openidconnect::url::Url::parse(location)
+        .expect("absolute location")
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// `/authorize` signed in: a code, delivered to the app host built from the
+/// handshake's row. Any host or redirect parameter in the request is ignored.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_redirects_only_to_the_handshakes_own_app_host(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let app = an_app(&pool, "acme", "notes").await;
+    let handshake = begin_handshake(&state, app, "/notes/42").await;
+
+    let reply = get_(
+        &state,
+        &format!(
+            "/authorize?state={handshake}&host=evil.example&redirect_uri=https://evil.example/cb"
+        ),
+        Some(&cookie),
+    )
+    .await;
+    assert_eq!(reply.status, StatusCode::SEE_OTHER, "{:?}", reply.json);
+    let location = reply.headers[header::LOCATION].to_str().expect("ascii");
+    assert!(
+        location.starts_with("https://notes.acme.clwd-apps.test/__clwd/callback?"),
+        "{location}"
+    );
+    assert_eq!(reply.headers["referrer-policy"], "no-referrer");
+    let q = query_of(location);
+    assert_eq!(q["state"], handshake);
+    assert_eq!(q["code"].len(), 64);
+}
+
+/// A state the database does not hold — forged, expired, or for a deleted
+/// app — is refused, and no redirect is issued at all.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_refuses_a_handshake_the_database_does_not_hold(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    for query in [
+        "",
+        "state=",
+        "state=not-a-token",
+        &format!("state={}", "a".repeat(64)),
+    ] {
+        let reply = get_(&state, &format!("/authorize?{query}"), Some(&cookie)).await;
+        assert_eq!(
+            reply.status,
+            StatusCode::BAD_REQUEST,
+            "{query}: {:?}",
+            reply.json
+        );
+        assert!(!reply.headers.contains_key(header::LOCATION), "{query}");
+    }
+}
+
+/// Not signed in to the control plane: sign in first, then resume the same
+/// handshake on this host.
+#[sqlx::test(migrations = "../../migrations")]
+async fn authorize_without_a_session_signs_in_then_resumes(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let app = an_app(&pool, "acme", "notes").await;
+    let handshake = begin_handshake(&state, app, "/").await;
+
+    let first = get_(&state, &format!("/authorize?state={handshake}"), None).await;
+    assert_eq!(first.status, StatusCode::SEE_OTHER);
+    assert_eq!(
+        first.headers[header::LOCATION],
+        format!("{ORIGIN}/auth/google?resume={handshake}").as_str()
+    );
+
+    let start = get_(&state, &format!("/auth/google?resume={handshake}"), None).await;
+    let flow = start.cookie(FLOW_COOKIE).expect("flow cookie");
+    let authorize_url = start.headers[header::LOCATION]
+        .to_str()
+        .expect("ascii")
+        .to_owned();
+    let callback = get_(
+        &state,
+        &format!(
+            "/auth/google/callback?{}",
+            issuer.mock.consent(&authorize_url)
+        ),
+        Some(&flow),
+    )
+    .await;
+    assert_eq!(
+        callback.headers[header::LOCATION],
+        format!("{ORIGIN}/authorize?state={handshake}").as_str(),
+        "sign-in resumes the handshake on the control plane's own host"
+    );
+}
+
+/// The full control-plane side: a code exchanges once for an app-host
+/// session that checks out for its app — and only its app — until the parent
+/// session is signed out.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_code_exchanges_once_for_a_session_bound_to_its_app_and_parent(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let notes = an_app(&pool, "acme", "notes").await;
+    let other_org = control_plane::db::org_by_slug(&pool, "acme")
+        .await
+        .expect("read")
+        .expect("org");
+    let wiki = control_plane::db::create_app(&pool, other_org.id, "wiki", "wasm")
+        .await
+        .expect("app")
+        .id;
+    let handshake = begin_handshake(&state, notes, "/notes/42").await;
+    let reply = get_(
+        &state,
+        &format!("/authorize?state={handshake}"),
+        Some(&cookie),
+    )
+    .await;
+    let q = query_of(reply.headers[header::LOCATION].to_str().expect("ascii"));
+    let body = serde_json::json!({ "code": q["code"], "state": q["state"] });
+
+    let exchanged = internal(
+        &state,
+        "/internal/handshakes/exchange",
+        &body,
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(exchanged.status, StatusCode::OK, "{:?}", exchanged.json);
+    assert_eq!(exchanged.json["return_path"], "/notes/42");
+    assert_eq!(exchanged.json["app_id"], notes.to_string());
+    let session = exchanged.json["session"]
+        .as_str()
+        .expect("session")
+        .to_owned();
+
+    // Once: the same code again, well inside its 60 seconds, is refused.
+    let again = internal(
+        &state,
+        "/internal/handshakes/exchange",
+        &body,
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(again.status, StatusCode::UNAUTHORIZED, "{:?}", again.json);
+
+    let check = |app: control_plane::ids::AppId| {
+        let state = state.clone();
+        let session = session.clone();
+        async move {
+            internal(
+                &state,
+                "/internal/app-sessions/check",
+                &serde_json::json!({ "session": session, "app_id": app.to_string() }),
+                Some(INTERNAL),
+            )
+            .await
+            .status
+        }
+    };
+    assert_eq!(check(notes).await, StatusCode::NO_CONTENT);
+    assert_eq!(
+        check(wiki).await,
+        StatusCode::UNAUTHORIZED,
+        "a session for one app is no session on another app's host"
+    );
+
+    // Signing out of the control plane ends the child on its next check.
+    let logout = send(&state, "POST", "/auth/logout", Some(&cookie)).await;
+    assert_eq!(logout.status, StatusCode::NO_CONTENT);
+    assert_eq!(check(notes).await, StatusCode::UNAUTHORIZED);
+}
+
+/// A code is bound to its state: the right code with another handshake's
+/// state is refused, and burns nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_code_with_the_wrong_state_is_refused(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let app = an_app(&pool, "acme", "notes").await;
+    let mine = begin_handshake(&state, app, "/").await;
+    let other = begin_handshake(&state, app, "/").await;
+    let reply = get_(&state, &format!("/authorize?state={mine}"), Some(&cookie)).await;
+    let q = query_of(reply.headers[header::LOCATION].to_str().expect("ascii"));
+
+    let wrong = internal(
+        &state,
+        "/internal/handshakes/exchange",
+        &serde_json::json!({ "code": q["code"], "state": other }),
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(wrong.status, StatusCode::UNAUTHORIZED);
+    let right = internal(
+        &state,
+        "/internal/handshakes/exchange",
+        &serde_json::json!({ "code": q["code"], "state": mine }),
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(right.status, StatusCode::OK, "{:?}", right.json);
+}
+
+/// The exchange is internal twice over: absent from the public router, and
+/// refused on the internal one without the credential.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_exchange_is_not_on_the_public_listener_and_needs_the_credential(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let body = serde_json::json!({ "code": "0".repeat(64), "state": "0".repeat(64) }).to_string();
+    for path in [
+        "/internal/handshakes/exchange",
+        "/internal/handshakes",
+        "/internal/app-sessions/check",
+    ] {
+        let public = send_with(
+            &state,
+            "POST",
+            path,
+            None,
+            &[("authorization", "Bearer test-internal-secret")],
+            &body,
+        )
+        .await;
+        assert_eq!(
+            public.status,
+            StatusCode::NOT_FOUND,
+            "{path} on the public router"
+        );
+    }
+    for secret in [None, Some("wrong-secret")] {
+        let reply = internal(
+            &state,
+            "/internal/handshakes/exchange",
+            &serde_json::json!({ "code": "0".repeat(64), "state": "0".repeat(64) }),
+            secret,
+        )
+        .await;
+        assert_eq!(reply.status, StatusCode::UNAUTHORIZED, "{secret:?}");
+    }
+}
+
+/// A return path that would leave the app host is never stored: the visitor
+/// returns to the app's root instead.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_return_path_that_leaves_the_host_is_not_stored(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let app = an_app(&pool, "acme", "notes").await;
+    for hostile in [
+        "https://evil.example/",
+        "//evil.example",
+        "/\\evil.example",
+        "/\t/evil",
+    ] {
+        let handshake = begin_handshake(&state, app, hostile).await;
+        let reply = get_(
+            &state,
+            &format!("/authorize?state={handshake}"),
+            Some(&cookie),
+        )
+        .await;
+        let q = query_of(reply.headers[header::LOCATION].to_str().expect("ascii"));
+        let exchanged = internal(
+            &state,
+            "/internal/handshakes/exchange",
+            &serde_json::json!({ "code": q["code"], "state": q["state"] }),
+            Some(INTERNAL),
+        )
+        .await;
+        assert_eq!(exchanged.json["return_path"], "/", "{hostile:?}");
+    }
 }

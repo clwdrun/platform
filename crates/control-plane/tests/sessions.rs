@@ -16,8 +16,6 @@ use control_plane::{db, ids::UserId};
 use shared::{Error, RequestId};
 use sqlx::PgPool;
 
-const APEX: &str = "clwd.run";
-
 fn key() -> CookieKey {
     CookieKey::from_secret(b"a-test-signing-secret-of-some-length")
 }
@@ -33,7 +31,7 @@ fn cookie_from(set_cookie: &str) -> HeaderMap {
 
 async fn signed_in(pool: &PgPool) -> (UserId, session::Issued, HeaderMap) {
     let user = db::create_user(pool, "a@example.com").await.expect("user");
-    let issued = session::issue(pool, &key(), user.id, APEX)
+    let issued = session::issue(pool, &key(), user.id)
         .await
         .expect("issue")
         .expect("a live user gets a session");
@@ -143,7 +141,7 @@ async fn revoked_expired_and_unknown_are_indistinguishable(pool: PgPool) {
         let user = db::create_user(&pool, &format!("u{n}@example.com"))
             .await
             .expect("user");
-        let issued = session::issue(&pool, &key(), user.id, APEX)
+        let issued = session::issue(&pool, &key(), user.id)
             .await
             .expect("issue")
             .expect("session");

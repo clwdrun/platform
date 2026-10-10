@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists (\n             select 1\n               from app_sessions a\n               join sessions s on s.id = a.parent_session_id\n               join users u on u.id = s.user_id\n              where a.secret_sha256 = $1\n                and a.app_id = $2\n                and a.expires_at > now()\n                and s.revoked_at is null\n                and s.expires_at > now()\n                and u.deleted_at is null\n           ) as \"live!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "12262ca9ae26909def6eb22cf7ec5abdb55154bfa30cd9d6c25e6212f0c93168"
+}

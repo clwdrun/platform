@@ -5,7 +5,7 @@
 //! own runtimes, so it must run on a plain thread. Configuration comes from the
 //! environment. TLS uses a per-org certificate chosen at handshake time by SNI
 //! ([`gateway::tls::DynamicCert`]) — one wildcard cert per org — so a host that
-//! is not `{app}.{org}.<apex>`, or an org with no issued certificate, fails the
+//! is not `{app}.{org}.<apps domain>`, or an org with no issued certificate, fails the
 //! handshake rather than being served a wrong certificate. This is binary-edge
 //! glue, so `anyhow`; the library crates use `thiserror`.
 
@@ -22,12 +22,23 @@ use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use pingora::services::listening::Service;
 use shared::cert::DirCertStore;
+use shared::domains::{AppsDomain, ControlPlaneDomain};
 
 fn main() -> anyhow::Result<()> {
     shared::telemetry::init();
 
     let listen = env::var("CLWD_GATEWAY_LISTEN").unwrap_or_else(|_| "0.0.0.0:8443".to_owned());
-    let apex = env::var("CLWD_APEX").unwrap_or_else(|_| "clwd.run".to_owned());
+    // Two domains, both required, no default: apps are served from a
+    // registrable domain of their own, never the control plane's (#62). One
+    // variable for both is how that would quietly be undone.
+    let apps = AppsDomain::parse(
+        &env::var("CLWD_APPS_DOMAIN").context("CLWD_APPS_DOMAIN must name the apps domain")?,
+    )?;
+    let control_plane_domain = ControlPlaneDomain::parse(
+        &env::var("CLWD_CONTROL_PLANE_DOMAIN")
+            .context("CLWD_CONTROL_PLANE_DOMAIN must name the control plane's public host")?,
+    )?;
+    apps.separate_from(&control_plane_domain)?;
     let control_plane = env::var("CLWD_CONTROL_PLANE")
         .context("CLWD_CONTROL_PLANE must be the internal control-plane base URL")?;
     let internal_secret =
@@ -37,13 +48,13 @@ fn main() -> anyhow::Result<()> {
     let cert_dir = env::var("CLWD_CERT_DIR")
         .context("CLWD_CERT_DIR must name the per-org certificate directory")?;
 
-    tracing::info!(%listen, %apex, %cert_dir, "gateway serving");
+    tracing::info!(%listen, %apps, control_plane = control_plane_domain.as_str(), %cert_dir, "gateway serving");
 
     let lookup = Arc::new(RouteLookup::new(control_plane, internal_secret)?);
-    let edge = Edge::new(lookup, apex.clone());
+    let edge = Edge::new(lookup, apps.clone());
 
     let store = Arc::new(DirCertStore::new(&cert_dir));
-    let resolver = CertResolver::new(store, apex);
+    let resolver = CertResolver::new(store, apps);
     let tls = TlsSettings::with_callbacks(DynamicCert::callbacks(resolver))
         .map_err(|e| anyhow::anyhow!("TLS settings: {e}"))?;
 

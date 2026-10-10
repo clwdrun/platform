@@ -14,8 +14,10 @@ pingora = { workspace = true }
 moka = { workspace = true }
 reqwest = { workspace = true }
 http = { workspace = true }
+bytes = { workspace = true }
+# Parsing the handshake callback's query. Already in the tree via url.
+form_urlencoded = "1"
 async-trait = { workspace = true }
-tower-cookies = { workspace = true }
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
