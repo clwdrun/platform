@@ -66,11 +66,15 @@ test:
 # envelope was asserted and invisible. That is a check reporting its colour
 # instead of its count. This runs the probe again with output shown and fails
 # unless both count lines appear, so it cannot pass by printing nothing.
+#
+# `--workspace --lib` rather than `-p control-plane`: `-p` resolves features for
+# one crate, not the workspace, so it rebuilt every dependency a second time in
+# a second feature set. The name filter still selects only this test.
 [doc('print the envelope probe counts: bare error responses, with and without conversion (needs a database)')]
 envelope-probe:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! out=$(cargo test -p control-plane --lib every_error_response_from_every_route -- --nocapture 2>&1); then
+    if ! out=$(cargo test --workspace --lib every_error_response_from_every_route -- --nocapture 2>&1); then
       printf '%s\n' "$out" | tail -60
       echo "error: the envelope probe failed"
       exit 1
@@ -93,7 +97,7 @@ envelope-probe:
 openapi-check:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! out=$(cargo test -p control-plane --lib openapi::tests -- --nocapture --test-threads=1 2>&1); then
+    if ! out=$(cargo test --workspace --lib openapi::tests -- --nocapture --test-threads=1 2>&1); then
       printf '%s\n' "$out" | tail -60
       echo "error: the OpenAPI checks failed"
       exit 1

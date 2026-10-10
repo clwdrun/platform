@@ -176,3 +176,15 @@ object_store = "0.14.1"
 # still pinned the tag's previous commit. When bumping the tag, run
 # `cargo update -p clwd-bundle` so any mismatch surfaces now, not in CI.
 clwd-bundle = { version = "0.0.1", git = "https://github.com/clwdrun/clwd", tag = "v0.0.1" }
+
+# Debug info is most of `target/`: a full-debuginfo gate run left ~19 GB, every
+# test binary ~290 MB with 44% of it DWARF, and the CI runner ran out of disk
+# linking one (rust-lld SIGBUS). The workspace's own crates keep line tables,
+# so a panic or backtrace still names file and line; dependencies keep none,
+# since nobody steps through aws-lc or tokio in a debugger from this repo.
+# Need a full debugger session on a dependency? Set `debug = true` locally.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
