@@ -17,7 +17,7 @@ default:
 # `migrate` runs before anything that compiles the workspace: sqlx checks its
 # queries against the live database at macro expansion, so a fresh `just db-up`
 # with no schema fails `clippy` rather than failing something about schema.
-check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe openapi-check deny
+check: secrets fmt-check seam rollback-plans migrate clippy sqlx-prepared offline-build migrate-roundtrip test envelope-probe openapi-check deny release-has-no-test-upstream
 
 # Secret scan over full history. This repository is private, so GitHub's own
 # secret scanning and push protection — both Advanced Security features — are
@@ -178,6 +178,21 @@ rollback-plans:
 
 # .sqlx is what lets CI build with no database. It rots silently the moment a
 # query changes, so the gate checks it rather than trusting it.
+# The gateway's app hop has exactly one HTTP implementation: the browser
+# tests' test upstream, which lives in crates/e2e and must never reach a
+# release build (#62). Built and searched, not assumed: the test upstream
+# writes a marker string no production code contains.
+[doc('the release gateway contains no test upstream')]
+release-has-no-test-upstream:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    cargo build --release --locked -p gateway --bin gateway
+    if grep -aq 'clwd-test-upstream-v1' target/release/gateway; then
+      echo "error: the release gateway contains the test upstream (marker clwd-test-upstream-v1)"
+      exit 1
+    fi
+    echo "ok: the release gateway contains no test upstream"
+
 [doc('.sqlx is current for every query, including the tests')]
 sqlx-prepared:
     cargo sqlx prepare --workspace --check -- --all-targets
