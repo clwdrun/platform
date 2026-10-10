@@ -858,8 +858,8 @@ async fn no_platform_cookie_reaches_the_wasm_boundary(pool: PgPool) {
 }
 
 /// Test 4: concurrent requests from different visitors each see only their
-/// own caller. 64 visitors, 4 requests each, all in flight at once: 256
-/// overlapping invocations on a handful of threads. A caller kept anywhere
+/// own caller. 64 visitors, 4 requests each, 256 in all, 64 in flight at a
+/// time: overlapping invocations on a handful of worker threads. A caller kept anywhere
 /// across invocations shows up as the wrong subject, and one overwritten
 /// mid-request as `caller_after` disagreeing with `caller`.
 #[sqlx::test(migrations = "../../migrations")]
@@ -877,7 +877,14 @@ async fn concurrent_visitors_each_see_only_themselves(pool: PgPool) {
             let client = client.clone();
             async move { (v, on_notes(&client, "/whoami", &v.cookie, &[]).await) }
         });
-    let answers = futures::future::join_all(requests).await;
+    // At most 64 in flight: 16× the worker's threads, so invocations overlap
+    // throughout, without queuing all 256 session checks at once behind the
+    // control plane, which shares this test's single thread.
+    use futures::StreamExt as _;
+    let answers: Vec<_> = futures::stream::iter(requests)
+        .buffer_unordered(64)
+        .collect()
+        .await;
     assert_eq!(answers.len(), 256);
     for (v, (status, json)) in answers {
         assert_eq!(status, 200, "{json}");
