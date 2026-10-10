@@ -147,7 +147,11 @@ pub(crate) fn doc() -> Doc {
                 )),
             },
         ],
-        errors: &[crate::openapi::BUNDLE_CODES, "control-plane.not_found"],
+        errors: &[
+            crate::openapi::BUNDLE_CODES,
+            "control-plane.not_found",
+            "control-plane.egress_not_supported",
+        ],
     }
 }
 
@@ -206,6 +210,14 @@ async fn publish_inner(
 
     // Before the claim, so an invalid bundle leaves no row at all.
     let validated = builder::validate(body)?;
+    // Before the claim, like validation: an app that cannot run leaves no row.
+    // The worker refuses the same bundle at spawn; this is the early answer.
+    let egress = &validated.manifest().capabilities.egress;
+    if !egress.is_empty() {
+        return Err(Error::EgressNotSupported {
+            hosts: egress.join(", "),
+        });
+    }
     let digest = validated.digest().to_string();
     let org_id = principal.org_id;
 
