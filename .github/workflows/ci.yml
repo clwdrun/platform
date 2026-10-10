@@ -102,8 +102,8 @@ jobs:
       # registry, which left 1.5 GB in a measured run — too thin, since a full
       # disk shows up as rust-lld SIGBUS linking a test binary. Deleting these
       # preinstalled toolchains frees ~25 GB but took 3.5 minutes in the
-      # foreground; run alongside cache restore and tool installs, it costs
-      # nothing, and the step before `just check` waits for whatever is left.
+      # foreground; run alongside cache restore, tool installs and the build, it
+      # costs nothing, and the step before `just check` waits only for room.
       # Docker images are not pruned here: Pebble's are pulled concurrently.
       - name: Free runner disk space (background)
         run: |
@@ -224,10 +224,19 @@ jobs:
       # One command, the same one a developer runs. Its steps are:
       # secrets, fmt-check, seam, rollback-plans, migrate, clippy,
       # sqlx-prepared, offline-build, migrate-roundtrip, test, deny.
-      - name: Wait for the disk to be freed
+      # Waits only for enough room, not for the deletion to finish: the gate
+      # peaks at ~10 GB (target/, registry, cache archive), so 20 GB free is
+      # margin, and the rest of the deletion carries on during the build.
+      # Waiting for completion instead cost two minutes on a measured run.
+      - name: Wait for 20 GB of free disk
         run: |
           pid=$(cat /tmp/free-disk.pid)
-          for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          for _ in $(seq 1 240); do
+            free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+            [ "$free_gb" -ge 20 ] && break
+            kill -0 "$pid" 2>/dev/null || break
+            sleep 1
+          done
           df -h /
 
       - name: just check
