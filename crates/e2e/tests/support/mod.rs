@@ -580,6 +580,17 @@ impl Harness {
             let app = control_plane::db::create_app(&pool, org, name, "wasm")
                 .await
                 .expect("app");
+            // A published version, so the app has something to run. The test
+            // upstream does not read the digest; its shape only has to parse.
+            sqlx::query(
+                "insert into app_versions (id, app_id, digest, state) values ($1, $2, $3, 'ready')",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(app.id.as_uuid())
+            .bind(format!("blake3:{}", "ab".repeat(32)))
+            .execute(&pool)
+            .await
+            .expect("a ready version");
             names.insert(app.id.to_string(), label);
         }
 

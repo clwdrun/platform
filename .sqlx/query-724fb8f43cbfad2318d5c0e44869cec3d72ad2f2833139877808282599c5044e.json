@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select a.id as \"id: AppId\", a.org_id as \"org_id: OrgId\", v.digest as \"digest?\"\n             from apps a\n             join orgs o on o.id = a.org_id\n             left join lateral (\n                 select digest from app_versions\n                  where app_id = a.id and state = 'ready'\n                  order by created_at desc, id desc\n                  limit 1\n             ) v on true\n            where o.slug = $1 and o.deleted_at is null\n              and a.name = $2 and a.deleted_at is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AppId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "apps",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "apps",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "digest?",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_versions",
+            "name": "digest"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "724fb8f43cbfad2318d5c0e44869cec3d72ad2f2833139877808282599c5044e"
+}

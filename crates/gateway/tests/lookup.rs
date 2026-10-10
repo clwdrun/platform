@@ -154,6 +154,7 @@ async fn a_warm_route_is_served_stale_when_the_control_plane_goes_down() {
             stale: true,
             app_id,
             org_id,
+            ..
         } => {
             assert_eq!(app_id, APP_ID);
             assert_eq!(org_id, ORG_ID);

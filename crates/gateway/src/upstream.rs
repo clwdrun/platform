@@ -27,6 +27,7 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clwd_bundle::BundleRef;
 use http::{HeaderMap, Method, StatusCode};
 use shared::hop::Caller;
 
@@ -36,11 +37,22 @@ use shared::hop::Caller;
 pub struct AppTarget {
     app_id: String,
     org_id: String,
+    digest: BundleRef,
 }
 
 impl AppTarget {
-    pub(crate) fn new(app_id: String, org_id: String) -> Self {
-        Self { app_id, org_id }
+    pub(crate) fn new(app_id: String, org_id: String, digest: BundleRef) -> Self {
+        Self {
+            app_id,
+            org_id,
+            digest,
+        }
+    }
+
+    /// The version to run: the newest published one the control plane named.
+    #[must_use]
+    pub fn digest(&self) -> &BundleRef {
+        &self.digest
     }
 
     /// The resolved app's id.

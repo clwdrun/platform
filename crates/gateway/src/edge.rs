@@ -553,8 +553,23 @@ impl ServeHttp for Edge {
         };
         // A live app, and an edge that serves apps: sign-in and the hop. The
         // target is the resolved row — nothing in the request chooses it.
-        if let (Some(serving), Some(Route::App { app_id, org_id, .. })) = (&self.serving, &route) {
-            let target = AppTarget::new(app_id.clone(), org_id.clone());
+        if let (
+            Some(serving),
+            Some(Route::App {
+                app_id,
+                org_id,
+                digest,
+                ..
+            }),
+        ) = (&self.serving, &route)
+        {
+            // Nothing published yet, or a digest that does not parse: there
+            // is no version to run, so the app is not ready. Answered before
+            // sign-in, so a visitor is not sent through a handshake for it.
+            let Some(digest) = digest.as_deref().and_then(|d| d.parse().ok()) else {
+                return render_disposition(Disposition::NotReady);
+            };
+            let target = AppTarget::new(app_id.clone(), org_id.clone(), digest);
             return self.serve_app(serving, session, target).await;
         }
         let disposition = disposition(route, session.req_header().uri.path());
@@ -586,6 +601,7 @@ mod tests {
                 Some(Route::App {
                     app_id: "a".to_owned(),
                     org_id: "o".to_owned(),
+                    digest: None,
                     stale: false,
                 }),
                 "/"
@@ -597,6 +613,7 @@ mod tests {
                 Some(Route::App {
                     app_id: "a".to_owned(),
                     org_id: "o".to_owned(),
+                    digest: None,
                     stale: true,
                 }),
                 "/"
@@ -615,6 +632,7 @@ mod tests {
                     Some(Route::App {
                         app_id: "a".to_owned(),
                         org_id: "o".to_owned(),
+                        digest: None,
                         stale: false,
                     }),
                     path

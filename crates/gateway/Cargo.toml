@@ -25,6 +25,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
+clwd-bundle = { workspace = true }
 
 [dev-dependencies]
 # A real HTTP server to point the lookup client at: warm the cache over real
