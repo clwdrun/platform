@@ -262,10 +262,15 @@ async fn walk(state: &AppState, bare_errors: BareErrors, fixture: &Fixture) -> C
                         } else {
                             BUDGET
                         };
-                        let response = build(state.clone(), budget, bare_errors)
-                            .oneshot(request)
-                            .await
-                            .expect("the router answers");
+                        let response = build(
+                            state.clone(),
+                            budget,
+                            bare_errors,
+                            crate::http::Listener::All,
+                        )
+                        .oneshot(request)
+                        .await
+                        .expect("the router answers");
                         counts.requests += 1;
 
                         let status = response.status();

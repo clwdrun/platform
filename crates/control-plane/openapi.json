@@ -707,6 +707,119 @@
         "summary": "Sign out"
       }
     },
+    "/authorize": {
+      "get": {
+        "description": "The middle of the app-host sign-in handshake. The gateway sends a visitor here with the handshake's `state`. Signs the visitor in to the control plane first if needed, then redirects to the app's own `/__clwd/callback` with a single-use, 60-second code. The app host is taken from the handshake, never from this request: any other parameter is ignored.\n\n**Authentication:** none required; the session cookie is read if sent. Must come from the control plane's own origin.",
+        "operationId": "authorizeAppHost",
+        "responses": {
+          "303": {
+            "description": "To the app host's callback with a code, or to sign-in first."
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.invalid_request": {
+                    "description": "A request body or parameter was not acceptable. The message says which part and why. What to do: check the request against the OpenAPI schema at /openapi.json",
+                    "summary": "control-plane.invalid_request",
+                    "value": {
+                      "code": "control-plane.invalid_request",
+                      "hint": "check the request against the OpenAPI schema at /openapi.json",
+                      "message": "invalid request: token request: missing field `name` at line 1 column 25",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
+          },
+          "405": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.method_not_allowed": {
+                    "description": "The path exists, but not for this HTTP method. What to do: use one of the methods named in the Allow header",
+                    "summary": "control-plane.method_not_allowed",
+                    "value": {
+                      "code": "control-plane.method_not_allowed",
+                      "hint": "use one of the methods named in the Allow header",
+                      "message": "method not allowed on this path",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.method_not_allowed`: The path exists, but not for this HTTP method. **What to do:** use one of the methods named in the Allow header",
+            "headers": {
+              "Allow": {
+                "description": "The methods this path accepts.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.internal": {
+                    "description": "An unexpected failure inside the service. What to do: this is a defect; report it with the request id",
+                    "summary": "control-plane.internal",
+                    "value": {
+                      "code": "control-plane.internal",
+                      "hint": "this is a defect; report it with the request id",
+                      "message": "internal error",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": false
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.internal`: An unexpected failure inside the service. **What to do:** this is a defect; report it with the request id"
+          },
+          "504": {
+            "content": {
+              "application/json": {
+                "examples": {
+                  "control-plane.timeout": {
+                    "description": "The request exceeded its time budget, or a dependency did not answer in time. What to do: retry; if it persists the dependency is down rather than slow",
+                    "summary": "control-plane.timeout",
+                    "value": {
+                      "code": "control-plane.timeout",
+                      "hint": "retry; if it persists the dependency is down rather than slow",
+                      "message": "timed out talking to the database",
+                      "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
+                      "retryable": true
+                    }
+                  }
+                },
+                "schema": {
+                  "$ref": "#/components/schemas/Envelope"
+                }
+              }
+            },
+            "description": "- `control-plane.timeout`: The request exceeded its time budget, or a dependency did not answer in time. **What to do:** retry; if it persists the dependency is down rather than slow"
+          }
+        },
+        "security": [],
+        "summary": "Sign in to an app host"
+      }
+    },
     "/healthz": {
       "get": {
         "description": "Answers `ok` while the process is serving requests. For load balancers: it checks nothing downstream.\n\n**Authentication:** none.",

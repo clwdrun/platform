@@ -105,6 +105,11 @@ pub struct AppState {
     /// answers `control-plane.internal` — fail closed. Set via
     /// [`AppState::with_txt_lookup`].
     pub txt_lookup: Option<crate::orgs::SharedTxtLookup>,
+    /// The domain apps are served under, for building an app host from its
+    /// row in the sign-in handshake. `None` means `/authorize` answers
+    /// `control-plane.internal` — fail closed. Set via
+    /// [`AppState::with_apps_domain`].
+    pub apps_domain: Option<shared::domains::AppsDomain>,
 }
 
 impl AppState {
@@ -136,6 +141,7 @@ impl AppState {
             internal_secret: None,
             signin: None,
             txt_lookup: None,
+            apps_domain: None,
         }
     }
 
@@ -151,6 +157,13 @@ impl AppState {
     #[must_use]
     pub fn with_signin(mut self, signin: crate::signin::SignIn) -> Self {
         self.signin = Some(std::sync::Arc::new(signin));
+        self
+    }
+
+    /// Set the domain apps are served under.
+    #[must_use]
+    pub fn with_apps_domain(mut self, apps: shared::domains::AppsDomain) -> Self {
+        self.apps_domain = Some(apps);
         self
     }
 
@@ -338,6 +351,34 @@ pub fn production_routes() -> Vec<Route> {
             crate::signin::logout,
         ),
         Route::new(
+            Verb::Get,
+            "/authorize",
+            Access::SessionOptional,
+            crate::handshake::authorize_doc(),
+            crate::handshake::authorize_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/internal/handshakes",
+            Access::Internal,
+            crate::handshake::begin_doc(),
+            crate::handshake::begin_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/internal/handshakes/exchange",
+            Access::Internal,
+            crate::handshake::exchange_doc(),
+            crate::handshake::exchange_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/internal/app-sessions/check",
+            Access::Internal,
+            crate::handshake::check_doc(),
+            crate::handshake::check_route,
+        ),
+        Route::new(
             Verb::Post,
             "/v1/domain-claims",
             Access::Session,
@@ -438,9 +479,49 @@ fn test_routes() -> Vec<Route> {
     ]
 }
 
-/// Build the router.
+/// Which listener a router is for.
+///
+/// Internal routes — the gateway's host resolution, the sign-in handshake's
+/// code exchange and session check — are served only on the internal
+/// listener, which is never exposed to the internet. Each also checks the
+/// internal credential, so reaching one takes both the network position and
+/// the secret; neither alone is enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Listener {
+    /// Everything but internal routes.
+    Public,
+    /// Internal routes only.
+    Internal,
+    /// Every route, for the envelope probe, which walks the whole table.
+    #[cfg(test)]
+    All,
+}
+
+impl Listener {
+    fn serves(self, access: Access) -> bool {
+        match self {
+            Self::Public => access != Access::Internal,
+            Self::Internal => access == Access::Internal,
+            #[cfg(test)]
+            Self::All => true,
+        }
+    }
+}
+
+/// Build the public router: every route except internal ones.
 pub fn router(state: AppState) -> Router {
     router_with(state, REQUEST_TIMEOUT)
+}
+
+/// Build the internal router: internal routes only, each behind the internal
+/// credential. Bound to a listener the internet cannot reach.
+pub fn internal_router(state: AppState) -> Router {
+    build(
+        state,
+        REQUEST_TIMEOUT,
+        BareErrors::Convert,
+        Listener::Internal,
+    )
 }
 
 /// Build the router with an explicit time budget.
@@ -449,7 +530,7 @@ pub fn router(state: AppState) -> Router {
 /// [`REQUEST_TIMEOUT`]. The whole layer stack is still assembled here, so a test
 /// that drives this exercises the real wiring.
 fn router_with(state: AppState, timeout: Duration) -> Router {
-    build(state, timeout, BareErrors::Convert)
+    build(state, timeout, BareErrors::Convert, Listener::Public)
 }
 
 /// Whether bare error responses are converted to envelopes.
@@ -464,8 +545,17 @@ pub(crate) enum BareErrors {
     Leave,
 }
 
-pub(crate) fn build(state: AppState, timeout: Duration, bare_errors: BareErrors) -> Router {
-    let router = register(routes(), &state)
+pub(crate) fn build(
+    state: AppState,
+    timeout: Duration,
+    bare_errors: BareErrors,
+    listener: Listener,
+) -> Router {
+    let table = routes()
+        .into_iter()
+        .filter(|route| listener.serves(route.access))
+        .collect();
+    let router = register(table, &state)
         .with_state(state)
         // The upload ceiling, applied to every route that reads a body.
         //
@@ -484,7 +574,11 @@ pub(crate) fn build(state: AppState, timeout: Duration, bare_errors: BareErrors)
             timeout,
         ))
         .layer(CatchPanicLayer::custom(on_panic))
-        .layer(TraceLayer::new_for_http());
+        // Spans record the method and the path, never the query: a query here
+        // can carry a sign-in handshake's code or state (#62).
+        .layer(TraceLayer::new_for_http().make_span_with(|request: &Request| {
+            tracing::debug_span!("request", method = %request.method(), path = %request.uri().path())
+        }));
 
     let router = match bare_errors {
         BareErrors::Convert => router.layer(middleware::from_fn(envelope_every_error)),

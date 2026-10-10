@@ -89,6 +89,10 @@ pub struct FlowState {
     pub nonce: String,
     /// The PKCE verifier presented at the token exchange.
     pub pkce_verifier: String,
+    /// An app-host handshake to resume after sign-in (its state), if sign-in
+    /// was started by `/authorize`. Signed with the rest of the cookie, so it
+    /// cannot be swapped in transit, and re-validated before use.
+    pub resume: Option<String>,
 }
 
 /// The JWT claims of a flow cookie.
@@ -99,6 +103,8 @@ struct FlowClaims {
     state: String,
     nonce: String,
     pkce: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume: Option<String>,
 }
 
 /// Why a flow cookie was not accepted.
@@ -131,12 +137,14 @@ pub fn seal_flow(
     pkce_verifier: &str,
     now_unix: u64,
     ttl_secs: u64,
+    resume: Option<&crate::handshake::HandshakeState>,
 ) -> Result<String, FlowCookieError> {
     let claims = FlowClaims {
         exp: now_unix.saturating_add(ttl_secs),
         state: state.to_owned(),
         nonce: nonce.to_owned(),
         pkce: pkce_verifier.to_owned(),
+        resume: resume.map(|r| r.expose().to_owned()),
     };
     jsonwebtoken::encode(&Header::new(ALG), &claims, &key.encoding)
         .map_err(|_| FlowCookieError::Invalid)
@@ -160,6 +168,7 @@ pub fn open_flow(key: &CookieKey, cookie: &str) -> Result<FlowState, FlowCookieE
         state: claims.state,
         nonce: claims.nonce,
         pkce_verifier: claims.pkce,
+        resume: claims.resume,
     })
 }
 
@@ -254,7 +263,15 @@ fn not_configured() -> Error {
 pub(crate) async fn start(
     State(state): State<AppState>,
     Extension(request_id): Extension<RequestId>,
+    RawQuery(query): RawQuery,
 ) -> Response {
+    // `resume` is the only parameter: an app-host handshake's state, which
+    // brings the visitor back to `/authorize` on this host after sign-in. It
+    // is a token in the shape this platform mints, not a URL, so there is
+    // still no redirect target to validate.
+    let resume = form_urlencoded::parse(query.as_deref().unwrap_or("").as_bytes())
+        .find(|(name, _)| name == "resume")
+        .and_then(|(_, value)| crate::handshake::HandshakeState::parse(&value));
     let Some(signin) = state.signin.as_deref() else {
         return render(&not_configured(), &request_id);
     };
@@ -266,6 +283,7 @@ pub(crate) async fn start(
         auth.pkce_verifier(),
         now_unix(),
         FLOW_TTL_SECS,
+        resume.as_ref(),
     ) {
         Ok(sealed) => sealed,
         Err(e) => return render(&Error::Internal { source: e.into() }, &request_id),
@@ -385,7 +403,19 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
     Ok((
         StatusCode::SEE_OTHER,
         [
-            (header::LOCATION, format!("{}/", signin.origin)),
+            (
+                header::LOCATION,
+                match flow
+                    .resume
+                    .as_deref()
+                    .and_then(crate::handshake::HandshakeState::parse)
+                {
+                    Some(resume) => {
+                        format!("{}/authorize?state={}", signin.origin, resume.expose())
+                    }
+                    None => format!("{}/", signin.origin),
+                },
+            ),
             (header::SET_COOKIE, issued.set_cookie),
         ],
     )
@@ -511,8 +541,16 @@ mod tests {
 
     #[test]
     fn a_sealed_flow_cookie_round_trips() {
-        let sealed = seal_flow(&key(), "the-state", "the-nonce", "the-verifier", now(), 600)
-            .expect("sealing succeeds");
+        let sealed = seal_flow(
+            &key(),
+            "the-state",
+            "the-nonce",
+            "the-verifier",
+            now(),
+            600,
+            None,
+        )
+        .expect("sealing succeeds");
 
         let recovered = open_flow(&key(), &sealed).expect("a fresh cookie opens");
 
@@ -522,13 +560,14 @@ mod tests {
                 state: "the-state".to_owned(),
                 nonce: "the-nonce".to_owned(),
                 pkce_verifier: "the-verifier".to_owned(),
+                resume: None,
             }
         );
     }
 
     #[test]
     fn a_tampered_cookie_is_rejected() {
-        let sealed = seal_flow(&key(), "s", "n", "v", now(), 600).expect("sealing succeeds");
+        let sealed = seal_flow(&key(), "s", "n", "v", now(), 600, None).expect("sealing succeeds");
         // Flip one character of the payload segment; the signature no longer
         // matches.
         let (head, rest) = sealed.split_once('.').expect("a JWT has segments");
@@ -545,7 +584,7 @@ mod tests {
     #[test]
     fn a_cookie_signed_with_another_key_is_rejected() {
         let other = CookieKey::from_secret(b"some-other-secret-entirely-different");
-        let sealed = seal_flow(&other, "s", "n", "v", now(), 600).expect("sealing succeeds");
+        let sealed = seal_flow(&other, "s", "n", "v", now(), 600, None).expect("sealing succeeds");
 
         assert!(matches!(
             open_flow(&key(), &sealed),
@@ -556,7 +595,8 @@ mod tests {
     #[test]
     fn an_expired_cookie_is_rejected() {
         // Expired 400s ago: well past the 60s default leeway.
-        let sealed = seal_flow(&key(), "s", "n", "v", now() - 1000, 600).expect("sealing succeeds");
+        let sealed =
+            seal_flow(&key(), "s", "n", "v", now() - 1000, 600, None).expect("sealing succeeds");
 
         assert!(matches!(
             open_flow(&key(), &sealed),

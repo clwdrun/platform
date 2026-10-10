@@ -142,6 +142,19 @@ id! {
 }
 
 id! {
+    /// An app-host session's row — never its cookie secret. Distinct from
+    /// [`SessionId`]: an app-host session is a child of a control-plane
+    /// session, and passing one where the other belongs is how a per-app
+    /// session would come to authenticate the control plane.
+    AppSessionId
+}
+
+id! {
+    /// A sign-in handshake's row — never its state or code.
+    HandshakeId
+}
+
+id! {
     /// An API token's row — never its secret.
     ///
     /// Safe to log, return and put in a URL: knowing it grants nothing, which
