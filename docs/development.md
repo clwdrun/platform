@@ -366,7 +366,8 @@ serve an app from the control plane's domain, as a shortcut.
 The two are separate configuration values and separate types
 (`shared::domains::ControlPlaneDomain`, `shared::domains::AppsDomain`); the gateway
 refuses to start if they share a registrable domain. The apps domain is a
-placeholder (`clwd-apps.test`) until one is registered.
+placeholder (`clwd-apps.test`) until one is registered. The decision, the cookies, the sign-in handshake and what an
+app's page can still do are in `docs/decisions/0001-session-isolation.md`.
 
 ## Identity and sharing
 
