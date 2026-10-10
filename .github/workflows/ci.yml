@@ -97,6 +97,21 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Free runner disk, in the background. ubuntu-latest has ~10 GB free
+      # before this; the gate's target/ is ~6 GB beside the restored cache and
+      # registry, which left 1.5 GB in a measured run — too thin, since a full
+      # disk shows up as rust-lld SIGBUS linking a test binary. Deleting these
+      # preinstalled toolchains frees ~25 GB but took 3.5 minutes in the
+      # foreground; run alongside cache restore and tool installs, it costs
+      # nothing, and the step before `just check` waits for whatever is left.
+      # Docker images are not pruned here: Pebble's are pulled concurrently.
+      - name: Free runner disk space (background)
+        run: |
+          nohup sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /usr/local/share/boost /usr/lib/jvm "$AGENT_TOOLSDIRECTORY" \
+            > /tmp/free-disk.log 2>&1 &
+          echo $! > /tmp/free-disk.pid
+
       # rust-toolchain.toml pins the version and components. Installing via
       # rustup rather than an action keeps one source of truth for which
       # compiler this workspace builds with.
@@ -116,8 +131,14 @@ jobs:
             url."https://x-access-token:${{ secrets.CLWD_READ_TOKEN }}@github.com/".insteadOf \
             "https://github.com/"
 
+      # `key` is a cache generation, bumped when something that changes every
+      # artifact changes but is not in the default key — the build profile is
+      # not. Without the bump, the old full-debuginfo cache kept restoring as a
+      # "full match", every run rebuilt cold, and no new cache was ever saved.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: lean-debuginfo
 
       # Isolated, and early. Every later step depends on this having worked, and
       # a credential problem that first surfaces inside a compile reads as a
@@ -203,15 +224,18 @@ jobs:
       # One command, the same one a developer runs. Its steps are:
       # secrets, fmt-check, seam, rollback-plans, migrate, clippy,
       # sqlx-prepared, offline-build, migrate-roundtrip, test, deny.
+      - name: Wait for the disk to be freed
+        run: |
+          pid=$(cat /tmp/free-disk.pid)
+          for _ in $(seq 1 120); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          df -h /
+
       - name: just check
         run: just check
 
-      # The headroom, printed. This job used to spend three and a half minutes
-      # deleting preinstalled toolchains because a full-debuginfo build
-      # overflowed the runner's ~14 GB (rust-lld SIGBUS linking a test binary).
-      # With dependency debuginfo off (Cargo.toml [profile.dev]) a full gate
-      # leaves ~6 GB in target/. If this number gets close to zero, look at
-      # target/ before bringing the deletion step back.
+      # The headroom, printed, so a build creeping toward the disk limit is
+      # visible before it becomes a SIGBUS. A full gate leaves ~6 GB in target/
+      # with dependency debuginfo off (Cargo.toml [profile.dev]).
       - name: Disk headroom after the gate
         if: always()
         run: df -h / && du -sh target
