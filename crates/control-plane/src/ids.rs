@@ -162,6 +162,34 @@ id! {
     TokenId
 }
 
+/// The subject an app sees for one visitor: pairwise, per (app, user).
+///
+/// Not an [`id!`] type, on purpose: there is no `new()`. A subject is a random
+/// UUIDv4 the database generates when the pair is first seen (see the
+/// `app_subjects` migration); minting one here would invite a v7, which leaks
+/// the time of the first visit. Only read back, and handed to the app in place
+/// of the user id, which this type exists to stop being confused with.
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize, sqlx::Type,
+)]
+#[sqlx(transparent)]
+#[serde(transparent)]
+pub struct AppSubject(Uuid);
+
+impl AppSubject {
+    /// The underlying UUID.
+    #[must_use]
+    pub fn as_uuid(&self) -> Uuid {
+        self.0
+    }
+}
+
+impl fmt::Display for AppSubject {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, f)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

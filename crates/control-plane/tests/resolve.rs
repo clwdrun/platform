@@ -1,7 +1,7 @@
 //! The internal host-resolution route: mapping `{app}.{org}` to a live app for
 //! the gateway, and who is allowed to ask.
 //!
-//! Coverage is both halves: the query (`db::resolve_app`) resolves only live
+//! Coverage is both halves: the query (`db::resolve_live_app`) resolves only live
 //! apps, and the route (`GET /internal/orgs/{org}/apps/{app}`) serves only the
 //! holder of the platform-internal credential — no customer token, and nothing
 //! at all when the credential is unconfigured.
@@ -50,26 +50,57 @@ async fn the_query_resolves_only_live_apps(pool: PgPool) {
         .expect("app");
 
     assert!(
-        db::resolve_app(&pool, "acme", "dashboard")
+        db::resolve_live_app(&pool, "acme", "dashboard")
             .await
             .expect("query")
             .is_some(),
         "a live app resolves"
     );
     assert!(
-        db::resolve_app(&pool, "acme", "ghost")
+        db::resolve_live_app(&pool, "acme", "ghost")
             .await
             .expect("query")
             .is_none(),
         "an unknown app in a known org does not resolve"
     );
     assert!(
-        db::resolve_app(&pool, "ghost", "dashboard")
+        db::resolve_live_app(&pool, "ghost", "dashboard")
             .await
             .expect("query")
             .is_none(),
         "an app under an unknown org does not resolve"
     );
+}
+
+/// The version to run is the newest `ready` one: none before a publish
+/// completes, and never a `pending` or `failed` one.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_digest_is_the_newest_ready_version(pool: PgPool) {
+    let org = db::create_org(&pool, "acme").await.expect("org");
+    let app = db::create_app(&pool, org.id, "dashboard", "wasm")
+        .await
+        .expect("app");
+    let digest = |n: u8| format!("blake3:{}", format!("{n:02x}").repeat(32));
+    let live = || async {
+        db::resolve_live_app(&pool, "acme", "dashboard")
+            .await
+            .expect("query")
+            .expect("resolves")
+            .digest
+    };
+    assert_eq!(live().await, None, "nothing published yet");
+
+    for (n, state) in [(1, "ready"), (2, "ready"), (3, "pending"), (4, "failed")] {
+        sqlx::query("insert into app_versions (id, app_id, digest, state) values ($1, $2, $3, $4)")
+            .bind(uuid::Uuid::now_v7())
+            .bind(app.id.as_uuid())
+            .bind(digest(n))
+            .bind(state)
+            .execute(&pool)
+            .await
+            .expect("version");
+    }
+    assert_eq!(live().await, Some(digest(2)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

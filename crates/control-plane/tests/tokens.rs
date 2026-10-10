@@ -81,6 +81,10 @@ async fn an_org_and_app(pool: &PgPool, slug: &str) -> (OrgId, AppId) {
 
 /// A real bundle, built the way `clwd build` builds one.
 fn a_bundle(body: &[u8]) -> Body {
+    a_bundle_with_egress(body, &[])
+}
+
+fn a_bundle_with_egress(body: &[u8], egress: &[&str]) -> Body {
     const PREAMBLE: [u8; 8] = [0x00, 0x61, 0x73, 0x6d, 0x0d, 0x00, 0x01, 0x00];
     let mut data = PREAMBLE.to_vec();
     data.extend_from_slice(body);
@@ -89,7 +93,7 @@ fn a_bundle(body: &[u8]) -> Body {
         "app.wasm",
         clwd_bundle::Capabilities {
             version: 1,
-            egress: vec![],
+            egress: egress.iter().map(|h| (*h).to_owned()).collect(),
             secrets: vec![],
             storage_namespaces: vec![],
             limits: clwd_bundle::Limits {
@@ -580,4 +584,46 @@ async fn the_first_publish_requests_the_orgs_certificate(pool: PgPool) {
     assert_eq!(again.status, StatusCode::OK);
     assert_eq!(again.json["certificate"]["status"], "pending");
     assert_eq!(rows().await, 1, "one certificate per org");
+}
+
+/// A manifest that grants egress is refused at publish, before anything is
+/// claimed or stored: deployed apps cannot use egress until it is filtered by
+/// address, and a developer should learn that at deploy, not on the first
+/// request.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_bundle_granting_egress_is_refused_at_publish(pool: PgPool) {
+    let state = state(&pool);
+    let (org, app) = an_org_and_app(&pool, "acme").await;
+    let (_, publish) = token(&pool, org, None, &["publish"]).await;
+
+    let refused = send(
+        &state,
+        "POST",
+        &format!("/v1/apps/{app}/versions"),
+        Some(&publish),
+        a_bundle_with_egress(b"egress", &["api.example.com"]),
+    )
+    .await;
+    assert_eq!(
+        refused.status,
+        StatusCode::BAD_REQUEST,
+        "{:?}",
+        refused.json
+    );
+    assert_eq!(refused.json["code"], "control-plane.egress_not_supported");
+    let rows: i64 = sqlx::query_scalar("select count(*) from app_versions")
+        .fetch_one(&pool)
+        .await
+        .expect("count");
+    assert_eq!(rows, 0, "a refused bundle leaves no version row");
+
+    let accepted = send(
+        &state,
+        "POST",
+        &format!("/v1/apps/{app}/versions"),
+        Some(&publish),
+        a_bundle(b"no egress"),
+    )
+    .await;
+    assert_eq!(accepted.status, StatusCode::CREATED, "{:?}", accepted.json);
 }

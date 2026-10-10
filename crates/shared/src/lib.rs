@@ -4,6 +4,7 @@ pub mod cert;
 pub mod cookie;
 pub mod domains;
 pub mod error;
+pub mod hop;
 pub mod limits;
 pub mod return_path;
 

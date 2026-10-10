@@ -92,6 +92,8 @@ pub enum Route {
     App {
         app_id: String,
         org_id: String,
+        /// The version to run; `None` until one is published.
+        digest: Option<String>,
         stale: bool,
     },
     /// The host is not a live app: answer 404.
@@ -103,16 +105,25 @@ pub enum Route {
 /// A resolved answer, as cached.
 #[derive(Debug, Clone)]
 enum Resolution {
-    Found { app_id: String, org_id: String },
+    Found {
+        app_id: String,
+        org_id: String,
+        digest: Option<String>,
+    },
     Unknown,
 }
 
 impl Resolution {
     fn to_route(&self, stale: bool) -> Route {
         match self {
-            Self::Found { app_id, org_id } => Route::App {
+            Self::Found {
+                app_id,
+                org_id,
+                digest,
+            } => Route::App {
                 app_id: app_id.clone(),
                 org_id: org_id.clone(),
+                digest: digest.clone(),
                 stale,
             },
             Self::Unknown => Route::Unknown,
@@ -131,6 +142,7 @@ struct Entry {
 struct ResolvedApp {
     app_id: String,
     org_id: String,
+    digest: Option<String>,
 }
 
 /// Why a single control-plane fetch did not produce an answer.
@@ -299,6 +311,7 @@ impl RouteLookup {
                 Ok(Resolution::Found {
                     app_id: app.app_id,
                     org_id: app.org_id,
+                    digest: app.digest,
                 })
             }
             StatusCode::NOT_FOUND => Ok(Resolution::Unknown),
@@ -333,6 +346,7 @@ mod tests {
                 Resolution::Found {
                     app_id: "00000000-0000-7000-8000-0000000000a1".to_owned(),
                     org_id: "00000000-0000-7000-8000-0000000000b2".to_owned(),
+                    digest: None,
                 },
             )
             .await;

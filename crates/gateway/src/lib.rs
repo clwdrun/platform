@@ -12,3 +12,4 @@ pub mod lookup;
 pub mod signin;
 pub mod tls;
 pub mod upstream;
+pub mod worker;

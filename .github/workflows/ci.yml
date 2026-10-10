@@ -1,6 +1,10 @@
 # The gate, in CI.
 #
-# This runs `just check` and nothing else. The gate is defined in the justfile
+# This runs `just check` and nothing else, split into two parallel jobs:
+# `just gate`, and the release worker build (`just
+# release-worker-has-no-dev-caller`), whose cold wasmtime build would otherwise
+# add ~8 minutes to the gate's wall clock. Together they are exactly `just
+# check`; neither is ever skipped. The gate is defined in the justfile
 # so that what CI enforces and what a developer can run before pushing are the
 # same list — a CI-only check is one nobody can reproduce, and a local-only
 # check is one nobody runs.
@@ -239,13 +243,49 @@ jobs:
           done
           df -h /
 
-      - name: just check
-        run: just check
+      - name: just gate
+        run: just gate
 
       # The headroom, printed, so a build creeping toward the disk limit is
       # visible before it becomes a SIGBUS. A full gate leaves ~6 GB in target/
       # with dependency debuginfo off (Cargo.toml [profile.dev]).
       - name: Disk headroom after the gate
+        if: always()
+        run: df -h / && du -sh target
+
+  # The other half of `just check`, in parallel with the gate: the release
+  # worker builds, and its tree reaches no dev or fake caller (#11).
+  release-worker:
+    name: release worker has no dev caller
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install Rust from rust-toolchain.toml
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Authenticate for the clwd seam dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.CLWD_READ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: Cache cargo build
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: release-worker
+
+      - name: Install just
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: just
+
+      - name: just release-worker-has-no-dev-caller
+        run: just release-worker-has-no-dev-caller
+
+      - name: Disk headroom
         if: always()
         run: df -h / && du -sh target
 
@@ -284,7 +324,15 @@ jobs:
             echo "::error::no tag found on the clwd-bundle pin in Cargo.toml. If the dependency was renamed or respelled, this parser needs updating — it is what keeps the standalone build following the real pin."
             exit 1
           fi
-          locked=$(sed -n 's|^source = "git+https://github.com/clwdrun/clwd?tag=\([^#]*\)#.*|\1|p' Cargo.lock)
+          # clwd-runtime moves with clwd-bundle, always: one tag for both.
+          runtime=$(sed -n 's/^clwd-runtime = .*tag = "\([^"]*\)".*/\1/p' Cargo.toml)
+          if [ "$runtime" != "$tag" ]; then
+            echo "::error::clwd-bundle is pinned to $tag but clwd-runtime to ${runtime:-nothing}. The two move together; pin both to one tag."
+            exit 1
+          fi
+          # Every clwd crate in the lock, deduplicated: there is one source line
+          # per crate, and all of them must name the same tag.
+          locked=$(sed -n 's|^source = "git+https://github.com/clwdrun/clwd?tag=\([^#]*\)#.*|\1|p' Cargo.lock | sort -u)
           if [ "$tag" != "$locked" ]; then
             echo "::error::Cargo.toml pins $tag but Cargo.lock resolved $locked. Run \`cargo update -p clwd-bundle\` and commit the lock; until then the gate and this job build different versions of the seam."
             exit 1

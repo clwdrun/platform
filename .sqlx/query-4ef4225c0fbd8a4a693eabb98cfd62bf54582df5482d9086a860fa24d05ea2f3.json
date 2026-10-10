@@ -1,0 +1,63 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "with h as (\n               delete from handshakes\n                where code_sha256 = $1 and state_sha256 = $2 and code_expires_at > now()\n               returning app_id, parent_session_id, return_path\n           ),\n           parent as (\n               select s.id, s.user_id, s.expires_at from sessions s\n                 join h on s.id = h.parent_session_id\n                where s.revoked_at is null and s.expires_at > now()\n           ),\n           -- The visitor's pairwise subject for this app, created on their\n           -- first exchange and kept forever. A concurrent first exchange for\n           -- the same pair meets this one on the primary key and does nothing,\n           -- so both read back the one subject at their next check.\n           subject as (\n               insert into app_subjects (app_id, user_id)\n               select h.app_id, parent.user_id from h, parent\n               on conflict (app_id, user_id) do nothing\n           )\n           insert into app_sessions (id, parent_session_id, app_id, secret_sha256, expires_at)\n           select $3, parent.id, h.app_id, $4,\n                  least(now() + ($5::bigint * interval '1 second'), parent.expires_at)\n             from h, parent\n           returning id as \"id: AppSessionId\", app_id as \"app_id: AppId\", expires_at,\n                     (select return_path from h) as \"return_path!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id: AppSessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "app_sessions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "app_id: AppId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "app_sessions",
+            "name": "app_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "app_sessions",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "return_path!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Bytea",
+        "Uuid",
+        "Bytea",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "4ef4225c0fbd8a4a693eabb98cfd62bf54582df5482d9086a860fa24d05ea2f3"
+}

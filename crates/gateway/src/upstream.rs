@@ -27,7 +27,9 @@
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use clwd_bundle::BundleRef;
 use http::{HeaderMap, Method, StatusCode};
+use shared::hop::Caller;
 
 /// The app a request is forwarded to, as the control plane resolved it.
 /// Built only by the gateway; there is no public constructor.
@@ -35,11 +37,22 @@ use http::{HeaderMap, Method, StatusCode};
 pub struct AppTarget {
     app_id: String,
     org_id: String,
+    digest: BundleRef,
 }
 
 impl AppTarget {
-    pub(crate) fn new(app_id: String, org_id: String) -> Self {
-        Self { app_id, org_id }
+    pub(crate) fn new(app_id: String, org_id: String, digest: BundleRef) -> Self {
+        Self {
+            app_id,
+            org_id,
+            digest,
+        }
+    }
+
+    /// The version to run: the newest published one the control plane named.
+    #[must_use]
+    pub fn digest(&self) -> &BundleRef {
+        &self.digest
     }
 
     /// The resolved app's id.
@@ -59,6 +72,8 @@ impl AppTarget {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UpstreamRequest {
+    /// Who is calling, from the gateway's session check. Never a header.
+    pub caller: Caller,
     pub method: Method,
     /// The path and query the visitor asked for, as received.
     pub path_and_query: String,
@@ -68,12 +83,14 @@ pub struct UpstreamRequest {
 
 impl UpstreamRequest {
     pub(crate) fn new(
+        caller: Caller,
         method: Method,
         path_and_query: String,
         headers: HeaderMap,
         body: Bytes,
     ) -> Self {
         Self {
+            caller,
             method,
             path_and_query,
             headers,
@@ -123,6 +140,72 @@ pub trait AppUpstream: Send + Sync {
     ) -> Result<UpstreamResponse, UpstreamError>;
 }
 
+/// Headers a client could send to claim an identity or an origin, or that a
+/// proxy in front of us would add. All of them are removed before the hop: the
+/// app's caller comes from the session check alone, and it sees no forwarding
+/// information at all (normalised client-address information can be added when
+/// an app needs it).
+const CLIENT_IDENTITY: &[&str] = &[
+    "forwarded",
+    "x-real-ip",
+    "x-client-ip",
+    "true-client-ip",
+    "cf-connecting-ip",
+];
+/// Prefixes removed for the same reason: `x-clwd-*` is the platform's
+/// namespace, and `x-forwarded-*` is a proxy's.
+const CLIENT_IDENTITY_PREFIXES: &[&str] = &["x-clwd-", "x-forwarded-"];
+/// Hop-by-hop headers (RFC 9110 §7.6.1): they describe one connection and
+/// never cross a proxy, in either direction.
+const HOP_BY_HOP: &[&str] = &[
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authenticate",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
+
+/// Remove every header that could carry a client-chosen identity or origin,
+/// and the hop-by-hop ones.
+pub fn strip_client_identity(headers: &mut HeaderMap) {
+    let names: Vec<http::HeaderName> = headers
+        .keys()
+        .filter(|name| {
+            let name = name.as_str();
+            CLIENT_IDENTITY.contains(&name)
+                || CLIENT_IDENTITY_PREFIXES.iter().any(|p| name.starts_with(p))
+        })
+        .cloned()
+        .collect();
+    for name in names {
+        headers.remove(name);
+    }
+    strip_hop_by_hop(headers);
+}
+
+/// Remove hop-by-hop headers, including any the `Connection` header names.
+pub fn strip_hop_by_hop(headers: &mut HeaderMap) {
+    let named: Vec<String> = headers
+        .get_all(http::header::CONNECTION)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .flat_map(|v| v.split(','))
+        .map(|n| n.trim().to_ascii_lowercase())
+        .filter(|n| !n.is_empty())
+        .collect();
+    for name in HOP_BY_HOP
+        .iter()
+        .copied()
+        .chain(named.iter().map(String::as_str))
+    {
+        headers.remove(name);
+    }
+}
+
 /// Remove `Set-Cookie` headers that would set a platform cookie, keeping the
 /// app's own. Returns how many were removed.
 pub fn drop_platform_set_cookies(headers: &mut HeaderMap) -> usize {
@@ -148,6 +231,36 @@ pub fn drop_platform_set_cookies(headers: &mut HeaderMap) -> usize {
 mod tests {
     use super::*;
     use http::HeaderValue;
+
+    #[test]
+    fn client_identity_and_hop_by_hop_headers_are_stripped() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("x-clwd-caller", "someone-else"),
+            ("X-Clwd-Subject", "forged"),
+            ("forwarded", "for=1.2.3.4"),
+            ("x-forwarded-for", "1.2.3.4"),
+            ("x-forwarded-host", "evil.example"),
+            ("x-real-ip", "1.2.3.4"),
+            ("x-client-ip", "1.2.3.4"),
+            ("true-client-ip", "1.2.3.4"),
+            ("cf-connecting-ip", "1.2.3.4"),
+            ("connection", "keep-alive, x-secret-hop"),
+            ("x-secret-hop", "1"),
+            ("upgrade", "websocket"),
+            ("accept", "text/html"),
+            ("x-app-header", "kept"),
+        ] {
+            headers.append(
+                http::HeaderName::from_bytes(name.as_bytes()).expect("name"),
+                HeaderValue::from_static(value),
+            );
+        }
+        strip_client_identity(&mut headers);
+        let mut left: Vec<&str> = headers.keys().map(http::HeaderName::as_str).collect();
+        left.sort_unstable();
+        assert_eq!(left, ["accept", "x-app-header"]);
+    }
 
     #[test]
     fn platform_set_cookies_are_dropped_and_the_apps_kept() {

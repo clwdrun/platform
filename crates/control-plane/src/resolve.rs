@@ -18,12 +18,13 @@ use crate::http::{AppState, render};
 use crate::ids::{AppId, OrgId};
 use crate::openapi::{Doc, Success};
 
-/// What the gateway learns about a resolved host. Ids only: choosing a version
-/// to serve is #11's concern, and the schema has no live-version pointer yet.
+/// What the gateway learns about a resolved host: the app, and the digest of
+/// the version to run (the newest `ready` one; `null` until one is published).
 #[derive(serde::Serialize)]
 struct Resolution {
     app_id: AppId,
     org_id: OrgId,
+    digest: Option<String>,
 }
 
 /// Resolve `{org}`/`{app}` to the live app, or 404 when there is none.
@@ -37,10 +38,11 @@ pub async fn resolve(
     Path((org, app)): Path<(String, String)>,
     axum::Extension(request_id): axum::Extension<RequestId>,
 ) -> Response {
-    match db::resolve_app(&state.pool, &org, &app).await {
+    match db::resolve_live_app(&state.pool, &org, &app).await {
         Ok(Some(found)) => Json(Resolution {
             app_id: found.id,
             org_id: found.org_id,
+            digest: found.digest,
         })
         .into_response(),
         Ok(None) => render(

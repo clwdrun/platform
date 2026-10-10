@@ -1,4 +1,5 @@
-//! Session isolation, in a real browser (#62).
+//! Session isolation, in a real browser (#62), and identity injection with
+//! the real worker running a real component (#11).
 //!
 //! A test of what the server sends is not a test of what the browser accepts:
 //! cookie prefixes, `Domain` scoping and overwrite rules are browser
@@ -227,6 +228,10 @@ async fn one_app_cannot_plant_platform_cookies_on_another(pool: PgPool) {
     let h = Harness::start(pool).await;
     let chrome = h.browser().await;
     let page = open_app(&chrome, NOTES, "/").await;
+    // App B is another org's. Under the interim member rule the visitor must
+    // be able to reach it for the attack to exist at all — as a grant will
+    // allow once #15/#16 land.
+    h.join("other").await;
     open_app(&chrome, ATTACKER_APP, "/").await;
     let session = cookie(&chrome, &page, NOTES, APP_SESSION).await;
     for c in [
@@ -607,5 +612,510 @@ async fn no_code_or_state_is_ever_logged(pool: PgPool) {
         ("session", &session),
     ] {
         assert!(!text.contains(value.as_str()), "a {what} reached the logs");
+    }
+}
+
+/// The interim access rule (#12 replaces it): a signed-in visitor who is not a
+/// member of the app's org gets `gateway.not_a_member`, and nothing reaches the
+/// hop — not the page, not anything after it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_member_reaches_no_app_code(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let chrome = h.browser().await;
+    open_app(&chrome, NOTES, "/").await;
+    let page = chrome
+        .open(&format!("https://{ATTACKER_APP}/probe-non-member"))
+        .await;
+    let body = text(&page).await;
+    assert!(body.contains("gateway.not_a_member"), "{body}");
+    assert!(
+        !h.upstream.saw_anywhere("/probe-non-member"),
+        "a non-member's request reached the hop"
+    );
+    assert!(
+        h.upstream
+            .seen_paths
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|(app, _)| *app != "page"),
+        "no request of any kind reached the non-member's app"
+    );
+}
+
+// ======================================================================
+// Identity injection (#11): the real worker, running the whoami fixture.
+//
+// Each test asserts what the app saw — the fixture echoes its caller and
+// every header it received — or how many times app code ran.
+// ======================================================================
+
+/// A visitor made directly in the database, the way sign-in and the exchange
+/// make one: a user, a control-plane session, their pairwise subject for an
+/// app in `acme`, and an app-host session for it.
+struct Visitor {
+    /// The `Cookie` pair for the app-host session.
+    cookie: String,
+    /// The subject `notes` should see.
+    subject: String,
+    /// The control-plane session the app session hangs off.
+    parent: control_plane::ids::SessionId,
+}
+
+async fn visitor(pool: &PgPool, email: &str, member: bool) -> Visitor {
+    visitor_of(pool, "notes", email, member).await
+}
+
+async fn visitor_of(pool: &PgPool, app: &str, email: &str, member: bool) -> Visitor {
+    let user = control_plane::db::create_user(pool, email)
+        .await
+        .expect("user");
+    let parent = session::issue(pool, &cookie_key(), user.id)
+        .await
+        .expect("issue")
+        .expect("a session")
+        .id;
+    let app: uuid::Uuid = sqlx::query_scalar(
+        "select a.id from apps a join orgs o on o.id = a.org_id where o.slug = 'acme' and a.name = $1",
+    )
+    .bind(app)
+    .fetch_one(pool)
+    .await
+    .expect("the app");
+    let secret: String = rand::random::<[u8; 32]>()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    use sha2::Digest as _;
+    sqlx::query(
+        "insert into app_sessions (id, parent_session_id, app_id, secret_sha256, expires_at)
+         values ($1, $2, $3, $4, now() + interval '1 hour')",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(parent.as_uuid())
+    .bind(app)
+    .bind(sha2::Sha256::digest(secret.as_bytes()).to_vec())
+    .execute(pool)
+    .await
+    .expect("app session");
+    let subject: String = sqlx::query_scalar(
+        "insert into app_subjects (app_id, user_id) values ($1, $2) returning subject::text",
+    )
+    .bind(app)
+    .bind(user.id.as_uuid())
+    .fetch_one(pool)
+    .await
+    .expect("subject");
+    if member {
+        sqlx::query(
+            "insert into org_members (org_id, user_id, joined_via)
+             select id, $1, 'claimant' from orgs where slug = 'acme'",
+        )
+        .bind(user.id.as_uuid())
+        .execute(pool)
+        .await
+        .expect("member");
+    }
+    Visitor {
+        cookie: format!("{APP_SESSION}={secret}"),
+        subject,
+        parent,
+    }
+}
+
+/// `GET https://notes…{path}` with `cookie` and `extra` headers: the status
+/// and, when the app answered, its JSON.
+async fn on_notes(
+    client: &reqwest::Client,
+    path: &str,
+    cookie: &str,
+    extra: &[(&str, &str)],
+) -> (reqwest::StatusCode, serde_json::Value) {
+    on_app(client, NOTES, path, cookie, extra).await
+}
+
+async fn on_app(
+    client: &reqwest::Client,
+    host: &str,
+    path: &str,
+    cookie: &str,
+    extra: &[(&str, &str)],
+) -> (reqwest::StatusCode, serde_json::Value) {
+    let mut request = client
+        .get(format!("https://{host}{path}"))
+        .header(reqwest::header::COOKIE, cookie);
+    for (name, value) in extra {
+        request = request.header(*name, *value);
+    }
+    let response = request.send().await.expect("the gateway answers");
+    let status = response.status();
+    let json = response.json().await.unwrap_or(serde_json::Value::Null);
+    (status, json)
+}
+
+fn invocations(h: &Harness) -> u64 {
+    h.worker.as_ref().expect("a worker harness").invocations()
+}
+
+/// What the fixture reports it received, as `(lowercase name, value)` pairs.
+fn echoed_headers(json: &serde_json::Value) -> Vec<(String, String)> {
+    json["headers"]
+        .as_array()
+        .expect("headers")
+        .iter()
+        .map(|pair| {
+            (
+                pair[0].as_str().unwrap_or("").to_ascii_lowercase(),
+                pair[1].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect()
+}
+
+/// Test 1, the MVP exit: a signed-in visitor gets `hello <their verified
+/// email>` from an app with no auth code in it, in a real browser.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_greets_the_signed_in_visitor_by_verified_email(pool: PgPool) {
+    let h = Harness::with_worker(pool).await;
+    let chrome = h.browser().await;
+    let page = chrome.open(&format!("https://{NOTES}/")).await;
+    let mut seen = String::new();
+    for _ in 0..50 {
+        seen = text(&page).await;
+        if seen.starts_with("hello") {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        seen.trim(),
+        format!("hello {}", support::EMAIL),
+        "{}",
+        url(&page).await
+    );
+    assert!(invocations(&h) >= 1);
+}
+
+/// Test 2: a client-sent identity header is ignored. The app's caller is the
+/// session's, and none of the forged headers reach it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_forged_identity_header_changes_nothing(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let real = visitor(&pool, "real@example.com", true).await;
+    let other = visitor(&pool, "other@example.com", true).await;
+    let forged: &[(&str, &str)] = &[
+        ("x-clwd-caller", &other.subject),
+        ("x-clwd-subject", &other.subject),
+        ("x-clwd-email", "other@example.com"),
+        ("forwarded", "for=6.6.6.6"),
+        ("x-forwarded-for", "6.6.6.6"),
+        ("x-forwarded-host", "evil.example"),
+        ("x-forwarded-proto", "http"),
+        ("x-real-ip", "6.6.6.6"),
+        ("x-client-ip", "6.6.6.6"),
+        ("true-client-ip", "6.6.6.6"),
+        ("cf-connecting-ip", "6.6.6.6"),
+    ];
+    let (status, json) = on_notes(&h.http(), "/whoami", &real.cookie, forged).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(json["caller"]["subject"], real.subject.as_str());
+    assert_eq!(json["caller"]["email"], "real@example.com");
+    let headers = echoed_headers(&json);
+    for (name, _) in forged {
+        assert!(
+            headers.iter().all(|(n, _)| n != name),
+            "{name} reached the app: {headers:?}"
+        );
+    }
+    assert!(
+        headers.iter().all(|(_, v)| !v.contains(&other.subject)),
+        "the forged subject reached the app"
+    );
+}
+
+/// Test 3: no platform cookie reaches app code, asserted at the wasm boundary
+/// with the fixture's echo. The app's own cookie does.
+#[sqlx::test(migrations = "../../migrations")]
+async fn no_platform_cookie_reaches_the_wasm_boundary(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let cookies = format!(
+        "{}; __Host-clwd_session=cp; __Secure-clwd_session=apex; __Host-clwd_state=st; app_theme=dark",
+        v.cookie
+    );
+    let (status, json) = on_notes(&h.http(), "/whoami", &cookies, &[]).await;
+    assert_eq!(status, 200, "{json}");
+    let cookie: String = echoed_headers(&json)
+        .into_iter()
+        .filter(|(n, _)| n == "cookie")
+        .map(|(_, v)| v.to_ascii_lowercase())
+        .collect();
+    assert!(cookie.contains("app_theme=dark"), "{cookie}");
+    assert!(
+        !cookie.contains("__host-clwd") && !cookie.contains("__secure-clwd"),
+        "a platform cookie reached the app: {cookie}"
+    );
+}
+
+/// Test 4: concurrent requests from different visitors each see only their
+/// own caller. 64 visitors, 4 requests each, 256 in all, 64 in flight at a
+/// time: overlapping invocations on a handful of worker threads. A caller kept anywhere
+/// across invocations shows up as the wrong subject, and one overwritten
+/// mid-request as `caller_after` disagreeing with `caller`.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_visitors_each_see_only_themselves(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let mut visitors = Vec::new();
+    for i in 0..64 {
+        visitors.push(visitor(&pool, &format!("v{i}@example.com"), true).await);
+    }
+    let client = h.http();
+    let requests = visitors
+        .iter()
+        .flat_map(|v| std::iter::repeat_n(v, 4))
+        .map(|v| {
+            let client = client.clone();
+            async move { (v, on_notes(&client, "/whoami", &v.cookie, &[]).await) }
+        });
+    // At most 64 in flight: 16× the worker's threads, so invocations overlap
+    // throughout, without queuing all 256 session checks at once behind the
+    // control plane, which shares this test's single thread.
+    use futures::StreamExt as _;
+    let answers: Vec<_> = futures::stream::iter(requests)
+        .buffer_unordered(64)
+        .collect()
+        .await;
+    assert_eq!(answers.len(), 256);
+    for (v, (status, json)) in answers {
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["caller"]["subject"], v.subject.as_str(), "{json}");
+        assert_eq!(json["caller_after"], json["caller"], "{json}");
+    }
+}
+
+/// Test 5: revoking the parent session runs nothing on the next request.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoked_session_runs_nothing(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 200, "positive control: the session works");
+    sqlx::query("update sessions set revoked_at = now() where id = $1")
+        .bind(v.parent.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    let before = invocations(&h);
+    let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
+    assert_ne!(status, 200);
+    assert_eq!(invocations(&h), before, "a revoked session ran app code");
+}
+
+/// Test 6: a signed-in non-member of the app's org runs nothing.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_member_runs_nothing(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "outsider@example.net", false).await;
+    let (status, json) = on_notes(&h.http(), "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 403, "{json}");
+    assert_eq!(json["code"], "gateway.not_a_member");
+    assert_eq!(invocations(&h), 0);
+}
+
+/// Store `bundle` and make it the newest ready version of `wiki`. Not `notes`:
+/// the harness's startup probe has the gateway's route cache holding notes'
+/// first version, and wiki has never been resolved.
+async fn publish_to_wiki(h: &Harness, bundle: bytes::Bytes) -> clwd_bundle::BundleRef {
+    let validated = builder::validate(bundle).expect("validates");
+    h.artifacts.put(&validated).await.expect("stored");
+    sqlx::query(
+        "insert into app_versions (id, app_id, digest, state)
+         select $1, a.id, $2, 'ready' from apps a join orgs o on o.id = a.org_id
+          where o.slug = 'acme' and a.name = 'wiki'",
+    )
+    .bind(uuid::Uuid::now_v7())
+    .bind(validated.digest().to_string())
+    .execute(&h.pool)
+    .await
+    .expect("version");
+    *validated.digest()
+}
+
+/// Test 7: an artifact whose bytes no longer match its digest is refused
+/// before anything is instantiated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_tampered_artifact_is_refused_before_it_runs(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor_of(&pool, "wiki", "v@example.com", true).await;
+    // A version of its own (another cpu budget, so another digest), so the
+    // other apps' artifact is untouched.
+    let wasm = support::WHOAMI.to_vec();
+    let encoded = clwd_bundle::build(
+        clwd_bundle::Runtime::Wasm,
+        "app.wasm",
+        clwd_bundle::Capabilities {
+            version: 1,
+            egress: vec![],
+            secrets: vec![],
+            storage_namespaces: vec![],
+            limits: clwd_bundle::Limits {
+                cpu_ms: 4_999,
+                memory_mb: 128,
+            },
+        },
+        vec![clwd_bundle::File {
+            path: "app.wasm".into(),
+            data: wasm,
+            executable: false,
+        }],
+    )
+    .expect("encodes");
+    let digest = publish_to_wiki(&h, bytes::Bytes::from(encoded.bytes)).await;
+
+    let mut stored = h
+        .artifacts
+        .get_bytes(&digest)
+        .await
+        .expect("stored")
+        .to_vec();
+    let middle = stored.len() / 2;
+    stored[middle] ^= 0x01;
+    let recompressed = zstd::encode_all(stored.as_slice(), 3).expect("compress");
+    h.operator
+        .write(builder::ArtifactKey::bundle(&digest).as_str(), recompressed)
+        .await
+        .expect("tamper");
+
+    let (status, json) = on_app(&h.http(), WIKI, "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 502, "{json}");
+    assert_eq!(json["code"], "gateway.app_unreachable");
+    assert_eq!(invocations(&h), 0, "a tampered artifact ran");
+}
+
+/// The worker is the authoritative egress refusal: a version whose manifest
+/// grants egress (stored around publish, which refuses it too) never runs.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_worker_refuses_a_bundle_that_grants_egress(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor_of(&pool, "wiki", "v@example.com", true).await;
+    publish_to_wiki(
+        &h,
+        support::bundle_of(support::WHOAMI, &["169.254.169.254"]),
+    )
+    .await;
+    let (status, json) = on_app(&h.http(), WIKI, "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 502, "{json}");
+    assert_eq!(invocations(&h), 0, "a bundle granting egress ran");
+}
+
+/// A worker is untrusted: one that answers with a platform `Set-Cookie`, an
+/// oversized frame, a malformed frame or an oversized body is stripped or
+/// refused, and the gateway keeps serving.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_misbehaving_worker_is_contained(pool: PgPool) {
+    use shared::hop::{self, RequestHead, ResponseHead};
+    use tokio::io::AsyncWriteExt as _;
+
+    let socket = support::socket_path();
+    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let Ok((head, _)) = hop::read_frame::<_, RequestHead>(&mut stream).await else {
+                    return;
+                };
+                match head.path_and_query.as_str() {
+                    "/cookie" => {
+                        let answer = ResponseHead::answer(
+                            200,
+                            vec![
+                                (
+                                    "set-cookie".into(),
+                                    b"__Host-clwd_app_session=planted; Path=/; Secure".to_vec(),
+                                ),
+                                ("set-cookie".into(), b"theme=dark; Path=/".to_vec()),
+                            ],
+                        );
+                        let _ = hop::write_frame(&mut stream, &answer, b"ok").await;
+                    }
+                    "/oversized" => {
+                        let _ = stream.write_all(&(hop::MAX_HEAD + 1).to_be_bytes()).await;
+                    }
+                    // Complete, well-formed frames that break a cap: a gateway
+                    // without the cap would read them whole and answer 200.
+                    "/huge-body" => {
+                        let answer = serde_json::to_vec(&ResponseHead::answer(200, vec![]))
+                            .expect("encodes");
+                        let _ = stream.write_all(&(answer.len() as u32).to_be_bytes()).await;
+                        let _ = stream.write_all(&answer).await;
+                        let _ = stream.write_all(&(hop::MAX_BODY + 1).to_be_bytes()).await;
+                        let body = vec![b'x'; usize::try_from(hop::MAX_BODY + 1).expect("fits")];
+                        let _ = stream.write_all(&body).await;
+                    }
+                    "/many-headers" => {
+                        let headers = (0..=hop::MAX_HEADERS)
+                            .map(|i| (format!("x-h{i}"), b"1".to_vec()))
+                            .collect();
+                        let answer = serde_json::to_vec(&ResponseHead::answer(200, headers))
+                            .expect("encodes");
+                        let _ = stream.write_all(&(answer.len() as u32).to_be_bytes()).await;
+                        let _ = stream.write_all(&answer).await;
+                        let _ = stream.write_all(&0u64.to_be_bytes()).await;
+                    }
+                    _ => {
+                        let _ = stream.write_all(&5u32.to_be_bytes()).await;
+                        let _ = stream.write_all(b"{nope").await;
+                        let _ = stream.write_all(&0u64.to_be_bytes()).await;
+                    }
+                }
+            });
+        }
+    });
+
+    let h = Harness::with_hop(
+        pool.clone(),
+        std::sync::Arc::new(gateway::worker::WorkerUpstream::new(
+            &socket,
+            support::my_uid(),
+        )),
+    )
+    .await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    let set_cookies = |response: &reqwest::Response| -> Vec<String> {
+        response
+            .headers()
+            .get_all(reqwest::header::SET_COOKIE)
+            .iter()
+            .filter_map(|v| v.to_str().ok().map(str::to_owned))
+            .collect()
+    };
+
+    for _ in 0..2 {
+        let response = client
+            .get(format!("https://{NOTES}/cookie"))
+            .header(reqwest::header::COOKIE, &v.cookie)
+            .send()
+            .await
+            .expect("answers");
+        assert_eq!(response.status(), 200);
+        let cookies = set_cookies(&response);
+        assert!(
+            cookies.iter().any(|c| c.starts_with("theme=dark")),
+            "{cookies:?}"
+        );
+        assert!(
+            cookies.iter().all(|c| !c.contains("planted")),
+            "a platform cookie from the worker reached the browser: {cookies:?}"
+        );
+        for path in ["/oversized", "/huge-body", "/many-headers", "/malformed"] {
+            let (status, json) = on_notes(&client, path, &v.cookie, &[]).await;
+            assert_eq!(status, 502, "{path}: {json}");
+            assert_eq!(json["code"], "gateway.app_unreachable", "{path}");
+        }
     }
 }

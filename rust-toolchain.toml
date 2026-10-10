@@ -1,4 +1,7 @@
 [toolchain]
 channel = "1.97.1"
 components = ["rustfmt", "clippy"]
+# The identity tests run a real component (crates/e2e/fixtures/whoami). Without
+# the target the fixture build fails; it never skips.
+targets = ["wasm32-wasip2"]
 profile = "minimal"

@@ -26,10 +26,14 @@ use crate::signin::{
     APP_SESSION_COOKIE, AppSession, COUNTER_COOKIE, COUNTER_WINDOW_SECS, MAX_HANDSHAKES,
     STATE_COOKIE, SigninClient, begun_state_cookie, constant_time_eq, counter_cookie, state_cookie,
 };
-use crate::upstream::{AppTarget, AppUpstream, UpstreamRequest, drop_platform_set_cookies};
+use crate::upstream::{
+    AppTarget, AppUpstream, UpstreamRequest, drop_platform_set_cookies, strip_client_identity,
+    strip_hop_by_hop,
+};
 use bytes::Bytes;
 use shared::cookie::Found;
 use shared::domains::ControlPlaneDomain;
+use shared::hop::Caller;
 use shared::return_path::ReturnPath;
 
 /// A body to fall back to if serializing the envelope ever fails (it cannot —
@@ -60,6 +64,9 @@ enum Disposition {
     SignInFailed,
     /// The app could not be reached.
     AppUnreachable,
+    /// Signed in, but not a member of the app's org: the interim access rule
+    /// until #12. No app code runs.
+    NotAMember,
 }
 
 /// The path prefix the platform reserves on every app host for its own
@@ -150,6 +157,13 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "the app could not be reached",
             hint: "retry shortly",
             retryable: true,
+        },
+        Disposition::NotAMember => EnvelopeSpec {
+            status: StatusCode::FORBIDDEN,
+            code: "gateway.not_a_member",
+            message: "this app is only open to members of its organization",
+            hint: "ask an owner of the organization to add you",
+            retryable: false,
         },
         Disposition::Unavailable => EnvelopeSpec {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -322,12 +336,17 @@ impl Edge {
                 .check(&AppSession::new(value), target.app_id())
                 .await
             {
-                Ok(true) => {
+                // #12 replaces: the interim org-member rule. Refused here, so
+                // a non-member's request never reaches the hop.
+                Ok(Some(checked)) if !checked.member => {
+                    return render_disposition(Disposition::NotAMember);
+                }
+                Ok(Some(checked)) => {
                     return self
-                        .forward(serving, session, &target, forwarded_cookie)
+                        .forward(serving, session, &target, checked.caller, forwarded_cookie)
                         .await;
                 }
-                Ok(false) => {}
+                Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "app session check failed; refusing");
                     return render_disposition(Disposition::Unavailable);
@@ -437,7 +456,7 @@ impl Edge {
                     .signin
                     .check(&AppSession::new(value), target.app_id())
                     .await,
-                Ok(true)
+                Ok(Some(_))
             )
         {
             return redirect("/", Vec::new());
@@ -453,6 +472,7 @@ impl Edge {
         serving: &Serving,
         session: &mut ServerSession,
         target: &AppTarget,
+        caller: Caller,
         cookie: Option<Vec<u8>>,
     ) -> Response<Vec<u8>> {
         let mut body = Vec::new();
@@ -470,11 +490,13 @@ impl Edge {
         }
         let head = session.req_header();
         let mut headers = head.headers.clone();
+        strip_client_identity(&mut headers);
         headers.remove(header::COOKIE);
         if let Some(cookie) = cookie.and_then(|c| HeaderValue::from_bytes(&c).ok()) {
             headers.insert(header::COOKIE, cookie);
         }
         let request = UpstreamRequest::new(
+            caller,
             head.method.clone(),
             head.uri
                 .path_and_query()
@@ -484,7 +506,10 @@ impl Edge {
         );
         match serving.upstream.forward(target, request).await {
             Ok(mut upstream) => {
+                // Here, after the hop, never in the worker: the worker runs
+                // untrusted code and its output is filtered as such.
                 drop_platform_set_cookies(&mut upstream.headers);
+                strip_hop_by_hop(&mut upstream.headers);
                 let mut response = Response::new(upstream.body.to_vec());
                 *response.status_mut() = upstream.status;
                 *response.headers_mut() = upstream.headers;
@@ -528,8 +553,23 @@ impl ServeHttp for Edge {
         };
         // A live app, and an edge that serves apps: sign-in and the hop. The
         // target is the resolved row — nothing in the request chooses it.
-        if let (Some(serving), Some(Route::App { app_id, org_id, .. })) = (&self.serving, &route) {
-            let target = AppTarget::new(app_id.clone(), org_id.clone());
+        if let (
+            Some(serving),
+            Some(Route::App {
+                app_id,
+                org_id,
+                digest,
+                ..
+            }),
+        ) = (&self.serving, &route)
+        {
+            // Nothing published yet, or a digest that does not parse: there
+            // is no version to run, so the app is not ready. Answered before
+            // sign-in, so a visitor is not sent through a handshake for it.
+            let Some(digest) = digest.as_deref().and_then(|d| d.parse().ok()) else {
+                return render_disposition(Disposition::NotReady);
+            };
+            let target = AppTarget::new(app_id.clone(), org_id.clone(), digest);
             return self.serve_app(serving, session, target).await;
         }
         let disposition = disposition(route, session.req_header().uri.path());
@@ -561,6 +601,7 @@ mod tests {
                 Some(Route::App {
                     app_id: "a".to_owned(),
                     org_id: "o".to_owned(),
+                    digest: None,
                     stale: false,
                 }),
                 "/"
@@ -572,6 +613,7 @@ mod tests {
                 Some(Route::App {
                     app_id: "a".to_owned(),
                     org_id: "o".to_owned(),
+                    digest: None,
                     stale: true,
                 }),
                 "/"
@@ -590,6 +632,7 @@ mod tests {
                     Some(Route::App {
                         app_id: "a".to_owned(),
                         org_id: "o".to_owned(),
+                        digest: None,
                         stale: false,
                     }),
                     path
@@ -617,6 +660,14 @@ mod tests {
             assert!(s.retryable, "a transient not-serving state is retryable");
             assert!(s.code.starts_with("gateway."), "gateway-namespaced code");
         }
+    }
+
+    #[test]
+    fn a_non_member_is_refused_for_good() {
+        let s = spec(Disposition::NotAMember);
+        assert_eq!(s.status, StatusCode::FORBIDDEN);
+        assert_eq!(s.code, "gateway.not_a_member");
+        assert!(!s.retryable, "membership does not change on retry");
     }
 
     #[test]

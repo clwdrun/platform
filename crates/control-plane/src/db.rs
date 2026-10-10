@@ -97,22 +97,39 @@ pub async fn org_by_slug(ex: impl PgExecutor<'_>, slug: &str) -> sqlx::Result<Op
     .await
 }
 
-/// Resolve `{app}.{org}` to the live app it names, for the gateway's host
-/// router. `None` when the org or the app does not exist, is soft-deleted, or
-/// the app is not that org's — the three cases the gateway answers with a 404,
-/// deliberately indistinguishable to a caller.
-pub async fn resolve_app(
+/// A resolved host: the live app, and the version the gateway should run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveApp {
+    pub id: AppId,
+    pub org_id: OrgId,
+    /// The newest `ready` version's digest; `None` until one is published.
+    /// There is no live-version pointer yet (rollback needs one: a #11
+    /// follow-up), so "newest ready" is what runs.
+    pub digest: Option<String>,
+}
+
+/// Resolve `{app}.{org}` to the live app it names, and the version to run, for
+/// the gateway's host router. `None` when the org or the app does not exist, is
+/// soft-deleted, or the app is not that org's — the three cases the gateway
+/// answers with a 404, deliberately indistinguishable to a caller.
+pub async fn resolve_live_app(
     ex: impl PgExecutor<'_>,
     org_slug: &str,
     app_name: &str,
-) -> sqlx::Result<Option<App>> {
+) -> sqlx::Result<Option<LiveApp>> {
     sqlx::query_as!(
-        App,
-        r#"select a.id, a.org_id, a.name, a.runtime, a.created_at, a.deleted_at
-           from apps a
-           join orgs o on o.id = a.org_id
-           where o.slug = $1 and o.deleted_at is null
-             and a.name = $2 and a.deleted_at is null"#,
+        LiveApp,
+        r#"select a.id as "id: AppId", a.org_id as "org_id: OrgId", v.digest as "digest?"
+             from apps a
+             join orgs o on o.id = a.org_id
+             left join lateral (
+                 select digest from app_versions
+                  where app_id = a.id and state = 'ready'
+                  order by created_at desc, id desc
+                  limit 1
+             ) v on true
+            where o.slug = $1 and o.deleted_at is null
+              and a.name = $2 and a.deleted_at is null"#,
         org_slug,
         app_name,
     )

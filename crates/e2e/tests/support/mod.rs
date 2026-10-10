@@ -54,6 +54,10 @@ const CLIENT_ID: &str = "e2e-client.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "e2e-client-secret";
 pub const SUBJECT: &str = "e2e-google-subject";
 pub const EMAIL: &str = "visitor@example.com";
+/// The visitor's Workspace domain, verified by `acme` with auto-join on, so
+/// the visitor is a member of `acme` and of nothing else — in particular not
+/// of `other`, whose app is the non-member case.
+pub const VISITOR_DOMAIN: &str = "example.com";
 
 /// The key the control plane signs its cookies with in this harness.
 pub fn cookie_key() -> control_plane::signin::CookieKey {
@@ -261,7 +265,11 @@ async fn issuer_token(
         StandardClaims::new(SubjectIdentifier::new(SUBJECT.to_owned()))
             .set_email(Some(EndUserEmail::new(EMAIL.to_owned())))
             .set_email_verified(Some(true)),
-        identity::GoogleClaims { hd: None },
+        // A Workspace account, so sign-in joins the visitor to `acme` through
+        // the org's verified domain — the product's own path to membership.
+        identity::GoogleClaims {
+            hd: Some(VISITOR_DOMAIN.to_owned()),
+        },
     )
     .set_nonce(Some(Nonce::new(grant.nonce)));
     let token = identity::GoogleIdToken::new(
@@ -525,14 +533,94 @@ pub fn logs() -> &'static Logs {
 
 pub struct Harness {
     pub upstream: Arc<TestUpstream>,
+    /// The real worker, when started [`Harness::with_worker`].
+    pub worker: Option<Arc<worker::Worker>>,
+    /// Where artifacts are stored, shared with the worker.
+    pub artifacts: builder::ArtifactStore,
+    /// The store's raw backend, for tampering with an artifact.
+    pub operator: opendal::Operator,
+    pub pool: PgPool,
     pub control_plane_port: u16,
     pub gateway_port: u16,
     pub evil_port: u16,
 }
 
+/// The whoami fixture (`crates/e2e/fixtures/whoami`), built for wasm32-wasip2
+/// by `just fixture`. A missing build is a compile error, never a skip.
+pub const WHOAMI: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../target/fixtures/wasm32-wasip2/release/whoami.wasm"
+));
+
+/// Which hop the gateway uses.
+#[derive(Clone)]
+enum Hop {
+    /// The HTTP test upstream: what the session-isolation tests drive.
+    Test,
+    /// The real worker, in this process, running the whoami fixture.
+    Worker,
+    /// Any hop a test supplies: a misbehaving worker, say.
+    Given(Arc<dyn AppUpstream>),
+}
+
+/// A bundle of `wasm` granting `egress`, as `clwd build` makes one.
+pub fn bundle_of(wasm: &[u8], egress: &[&str]) -> bytes::Bytes {
+    let encoded = clwd_bundle::build(
+        clwd_bundle::Runtime::Wasm,
+        "app.wasm",
+        clwd_bundle::Capabilities {
+            version: 1,
+            egress: egress.iter().map(|h| (*h).to_owned()).collect(),
+            secrets: vec![],
+            storage_namespaces: vec![],
+            limits: clwd_bundle::Limits {
+                cpu_ms: 5_000,
+                memory_mb: 128,
+            },
+        },
+        vec![clwd_bundle::File {
+            path: "app.wasm".into(),
+            data: wasm.to_vec(),
+            executable: false,
+        }],
+    )
+    .expect("a well-formed bundle encodes");
+    bytes::Bytes::from(encoded.bytes)
+}
+
+/// This process's user id: the gateway and the worker share it in tests.
+pub fn my_uid() -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    std::fs::metadata("/proc/self").expect("/proc/self").uid()
+}
+
+/// A socket path short enough for `SUN_LEN` (108 bytes).
+pub fn socket_path() -> std::path::PathBuf {
+    std::path::PathBuf::from(format!(
+        "/tmp/clwd-e2e-{}.sock",
+        &uuid::Uuid::now_v7().simple().to_string()[20..]
+    ))
+}
+
 impl Harness {
-    /// Start everything against `pool`.
+    /// Start everything against `pool`, with the HTTP test upstream as the hop.
     pub async fn start(pool: PgPool) -> Self {
+        Self::start_with(pool, Hop::Test).await
+    }
+
+    /// Start everything against `pool`, with the real worker as the hop and
+    /// the whoami fixture published as every app. One artifact, three apps:
+    /// the same digest under different app ids.
+    pub async fn with_worker(pool: PgPool) -> Self {
+        Self::start_with(pool, Hop::Worker).await
+    }
+
+    /// Start everything against `pool`, with `hop` as the gateway's hop.
+    pub async fn with_hop(pool: PgPool, hop: Arc<dyn AppUpstream>) -> Self {
+        Self::start_with(pool, Hop::Given(hop)).await
+    }
+
+    async fn start_with(pool: PgPool, kind: Hop) -> Self {
         logs();
         control_plane::acme::install_crypto_provider();
 
@@ -543,6 +631,30 @@ impl Harness {
         let other = control_plane::db::create_org(&pool, "other")
             .await
             .expect("org");
+        // `acme` holds the visitor's domain, verified, with auto-join on. The
+        // claimant is someone else, so the visitor's membership comes from
+        // sign-in alone.
+        let claimant: uuid::Uuid = sqlx::query_scalar(
+            "insert into users (id, email) values ($1, 'owner@example.net') returning id",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .fetch_one(&pool)
+        .await
+        .expect("claimant");
+        sqlx::query(
+            "insert into org_domains (domain, org_id, claimant_id, auto_join) values ($1, $2, $3, true)",
+        )
+        .bind(VISITOR_DOMAIN)
+        .bind(acme.id.as_uuid())
+        .bind(claimant)
+        .execute(&pool)
+        .await
+        .expect("acme verifies the visitor's domain");
+        // One store, shared by the control plane and the worker, as publish
+        // and the worker share one in production.
+        let operator =
+            opendal::Operator::new(opendal::services::Memory::default()).expect("operator");
+        let artifacts = builder::ArtifactStore::new(operator.clone());
         let mut names = HashMap::new();
         for (org, name, label) in [
             (acme.id, "notes", "notes"),
@@ -552,6 +664,20 @@ impl Harness {
             let app = control_plane::db::create_app(&pool, org, name, "wasm")
                 .await
                 .expect("app");
+            // A published version, so the app has something to run: the
+            // fixture, stored where publish stores it.
+            let validated =
+                builder::validate(bundle_of(WHOAMI, &[])).expect("the fixture validates");
+            artifacts.put(&validated).await.expect("stored");
+            sqlx::query(
+                "insert into app_versions (id, app_id, digest, state) values ($1, $2, $3, 'ready')",
+            )
+            .bind(uuid::Uuid::now_v7())
+            .bind(app.id.as_uuid())
+            .bind(validated.digest().to_string())
+            .execute(&pool)
+            .await
+            .expect("a ready version");
             names.insert(app.id.to_string(), label);
         }
 
@@ -569,13 +695,10 @@ impl Harness {
         )
         .await
         .expect("discovery against the mock issuer");
-        let operator =
-            opendal::Operator::new(opendal::services::Memory::default()).expect("operator");
-        let state =
-            control_plane::http::AppState::new(pool.clone(), builder::ArtifactStore::new(operator))
-                .with_signin(signin)
-                .with_internal_secret(INTERNAL_SECRET)
-                .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
+        let state = control_plane::http::AppState::new(pool.clone(), artifacts.clone())
+            .with_signin(signin)
+            .with_internal_secret(INTERNAL_SECRET)
+            .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
         let control_plane_port = serve_tls(control_plane::http::router(state.clone())).await;
         let internal = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -606,7 +729,38 @@ impl Harness {
                 .expect("key.pem");
         }
         let internal_base = format!("http://127.0.0.1:{internal_port}");
-        let hop: Arc<dyn AppUpstream> = upstream.clone();
+        let (hop, worker): (Arc<dyn AppUpstream>, _) = match kind {
+            Hop::Test => (upstream.clone(), None),
+            Hop::Given(hop) => (hop, None),
+            Hop::Worker => {
+                let worker = Arc::new(
+                    worker::Worker::new(artifacts.clone(), my_uid()).expect("the worker starts"),
+                );
+                let socket = socket_path();
+                // Its own runtime on its own threads, as its own process has in
+                // production. On the test's single-threaded runtime, running
+                // app code would starve the control plane beside it.
+                let (serving, path) = (Arc::clone(&worker), socket.clone());
+                let (ready, bound) = tokio::sync::oneshot::channel();
+                std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Builder::new_multi_thread()
+                        .enable_all()
+                        .build()
+                        .expect("worker runtime");
+                    runtime.block_on(async move {
+                        let listener =
+                            tokio::net::UnixListener::bind(&path).expect("bind the worker");
+                        let _ = ready.send(());
+                        serving.serve(listener).await;
+                    });
+                });
+                bound.await.expect("the worker is listening");
+                (
+                    Arc::new(gateway::worker::WorkerUpstream::new(&socket, my_uid())),
+                    Some(worker),
+                )
+            }
+        };
         let gateway_port =
             start_gateway(&pool, &internal_base, &hop, &cert_dir, control_plane_port).await;
         for port in [control_plane_port, evil_port] {
@@ -615,10 +769,31 @@ impl Harness {
 
         Self {
             upstream,
+            worker,
+            artifacts,
+            operator,
+            pool,
             control_plane_port,
             gateway_port,
             evil_port,
         }
+    }
+
+    /// Make the signed-in visitor a member of `org` as well, the way a grant
+    /// (#15/#16) will let them reach another org's app. The visitor must have
+    /// signed in once, so their user exists.
+    pub async fn join(&self, org: &str) {
+        let added = sqlx::query(
+            "insert into org_members (org_id, user_id, joined_via)
+             select o.id, u.id, 'claimant' from orgs o, users u
+              where o.slug = $1 and u.email = $2",
+        )
+        .bind(org)
+        .bind(EMAIL)
+        .execute(&self.pool)
+        .await
+        .expect("join");
+        assert_eq!(added.rows_affected(), 1, "the visitor has signed in");
     }
 
     fn resolver_rules(&self) -> String {

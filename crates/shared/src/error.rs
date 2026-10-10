@@ -296,6 +296,19 @@ define_error! {
             meaning: "The request conflicts with the resource's current state.",
             hint: "re-read the resource and retry with the current state";
 
+        /// A bundle whose manifest grants outbound network access.
+        ///
+        /// Refused until the platform can filter egress by address (#11's
+        /// follow-up). The runtime enforces egress by host name only, and a
+        /// name that resolves to loopback, link-local or a private range would
+        /// reach the host, the cloud metadata service and anything internal.
+        /// The worker refuses such a bundle at spawn as well; this refusal is
+        /// the early one, so a developer finds out at deploy.
+        #[error("outbound network access is not supported yet: the manifest grants egress to {hosts}")]
+        EgressNotSupported { hosts: String } => "control-plane.egress_not_supported", 400, false,
+            meaning: "The bundle's manifest grants outbound network access (`capabilities.egress`), which deployed apps cannot use yet. Nothing was published.",
+            hint: "remove the hosts from `capabilities.egress` in clwd.toml, rebuild, and publish again";
+
         /// A stored artifact could not be decoded.
         ///
         /// **Not a `bundle.*` code, deliberately.** The bytes passed validation
@@ -455,6 +468,9 @@ pub fn owned_samples() -> Vec<Error> {
         },
         Error::ArtifactCorrupt {
             digest: format!("blake3:{}", "5f".repeat(32)),
+        },
+        Error::EgressNotSupported {
+            hosts: "api.example.com".into(),
         },
         Error::Timeout {
             dependency: "the database".into(),
