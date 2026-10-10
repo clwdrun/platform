@@ -2072,20 +2072,18 @@ async fn a_code_exchanges_once_for_a_session_bound_to_its_app_and_parent(pool: P
     let check = |app: control_plane::ids::AppId| {
         let state = state.clone();
         let session = session.clone();
-        async move {
-            internal(
-                &state,
-                "/internal/app-sessions/check",
-                &serde_json::json!({ "session": session, "app_id": app.to_string() }),
-                Some(INTERNAL),
-            )
-            .await
-            .status
-        }
+        async move { check_session(&state, &session, app).await }
     };
-    assert_eq!(check(notes).await, StatusCode::NO_CONTENT);
+    let live = check(notes).await;
+    assert_eq!(live.status, StatusCode::OK, "{:?}", live.json);
+    assert_eq!(live.json["email"], EMAIL);
+    assert_eq!(live.json["org_id"], other_org.id.to_string());
     assert_eq!(
-        check(wiki).await,
+        live.json["member"], false,
+        "the signed-in user is not a member of acme"
+    );
+    assert_eq!(
+        check(wiki).await.status,
         StatusCode::UNAUTHORIZED,
         "a session for one app is no session on another app's host"
     );
@@ -2093,7 +2091,153 @@ async fn a_code_exchanges_once_for_a_session_bound_to_its_app_and_parent(pool: P
     // Signing out of the control plane ends the child on its next check.
     let logout = send(&state, "POST", "/auth/logout", Some(&cookie)).await;
     assert_eq!(logout.status, StatusCode::NO_CONTENT);
-    assert_eq!(check(notes).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(check(notes).await.status, StatusCode::UNAUTHORIZED);
+}
+
+async fn check_session(state: &AppState, session: &str, app: control_plane::ids::AppId) -> Reply {
+    internal(
+        state,
+        "/internal/app-sessions/check",
+        &serde_json::json!({ "session": session, "app_id": app.to_string() }),
+        Some(INTERNAL),
+    )
+    .await
+}
+
+/// Begin, authorize and exchange: an app-host session for `app`, as the
+/// visitor signed in with `cookie`.
+async fn app_session(state: &AppState, cookie: &str, app: control_plane::ids::AppId) -> String {
+    let body = issued_code(state, cookie, app).await;
+    let exchanged = internal(
+        state,
+        "/internal/handshakes/exchange",
+        &body,
+        Some(INTERNAL),
+    )
+    .await;
+    assert_eq!(exchanged.status, StatusCode::OK, "{:?}", exchanged.json);
+    exchanged.json["session"]
+        .as_str()
+        .expect("session")
+        .to_owned()
+}
+
+/// A code issued to the visitor for `app`, ready to exchange.
+async fn issued_code(
+    state: &AppState,
+    cookie: &str,
+    app: control_plane::ids::AppId,
+) -> serde_json::Value {
+    let handshake = begin_handshake(state, app, "/").await;
+    let reply = get_(
+        state,
+        &format!("/authorize?state={handshake}"),
+        Some(cookie),
+    )
+    .await;
+    let q = query_of(reply.headers[header::LOCATION].to_str().expect("ascii"));
+    serde_json::json!({ "code": q["code"], "state": q["state"] })
+}
+
+/// The app sees a pairwise subject: random (version 4), not the user id, the
+/// same on every visit to one app, different in another app. Membership of
+/// the app's org is reported, and changes nothing about the subject.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_subject_is_pairwise_random_and_stable(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let notes = an_app(&pool, "acme", "notes").await;
+    let acme = control_plane::db::org_by_slug(&pool, "acme")
+        .await
+        .expect("read")
+        .expect("org");
+    let wiki = control_plane::db::create_app(&pool, acme.id, "wiki", "wasm")
+        .await
+        .expect("app")
+        .id;
+    let user_id: uuid::Uuid = sqlx::query_scalar("select id from users where email = $1")
+        .bind(EMAIL)
+        .fetch_one(&pool)
+        .await
+        .expect("the user");
+
+    let first = check_session(&state, &app_session(&state, &cookie, notes).await, notes).await;
+    let subject: uuid::Uuid = first.json["subject"]
+        .as_str()
+        .expect("subject")
+        .parse()
+        .expect("a uuid");
+    assert_eq!(
+        subject.get_version_num(),
+        4,
+        "a subject must be random: a v7 carries the time of the first visit"
+    );
+    assert_ne!(subject, user_id, "an app must never see the user id");
+
+    let again = check_session(&state, &app_session(&state, &cookie, notes).await, notes).await;
+    assert_eq!(
+        again.json["subject"], first.json["subject"],
+        "stable per app"
+    );
+
+    let in_wiki = check_session(&state, &app_session(&state, &cookie, wiki).await, wiki).await;
+    assert_ne!(
+        in_wiki.json["subject"], first.json["subject"],
+        "pairwise: another app sees another subject"
+    );
+
+    assert_eq!(first.json["member"], false);
+    sqlx::query("insert into org_members (org_id, user_id, joined_via) values ($1, $2, 'domain')")
+        .bind(acme.id.as_uuid())
+        .bind(user_id)
+        .execute(&pool)
+        .await
+        .expect("join acme");
+    let member = check_session(&state, &app_session(&state, &cookie, notes).await, notes).await;
+    assert_eq!(member.json["member"], true);
+    assert_eq!(member.json["subject"], first.json["subject"]);
+}
+
+/// Two first visits racing — two tabs, one person, one app — exchange
+/// concurrently and must end with one subject between them, not two.
+#[sqlx::test(migrations = "../../migrations")]
+async fn concurrent_first_exchanges_share_one_subject(pool: PgPool) {
+    let issuer = start_issuer().await;
+    let state = state(&pool, &issuer).await;
+    let cookie = signed_in(&state, &issuer).await;
+    let notes = an_app(&pool, "acme", "notes").await;
+
+    for _ in 0..8 {
+        sqlx::query("delete from app_sessions")
+            .execute(&pool)
+            .await
+            .expect("reset sessions");
+        sqlx::query("delete from app_subjects")
+            .execute(&pool)
+            .await
+            .expect("reset subjects");
+        let a = issued_code(&state, &cookie, notes).await;
+        let b = issued_code(&state, &cookie, notes).await;
+        let (ra, rb) = tokio::join!(
+            internal(&state, "/internal/handshakes/exchange", &a, Some(INTERNAL)),
+            internal(&state, "/internal/handshakes/exchange", &b, Some(INTERNAL)),
+        );
+        assert_eq!(ra.status, StatusCode::OK, "{:?}", ra.json);
+        assert_eq!(rb.status, StatusCode::OK, "{:?}", rb.json);
+        let sa = check_session(&state, ra.json["session"].as_str().expect("s"), notes).await;
+        let sb = check_session(&state, rb.json["session"].as_str().expect("s"), notes).await;
+        assert_eq!(sa.status, StatusCode::OK, "{:?}", sa.json);
+        assert_eq!(
+            sa.json["subject"], sb.json["subject"],
+            "one subject per (app, user)"
+        );
+        let rows: i64 = sqlx::query_scalar("select count(*) from app_subjects")
+            .fetch_one(&pool)
+            .await
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
 }
 
 /// A code is bound to its state: the right code with another handshake's

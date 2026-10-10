@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select sub.subject as \"subject: AppSubject\",\n                  u.email,\n                  ap.org_id as \"org_id: OrgId\",\n                  -- #12 replaces: interim org-member rule.\n                  (m.user_id is not null) as \"member!\"\n             from app_sessions a\n             join sessions s on s.id = a.parent_session_id\n             join users u on u.id = s.user_id\n             join apps ap on ap.id = a.app_id\n             join app_subjects sub on sub.app_id = a.app_id and sub.user_id = u.id\n             left join org_members m on m.org_id = ap.org_id and m.user_id = u.id\n            where a.secret_sha256 = $1\n              and a.app_id = $2\n              and a.expires_at > now()\n              and s.revoked_at is null\n              and s.expires_at > now()\n              and u.deleted_at is null\n              and ap.deleted_at is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subject: AppSubject",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "app_subjects",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "apps",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "member!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "f17bef1197d3588010211983a6f4d81ea136c4a0558531b745fac79db0b722b2"
+}

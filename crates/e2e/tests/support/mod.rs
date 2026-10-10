@@ -54,6 +54,10 @@ const CLIENT_ID: &str = "e2e-client.apps.googleusercontent.com";
 const CLIENT_SECRET: &str = "e2e-client-secret";
 pub const SUBJECT: &str = "e2e-google-subject";
 pub const EMAIL: &str = "visitor@example.com";
+/// The visitor's Workspace domain, verified by `acme` with auto-join on, so
+/// the visitor is a member of `acme` and of nothing else — in particular not
+/// of `other`, whose app is the non-member case.
+pub const VISITOR_DOMAIN: &str = "example.com";
 
 /// The key the control plane signs its cookies with in this harness.
 pub fn cookie_key() -> control_plane::signin::CookieKey {
@@ -261,7 +265,11 @@ async fn issuer_token(
         StandardClaims::new(SubjectIdentifier::new(SUBJECT.to_owned()))
             .set_email(Some(EndUserEmail::new(EMAIL.to_owned())))
             .set_email_verified(Some(true)),
-        identity::GoogleClaims { hd: None },
+        // A Workspace account, so sign-in joins the visitor to `acme` through
+        // the org's verified domain — the product's own path to membership.
+        identity::GoogleClaims {
+            hd: Some(VISITOR_DOMAIN.to_owned()),
+        },
     )
     .set_nonce(Some(Nonce::new(grant.nonce)));
     let token = identity::GoogleIdToken::new(
@@ -525,6 +533,7 @@ pub fn logs() -> &'static Logs {
 
 pub struct Harness {
     pub upstream: Arc<TestUpstream>,
+    pub pool: PgPool,
     pub control_plane_port: u16,
     pub gateway_port: u16,
     pub evil_port: u16,
@@ -543,6 +552,25 @@ impl Harness {
         let other = control_plane::db::create_org(&pool, "other")
             .await
             .expect("org");
+        // `acme` holds the visitor's domain, verified, with auto-join on. The
+        // claimant is someone else, so the visitor's membership comes from
+        // sign-in alone.
+        let claimant: uuid::Uuid = sqlx::query_scalar(
+            "insert into users (id, email) values ($1, 'owner@example.net') returning id",
+        )
+        .bind(uuid::Uuid::now_v7())
+        .fetch_one(&pool)
+        .await
+        .expect("claimant");
+        sqlx::query(
+            "insert into org_domains (domain, org_id, claimant_id, auto_join) values ($1, $2, $3, true)",
+        )
+        .bind(VISITOR_DOMAIN)
+        .bind(acme.id.as_uuid())
+        .bind(claimant)
+        .execute(&pool)
+        .await
+        .expect("acme verifies the visitor's domain");
         let mut names = HashMap::new();
         for (org, name, label) in [
             (acme.id, "notes", "notes"),
@@ -615,10 +643,28 @@ impl Harness {
 
         Self {
             upstream,
+            pool,
             control_plane_port,
             gateway_port,
             evil_port,
         }
+    }
+
+    /// Make the signed-in visitor a member of `org` as well, the way a grant
+    /// (#15/#16) will let them reach another org's app. The visitor must have
+    /// signed in once, so their user exists.
+    pub async fn join(&self, org: &str) {
+        let added = sqlx::query(
+            "insert into org_members (org_id, user_id, joined_via)
+             select o.id, u.id, 'claimant' from orgs o, users u
+              where o.slug = $1 and u.email = $2",
+        )
+        .bind(org)
+        .bind(EMAIL)
+        .execute(&self.pool)
+        .await
+        .expect("join");
+        assert_eq!(added.rows_affected(), 1, "the visitor has signed in");
     }
 
     fn resolver_rules(&self) -> String {

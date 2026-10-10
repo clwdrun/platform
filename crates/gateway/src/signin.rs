@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use shared::hop::{AppSubject, Caller, OrgId};
 use shared::return_path::ReturnPath;
 use thiserror::Error;
 
@@ -236,13 +237,19 @@ impl SigninClient {
         }
     }
 
-    /// Whether `session` is live for `app_id` — the per-request check.
+    /// Who `session` belongs to, if it is live for `app_id` — the per-request
+    /// check. The identity comes from the control plane's one statement, never
+    /// from anything in the request.
     ///
     /// # Errors
     ///
     /// [`Unreachable`] if the control plane could not be asked: the caller
     /// fails closed.
-    pub async fn check(&self, session: &AppSession, app_id: &str) -> Result<bool, Unreachable> {
+    pub async fn check(
+        &self,
+        session: &AppSession,
+        app_id: &str,
+    ) -> Result<Option<Checked>, Unreachable> {
         let response = self
             .post(
                 "/internal/app-sessions/check",
@@ -250,15 +257,45 @@ impl SigninClient {
             )
             .await?;
         match response.status() {
-            StatusCode::NO_CONTENT => Ok(true),
-            StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST => Ok(false),
+            StatusCode::OK => {
+                let body: CheckResponse = response
+                    .json()
+                    .await
+                    .map_err(|e| Unreachable(e.without_url().to_string()))?;
+                Ok(Some(Checked {
+                    caller: Caller::new(
+                        AppSubject::new(body.subject),
+                        Some(body.email),
+                        OrgId::new(body.org_id),
+                    ),
+                    member: body.member,
+                }))
+            }
+            StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST => Ok(None),
             other => Err(Unreachable(format!("check answered {other}"))),
         }
     }
 }
 
-/// Compare without an early exit, so timing says nothing about a guessed
-/// state.
+#[derive(serde::Deserialize)]
+struct CheckResponse {
+    subject: String,
+    email: String,
+    org_id: String,
+    member: bool,
+}
+
+/// A live app-host session's visitor.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct Checked {
+    /// Who the app is told is calling.
+    pub caller: Caller,
+    /// Whether the visitor is a member of the app's org. The interim access
+    /// rule until #12: a non-member's request reaches no app code.
+    pub member: bool,
+}
+
 #[must_use]
 pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0

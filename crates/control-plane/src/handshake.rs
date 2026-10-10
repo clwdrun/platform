@@ -42,7 +42,7 @@ use sqlx::PgPool;
 
 use crate::auth::unavailable;
 use crate::http::{AppState, render};
-use crate::ids::{AppId, AppSessionId, HandshakeId};
+use crate::ids::{AppId, AppSessionId, AppSubject, HandshakeId, OrgId};
 use crate::openapi::{Body, Doc, Success};
 use crate::session;
 
@@ -183,9 +183,18 @@ pub async fn exchange(
                returning app_id, parent_session_id, return_path
            ),
            parent as (
-               select s.id, s.expires_at from sessions s
+               select s.id, s.user_id, s.expires_at from sessions s
                  join h on s.id = h.parent_session_id
                 where s.revoked_at is null and s.expires_at > now()
+           ),
+           -- The visitor's pairwise subject for this app, created on their
+           -- first exchange and kept forever. A concurrent first exchange for
+           -- the same pair meets this one on the primary key and does nothing,
+           -- so both read back the one subject at their next check.
+           subject as (
+               insert into app_subjects (app_id, user_id)
+               select h.app_id, parent.user_id from h, parent
+               on conflict (app_id, user_id) do nothing
            )
            insert into app_sessions (id, parent_session_id, app_id, secret_sha256, expires_at)
            select $3, parent.id, h.app_id, $4,
@@ -216,7 +225,23 @@ pub async fn exchange(
 
 // ----------------------------------------------------------- check ----
 
-/// Whether `secret` is a live app-host session **for `app_id`**.
+/// Who a live app-host session belongs to, as the app is allowed to see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct Checked {
+    /// The visitor's pairwise subject for this app, never their user id.
+    pub subject: AppSubject,
+    /// Verified (#9 stores no other kind).
+    pub email: String,
+    /// The app's org.
+    pub org_id: OrgId,
+    /// Whether the visitor is a member of the app's org. The interim access
+    /// rule until #12: a session for a non-member reaches no app code.
+    pub member: bool,
+}
+
+/// The visitor behind `secret`, if it is a live app-host session **for
+/// `app_id`**.
 ///
 /// The per-request check, and the only query the session model adds to the
 /// app request path: one statement, an index probe on `secret_sha256`. Both
@@ -226,29 +251,51 @@ pub async fn exchange(
 /// cached, so revocation latency is zero; #12's cache must keep that or argue
 /// for a bound.
 ///
+/// The same statement returns what the app is told (its pairwise subject,
+/// the verified email, the app's org) and whether the visitor is a member of
+/// the app's org: a left join, not a second query. **#12 replaces the
+/// membership rule** with its policy; #15/#16 widen it to "a member, or holds a
+/// grant on this app".
+///
 /// # Errors
 ///
 /// [`unavailable`]'s mapping for a database failure.
-pub async fn check(pool: &PgPool, secret: &AppSessionSecret, app_id: AppId) -> Result<bool, Error> {
-    sqlx::query_scalar!(
-        r#"select exists (
-             select 1
-               from app_sessions a
-               join sessions s on s.id = a.parent_session_id
-               join users u on u.id = s.user_id
-              where a.secret_sha256 = $1
-                and a.app_id = $2
-                and a.expires_at > now()
-                and s.revoked_at is null
-                and s.expires_at > now()
-                and u.deleted_at is null
-           ) as "live!""#,
+pub async fn check(
+    pool: &PgPool,
+    secret: &AppSessionSecret,
+    app_id: AppId,
+) -> Result<Option<Checked>, Error> {
+    let row = sqlx::query!(
+        r#"select sub.subject as "subject: AppSubject",
+                  u.email,
+                  ap.org_id as "org_id: OrgId",
+                  -- #12 replaces: interim org-member rule.
+                  (m.user_id is not null) as "member!"
+             from app_sessions a
+             join sessions s on s.id = a.parent_session_id
+             join users u on u.id = s.user_id
+             join apps ap on ap.id = a.app_id
+             join app_subjects sub on sub.app_id = a.app_id and sub.user_id = u.id
+             left join org_members m on m.org_id = ap.org_id and m.user_id = u.id
+            where a.secret_sha256 = $1
+              and a.app_id = $2
+              and a.expires_at > now()
+              and s.revoked_at is null
+              and s.expires_at > now()
+              and u.deleted_at is null
+              and ap.deleted_at is null"#,
         &secret.digest()[..],
         app_id.as_uuid(),
     )
-    .fetch_one(pool)
+    .fetch_optional(pool)
     .await
-    .map_err(unavailable)
+    .map_err(unavailable)?;
+    Ok(row.map(|row| Checked {
+        subject: row.subject,
+        email: row.email,
+        org_id: row.org_id,
+        member: row.member,
+    }))
 }
 
 // ------------------------------------------------------- authorize ----
@@ -441,6 +488,18 @@ pub(crate) struct CheckRequest {
     app_id: AppId,
 }
 
+#[derive(Serialize, Deserialize, utoipa::ToSchema)]
+pub(crate) struct CheckResponse {
+    /// The visitor's pairwise subject for this app.
+    #[schema(value_type = String, format = Uuid)]
+    subject: AppSubject,
+    email: String,
+    #[schema(value_type = String, format = Uuid)]
+    org_id: OrgId,
+    /// Whether the visitor is a member of the app's org (#12 replaces).
+    member: bool,
+}
+
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
     serde_json::from_slice(body).map_err(|e| Error::InvalidRequest {
         what: e.to_string(),
@@ -509,15 +568,19 @@ pub(crate) async fn check_route(
     let result = async {
         let request: CheckRequest = parse_body(&body)?;
         let secret = AppSessionSecret::parse(&request.session).ok_or(Error::Unauthenticated {})?;
-        if check(&state.pool, &secret, request.app_id).await? {
-            Ok(())
-        } else {
-            Err(Error::Unauthenticated {})
-        }
+        check(&state.pool, &secret, request.app_id)
+            .await?
+            .ok_or(Error::Unauthenticated {})
     }
     .await;
     match result {
-        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Ok(checked) => axum::Json(CheckResponse {
+            subject: checked.subject,
+            email: checked.email,
+            org_id: checked.org_id,
+            member: checked.member,
+        })
+        .into_response(),
         Err(error) => render(&error, &request_id),
     }
 }
@@ -549,6 +612,15 @@ fn exchange_response_example() -> serde_json::Result<serde_json::Value> {
         max_age_secs: 86_400,
         return_path: "/notes/42".to_owned(),
     })
+}
+
+fn check_response_example() -> serde_json::Result<serde_json::Value> {
+    Ok(serde_json::json!({
+        "subject": "3f2a1c4e-9b7d-4e21-8c3a-5d6f7e8a9b0c",
+        "email": "ada@example.com",
+        "org_id": crate::openapi::EXAMPLE_ORG,
+        "member": true,
+    }))
 }
 
 fn check_request_example() -> serde_json::Result<serde_json::Value> {
@@ -606,16 +678,19 @@ pub(crate) fn check_doc() -> Doc {
     Doc {
         operation_id: "checkAppSession",
         summary: "Check an app-host session",
-        description: "Gateway only, on every app request. 204 if the session is live for this app and its parent control-plane session is live; identity.unauthenticated otherwise.",
+        description: "Gateway only, on every app request. 200 with the visitor's identity for this app if the session is live for this app and its parent control-plane session is live; identity.unauthenticated otherwise. `member` is false when the visitor is not a member of the app's org, and the gateway runs no app code for them.",
         params: &[],
         request: Some(Body::json::<CheckRequest>(
             "The session and the app requested.",
             check_request_example,
         )),
         success: vec![Success {
-            status: StatusCode::NO_CONTENT,
+            status: StatusCode::OK,
             description: "The session is live for this app.",
-            body: None,
+            body: Some(Body::json::<CheckResponse>(
+                "Who the visitor is, as the app may see them.",
+                check_response_example,
+            )),
         }],
         errors: &["control-plane.invalid_request"],
     }

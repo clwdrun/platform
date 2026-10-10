@@ -227,6 +227,10 @@ async fn one_app_cannot_plant_platform_cookies_on_another(pool: PgPool) {
     let h = Harness::start(pool).await;
     let chrome = h.browser().await;
     let page = open_app(&chrome, NOTES, "/").await;
+    // App B is another org's. Under the interim member rule the visitor must
+    // be able to reach it for the attack to exist at all — as a grant will
+    // allow once #15/#16 land.
+    h.join("other").await;
     open_app(&chrome, ATTACKER_APP, "/").await;
     let session = cookie(&chrome, &page, NOTES, APP_SESSION).await;
     for c in [
@@ -608,4 +612,32 @@ async fn no_code_or_state_is_ever_logged(pool: PgPool) {
     ] {
         assert!(!text.contains(value.as_str()), "a {what} reached the logs");
     }
+}
+
+/// The interim access rule (#12 replaces it): a signed-in visitor who is not a
+/// member of the app's org gets `gateway.not_a_member`, and nothing reaches the
+/// hop — not the page, not anything after it.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_non_member_reaches_no_app_code(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let chrome = h.browser().await;
+    open_app(&chrome, NOTES, "/").await;
+    let page = chrome
+        .open(&format!("https://{ATTACKER_APP}/probe-non-member"))
+        .await;
+    let body = text(&page).await;
+    assert!(body.contains("gateway.not_a_member"), "{body}");
+    assert!(
+        !h.upstream.saw_anywhere("/probe-non-member"),
+        "a non-member's request reached the hop"
+    );
+    assert!(
+        h.upstream
+            .seen_paths
+            .lock()
+            .expect("lock")
+            .iter()
+            .all(|(app, _)| *app != "page"),
+        "no request of any kind reached the non-member's app"
+    );
 }
