@@ -1,0 +1,72 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select domain, slug, auto_join, token, expires_at > now() as \"live!\"\n             from domain_claims where id = $1 and claimant_id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "domain_claims",
+            "name": "domain"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "domain_claims",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "auto_join",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "domain_claims",
+            "name": "auto_join"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "token",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "domain_claims",
+            "name": "token"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "live!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "92fd1a32f74190723fbe372ff312ca633ee3b17fe31302b3f2777ea1c62f9f17"
+}

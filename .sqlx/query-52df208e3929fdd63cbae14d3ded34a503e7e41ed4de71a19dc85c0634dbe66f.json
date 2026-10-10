@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from domain_claims",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "52df208e3929fdd63cbae14d3ded34a503e7e41ed4de71a19dc85c0634dbe66f"
+}

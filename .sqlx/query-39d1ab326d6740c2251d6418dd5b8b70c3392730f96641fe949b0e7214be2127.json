@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select hosted_domain from users where id = $1 and deleted_at is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "hosted_domain",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "hosted_domain"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "39d1ab326d6740c2251d6418dd5b8b70c3392730f96641fe949b0e7214be2127"
+}

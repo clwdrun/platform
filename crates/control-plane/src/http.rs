@@ -49,7 +49,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::DefaultBodyLimit;
-use axum::extract::Request;
+use axum::extract::{Request, State};
 use axum::handler::Handler;
 use axum::http::response::Parts;
 use axum::http::{HeaderValue, Method, StatusCode, header};
@@ -101,6 +101,10 @@ pub struct AppState {
     /// `control-plane.internal` — fail closed. Set via
     /// [`AppState::with_signin`].
     pub signin: Option<std::sync::Arc<crate::signin::SignIn>>,
+    /// The DNS lookup domain verification uses. `None` means verifying a claim
+    /// answers `control-plane.internal` — fail closed. Set via
+    /// [`AppState::with_txt_lookup`].
+    pub txt_lookup: Option<crate::orgs::SharedTxtLookup>,
 }
 
 impl AppState {
@@ -131,6 +135,7 @@ impl AppState {
             limiter: std::sync::Arc::new(Limiter::keyed(quota)),
             internal_secret: None,
             signin: None,
+            txt_lookup: None,
         }
     }
 
@@ -146,6 +151,13 @@ impl AppState {
     #[must_use]
     pub fn with_signin(mut self, signin: crate::signin::SignIn) -> Self {
         self.signin = Some(std::sync::Arc::new(signin));
+        self
+    }
+
+    /// Enable domain-claim verification through `lookup`.
+    #[must_use]
+    pub fn with_txt_lookup(mut self, lookup: crate::orgs::SharedTxtLookup) -> Self {
+        self.txt_lookup = Some(lookup);
         self
     }
 }
@@ -165,6 +177,23 @@ pub enum Access {
     /// part of the customer API surface. The gateway's host-resolution call is
     /// the only one today.
     Internal,
+    /// A browser holding a live session cookie. The handler receives the
+    /// session as an `Extension<ActiveSession>`; no session is
+    /// `identity.unauthenticated`.
+    Session,
+    /// A browser route that reads the session cookie but does not require
+    /// one — logout, which succeeds whatever it is sent.
+    SessionOptional,
+}
+
+impl Access {
+    /// Whether the route authenticates by the session cookie — which a browser
+    /// attaches on its own, so a request carrying it may not be one the user
+    /// meant to make.
+    #[must_use]
+    pub fn uses_session_cookie(self) -> bool {
+        matches!(self, Self::Session | Self::SessionOptional)
+    }
 }
 
 /// A method a route can be registered for.
@@ -193,6 +222,13 @@ impl Verb {
             Self::Patch => Method::PATCH,
             Self::Delete => Method::DELETE,
         }
+    }
+
+    /// Whether the method changes state. `GET` never may: `SameSite=Lax` still
+    /// sends the session cookie on a cross-site top-level `GET` navigation.
+    #[must_use]
+    pub fn mutates(self) -> bool {
+        !matches!(self, Self::Get)
     }
 
     fn filter(self) -> MethodFilter {
@@ -297,9 +333,30 @@ pub fn production_routes() -> Vec<Route> {
         Route::new(
             Verb::Post,
             "/auth/logout",
-            Access::Public,
+            Access::SessionOptional,
             crate::signin::logout_doc(),
             crate::signin::logout,
+        ),
+        Route::new(
+            Verb::Post,
+            "/v1/domain-claims",
+            Access::Session,
+            crate::orgs::claim_doc(),
+            crate::orgs::claim_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/v1/domain-claims/{claim_id}/verify",
+            Access::Session,
+            crate::orgs::verify_doc(),
+            crate::orgs::verify_route,
+        ),
+        Route::new(
+            Verb::Patch,
+            "/v1/orgs/{org_id}/domains",
+            Access::Session,
+            crate::orgs::auto_join_doc(),
+            crate::orgs::auto_join_route,
         ),
         Route::new(
             Verb::Post,
@@ -450,9 +507,30 @@ fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
     let mut public = Router::new();
     let mut authenticated = Router::new();
     let mut internal = Router::new();
+    let mut browser = Router::new();
 
     for route in table {
         match route.access {
+            access @ (Access::Session | Access::SessionOptional) => {
+                let mut handler = route.handler;
+                if access == Access::Session {
+                    handler = handler.route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        crate::session::require,
+                    ));
+                }
+                // Added last, so it runs first: a forged request is refused
+                // before the session is even looked up. Decided here, from
+                // the table, so no cookie-authenticated mutating route can be
+                // registered without it.
+                if route.verb.mutates() {
+                    handler = handler.route_layer(middleware::from_fn_with_state(
+                        state.clone(),
+                        require_same_origin,
+                    ));
+                }
+                browser = browser.route(route.path, handler);
+            }
             Access::Public => public = public.route(route.path, route.handler),
             Access::Scoped(scope) => {
                 let handler = route.handler.route_layer(middleware::from_fn(
@@ -487,7 +565,72 @@ fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
     public
         .merge(authenticated)
         .merge(internal)
+        .merge(browser)
         .fallback(unmatched)
+}
+
+/// Refuse a cookie-authenticated, state-changing request that did not come
+/// from the control plane's own origin.
+///
+/// # Why `SameSite=Lax` is not enough
+///
+/// `SameSite` is about *sites*, and every `{app}.{org}.<apex>` is the same
+/// site as the control plane. Script on any customer app can make a browser
+/// send a same-site `POST` here with the visitor's session cookie attached.
+/// Only an origin check tells that apart from the control plane's own pages.
+///
+/// # What is accepted
+///
+/// - `Sec-Fetch-Site` present: it must be `same-origin` (`same-site` is
+///   exactly the app-subdomain attack).
+/// - Otherwise `Origin` must equal the control plane's origin exactly
+///   (`Origin: null` does not).
+/// - Neither header: refused. A cookie-authenticated request comes from a
+///   browser, which sends at least one; the CLI uses API tokens.
+///
+/// This holds whatever #62 decides about where the session cookie lives. It
+/// mitigates forged requests; it does nothing about cookie tossing or session
+/// fixation, which are #62's.
+async fn require_same_origin(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::generate);
+    let Some(origin) = state.signin.as_deref().map(crate::signin::SignIn::origin) else {
+        return render(
+            &Error::Internal {
+                source: anyhow::anyhow!("sign-in is not configured on this control plane"),
+            },
+            &request_id,
+        );
+    };
+    let headers = request.headers();
+    let fetch_site = headers
+        .get("sec-fetch-site")
+        .map(|v| v.to_str().unwrap_or(""));
+    let same_origin = match fetch_site {
+        Some(site) => site == "same-origin",
+        None => headers
+            .get(header::ORIGIN)
+            .is_some_and(|v| v.as_bytes() == origin.as_bytes()),
+    };
+    if same_origin {
+        next.run(request).await
+    } else {
+        render(
+            &Error::Forbidden {
+                what: "a cross-origin request; this operation must come from the control \
+                       plane's own pages"
+                    .to_owned(),
+            },
+            &request_id,
+        )
+    }
 }
 
 /// Assign a request id before anything else looks at the request.

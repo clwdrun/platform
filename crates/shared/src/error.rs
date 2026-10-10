@@ -267,15 +267,18 @@ define_error! {
             meaning: "The request carries no valid credential: the Authorization header is missing or malformed, or the token is unknown or revoked. These are deliberately indistinguishable.",
             hint: "supply a valid, unrevoked API token as `Authorization: Bearer <token>`";
 
-        /// The credential is valid but lacks the scope this route needs.
+        /// The caller is authenticated but not permitted to do this: a token
+        /// lacking the route's scope, a session member who is not the one
+        /// allowed to make the change, or a session request that did not come
+        /// from the control plane's own origin.
         ///
-        /// Only for a resource the credential may see. A resource outside the
+        /// Only for a resource the caller may see. A resource outside the
         /// token's org or app binding is `control-plane.not_found`, because a
         /// 403 there would confirm the resource exists.
         #[error("not permitted: {what}")]
         Forbidden { what: String } => "identity.forbidden", 403, false,
-            meaning: "The token is valid, but lacks the scope this operation requires. The message names the scope.",
-            hint: "use a token that carries the scope named in the message";
+            meaning: "The caller is authenticated but not permitted to do this: a token without the scope the operation requires, a signed-in user who is not the one allowed to make this change, or a browser request from another origin. The message says which.",
+            hint: "act on what the message names: a token with that scope, the permitted user, or a request from the control plane's own pages";
 
         /// A named resource does not exist, or the caller may not see it.
         ///

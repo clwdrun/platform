@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update org_domains d set auto_join = $4\n            where d.org_id = $1 and d.domain = $2 and d.claimant_id = $3\n              and exists (select 1 from org_members m where m.org_id = $1 and m.user_id = $3)\n        returning auto_join",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "auto_join",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "org_domains",
+            "name": "auto_join"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "fbabd823d1f09f7bb5fc32291a60162c0cad5baba66596a026e9b6950b71be6a"
+}

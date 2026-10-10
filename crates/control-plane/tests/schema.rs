@@ -274,13 +274,23 @@ async fn a_user_can_join_an_org(pool: PgPool) {
     let user = db::create_user(&pool, "someone@example.com")
         .await
         .expect("user");
-    db::add_org_member(&pool, org.id, user.id)
-        .await
-        .expect("membership");
+    db::add_org_member(
+        &pool,
+        org.id,
+        user.id,
+        control_plane::orgs::JoinedVia::Personal,
+    )
+    .await
+    .expect("membership");
 
-    let err = db::add_org_member(&pool, org.id, user.id)
-        .await
-        .expect_err("joining twice");
+    let err = db::add_org_member(
+        &pool,
+        org.id,
+        user.id,
+        control_plane::orgs::JoinedVia::Personal,
+    )
+    .await
+    .expect_err("joining twice");
     assert_eq!(sqlstate(err), UNIQUE_VIOLATION);
 }
 

@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select exists (select 1 from reserved_slugs where slug = $1) as \"reserved!\",\n                  exists (select 1 from orgs where slug = $1) as \"taken!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "reserved!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "taken!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "ffa7b136b759735909204e512db2d2846b44f53f7af010a23267a11b5a03f41a"
+}

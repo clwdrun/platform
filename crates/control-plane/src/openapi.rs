@@ -51,7 +51,9 @@ use utoipa::openapi::response::ResponseBuilder;
 use utoipa::openapi::schema::{
     AdditionalProperties, KnownFormat, ObjectBuilder, SchemaFormat, SchemaType, Type,
 };
-use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme};
+use utoipa::openapi::security::{
+    ApiKey, ApiKeyValue, HttpAuthScheme, HttpBuilder, SecurityRequirement, SecurityScheme,
+};
 use utoipa::openapi::{
     ComponentsBuilder, InfoBuilder, OpenApi, OpenApiBuilder, Paths, Ref, RefOr, Required, Schema,
 };
@@ -62,6 +64,8 @@ use crate::http::{Access, Route, Verb, production_routes};
 pub const COMMITTED: &str = include_str!("../openapi.json");
 
 const SECURITY_SCHEME: &str = "bearerAuth";
+const COOKIE_SCHEME: &str = "sessionCookie";
+const SESSION_AUTHENTICATION: &str = "**Authentication:** a browser session cookie, set by Google sign-in (`GET /auth/google`). A state-changing request must also come from the control plane's own origin: `Sec-Fetch-Site: same-origin`, or, without that header, an exact `Origin` match. Other pages on the same site, including every app under the apex, are refused.";
 const ENVELOPE: &str = "Envelope";
 const JSON: &str = "application/json";
 
@@ -80,6 +84,8 @@ pub(crate) const EXAMPLE_VERSION: uuid::Uuid =
     uuid::Uuid::from_u128(0x0198f0c1_8b3e_7000_8000_0000000000a3);
 pub(crate) const EXAMPLE_TOKEN: uuid::Uuid =
     uuid::Uuid::from_u128(0x0198f0c1_8b3e_7000_8000_0000000000a4);
+pub(crate) const EXAMPLE_CLAIM: uuid::Uuid =
+    uuid::Uuid::from_u128(0x0198f0c1_8b3e_7000_8000_0000000000a6);
 const EXAMPLE_REQUEST_ID: &str = "0198f0c1-8b3e-7000-8000-0000000000a5";
 
 const AUTHENTICATION: &str = "A token looks like `clwd_tok_` followed by 64 lowercase hex characters, and is sent as `Authorization: Bearer <token>`. \
@@ -124,8 +130,9 @@ pub(crate) type ExampleFn = fn() -> serde_json::Result<Value>;
 
 /// Where a body's schema comes from.
 pub(crate) enum SchemaSource {
-    /// A type's derived schema, registered as a component.
-    Component(fn() -> (String, RefOr<Schema>)),
+    /// A type's derived schema, registered as a component together with every
+    /// schema it refers to.
+    Component(fn() -> NamedSchemas),
     /// A schema with no Rust type behind it: plain text, raw bytes.
     Inline(fn() -> Schema),
 }
@@ -203,8 +210,13 @@ pub(crate) struct Doc {
     pub(crate) errors: &'static [&'static str],
 }
 
-fn component<T: ToSchema>() -> (String, RefOr<Schema>) {
-    (T::name().into_owned(), T::schema())
+/// A type's schema under its name, and the named schemas it refers to.
+type NamedSchemas = (String, RefOr<Schema>, Vec<(String, RefOr<Schema>)>);
+
+fn component<T: ToSchema>() -> NamedSchemas {
+    let mut referenced = Vec::new();
+    T::schemas(&mut referenced);
+    (T::name().into_owned(), T::schema(), referenced)
 }
 
 fn string_schema() -> Schema {
@@ -319,6 +331,15 @@ pub(crate) fn documented_codes(route: &Route) -> Option<BTreeSet<&'static str>> 
         Access::Internal => {
             codes.insert("identity.unauthenticated");
         }
+        Access::Session => {
+            codes.insert("identity.unauthenticated");
+        }
+        Access::SessionOptional => {}
+    }
+    // The same-origin check the route table puts on every cookie-authenticated
+    // state-changing route (`http::require_same_origin`).
+    if route.access.uses_session_cookie() && route.verb.mutates() {
+        codes.insert("identity.forbidden");
     }
     codes.extend(doc.errors.iter().copied());
     Some(codes)
@@ -378,9 +399,10 @@ type Components = BTreeMap<String, RefOr<Schema>>;
 fn content(body: &Body, components: &mut Components) -> Result<Content, SpecError> {
     let schema = match body.schema {
         SchemaSource::Component(source) => {
-            let (name, schema) = source();
+            let (name, schema, referenced) = source();
             let reference = RefOr::Ref(Ref::from_schema_name(name.clone()));
             components.insert(name, schema);
+            components.extend(referenced);
             reference
         }
         SchemaSource::Inline(source) => RefOr::T(source()),
@@ -421,6 +443,12 @@ pub fn document() -> Result<OpenApi, SpecError> {
                 "**Authentication:** a bearer token carrying the `{}` scope.",
                 scope.as_str()
             ),
+            Access::Session => SESSION_AUTHENTICATION.to_owned(),
+            Access::SessionOptional => {
+                "**Authentication:** none required; the session cookie is read if sent. \
+                 Must come from the control plane's own origin."
+                    .to_owned()
+            }
             // Skipped above: internal routes are never rendered.
             Access::Internal => unreachable!("internal routes are not rendered"),
         };
@@ -460,6 +488,12 @@ pub fn document() -> Result<OpenApi, SpecError> {
             Access::Public => operation.securities(Some(Vec::<SecurityRequirement>::new())),
             Access::Scoped(scope) => {
                 operation.security(SecurityRequirement::new(SECURITY_SCHEME, [scope.as_str()]))
+            }
+            Access::Session => {
+                operation.security(SecurityRequirement::new(COOKIE_SCHEME, Vec::<&str>::new()))
+            }
+            Access::SessionOptional => {
+                operation.securities(Some(Vec::<SecurityRequirement>::new()))
             }
             // Skipped above: internal routes are never rendered.
             Access::Internal => unreachable!("internal routes are not rendered"),
@@ -537,6 +571,13 @@ pub fn document() -> Result<OpenApi, SpecError> {
                         .description(Some(AUTHENTICATION))
                         .build(),
                 ),
+            )
+            .security_scheme(
+                COOKIE_SCHEME,
+                SecurityScheme::ApiKey(ApiKey::Cookie(ApiKeyValue::with_description(
+                    crate::session::COOKIE_NAME,
+                    SESSION_AUTHENTICATION,
+                ))),
             ),
         |builder, (name, schema)| builder.schema(name, schema),
     );

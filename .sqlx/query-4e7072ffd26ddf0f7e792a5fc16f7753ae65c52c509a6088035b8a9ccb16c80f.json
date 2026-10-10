@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into org_members (org_id, user_id, joined_via) values ($1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4e7072ffd26ddf0f7e792a5fc16f7753ae65c52c509a6088035b8a9ccb16c80f"
+}
