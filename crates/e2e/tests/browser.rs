@@ -94,6 +94,47 @@ fn set_cookie_value(response: &reqwest::Response, name: &str) -> Option<String> 
         })
 }
 
+/// The handshake state cookie a response sets, as `(name, value)`. One per
+/// handshake in flight, named `__Host-clwd_state.<id>` (#83).
+fn state_cookie_set(response: &reqwest::Response) -> Option<(String, String)> {
+    state_cookies_set(response)
+        .into_iter()
+        .find(|(_, value, max_age)| !value.is_empty() && *max_age > 0)
+        .map(|(name, value, _)| (name, value))
+}
+
+/// Every state cookie a response sets or clears: `(name, value, max_age)`.
+fn state_cookies_set(response: &reqwest::Response) -> Vec<(String, String, i64)> {
+    response
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter_map(|c| {
+            let (pair, attributes) = c.split_once(';')?;
+            let (name, value) = pair.split_once('=')?;
+            name.starts_with("__Host-clwd_state.").then(|| {
+                let max_age = attributes
+                    .split(';')
+                    .find_map(|a| a.trim().strip_prefix("Max-Age="))
+                    .and_then(|n| n.parse().ok())
+                    .unwrap_or(0);
+                (name.to_owned(), value.to_owned(), max_age)
+            })
+        })
+        .collect()
+}
+
+/// The `state` query parameter of an `/authorize` URL.
+fn state_of(authorize: &str) -> String {
+    authorize
+        .split("state=")
+        .nth(1)
+        .and_then(|rest| rest.split('&').next())
+        .expect("state")
+        .to_owned()
+}
+
 /// The harness is real: `__Host-` cookies are set and sent, host-only. And
 /// without the pinned certificate the same harness loads nothing — the
 /// permanent negative control that keeps a TLS mistake from becoming a quiet
@@ -510,6 +551,207 @@ async fn concurrent_handshakes_both_end_signed_in(pool: PgPool) {
     }
 }
 
+/// Four tabs of one app, opened at once while signed out: each handshake has
+/// its own state cookie, so none invalidates another, and all four end signed
+/// in (#83).
+#[sqlx::test(migrations = "../../migrations")]
+async fn four_concurrent_handshakes_all_end_signed_in(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let chrome = h.browser().await;
+    open_app(&chrome, WIKI, "/").await;
+    let urls: Vec<String> = ["one", "two", "three", "four"]
+        .iter()
+        .map(|p| format!("https://{NOTES}/{p}"))
+        .collect();
+    let tabs = futures::future::join_all(urls.iter().map(|u| chrome.open(u))).await;
+    for tab in &tabs {
+        assert_eq!(
+            app_name(tab).await,
+            "notes",
+            "{}: {}",
+            url(tab).await,
+            text(tab).await
+        );
+    }
+}
+
+/// A browser's cookies for one app host: every `Set-Cookie` applied, a
+/// `Max-Age=0` one deleting.
+#[derive(Default)]
+struct Jar(Vec<(String, String)>);
+
+impl Jar {
+    fn take(&mut self, response: &reqwest::Response) {
+        for set in response.headers().get_all(reqwest::header::SET_COOKIE) {
+            let Some((pair, attributes)) = set.to_str().ok().and_then(|c| c.split_once(';')) else {
+                continue;
+            };
+            let Some((name, value)) = pair.split_once('=') else {
+                continue;
+            };
+            self.0.retain(|(n, _)| n != name);
+            if !attributes.contains("Max-Age=0") {
+                self.0.push((name.to_owned(), value.to_owned()));
+            }
+        }
+    }
+
+    fn header(&self) -> String {
+        self.0
+            .iter()
+            .map(|(n, v)| format!("{n}={v}"))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    fn states(&self) -> Vec<&str> {
+        self.0
+            .iter()
+            .map(|(n, _)| n.as_str())
+            .filter(|n| n.starts_with("__Host-clwd_state."))
+            .collect()
+    }
+
+    fn get(&self, name: &str) -> Option<String> {
+        self.0
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.clone())
+    }
+}
+
+/// One browser's handshakes, driven by hand so the order is exact, with a
+/// cookie jar that applies every `Set-Cookie` as a browser does:
+///
+/// - a fifth handshake in flight evicts the oldest state cookie;
+/// - the evicted tab's callback restarts cleanly: a fresh handshake, not the
+///   loop guard (and that restart, being a handshake, evicts the next oldest);
+/// - every other tab completes, clearing only its own cookie;
+/// - a tab whose cookie went while another tab signed in just goes to the app;
+/// - a second callback for a completed state is refused, not redirected.
+///
+/// The loop guard's counter is dropped before the fifth: its window is a
+/// minute and a state cookie lives ten, so a browser that began four
+/// handshakes over a minute ago holds four state cookies and no counter.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_fifth_handshake_evicts_the_oldest_and_its_tab_restarts(pool: PgPool) {
+    let h = Harness::start(pool.clone()).await;
+    let http = h.http();
+    let (cp_cookie, _) = control_plane_session(&pool, "tabs@example.com").await;
+    let mut jar = Jar::default();
+    let send = |url: String, jar: &Jar| {
+        let mut request = http.get(url);
+        if !jar.0.is_empty() {
+            request = request.header(reqwest::header::COOKIE, jar.header());
+        }
+        request.send()
+    };
+
+    let mut authorizes = Vec::new();
+    for tab in 0..5 {
+        if tab == 4 {
+            jar.0.retain(|(n, _)| n != "__Host-clwd_hs");
+        }
+        let begun = send(format!("https://{NOTES}/tab{tab}"), &jar)
+            .await
+            .expect("begin");
+        let authorize = location(&begun);
+        assert!(
+            authorize.contains("/authorize?state="),
+            "tab {tab}: {authorize}"
+        );
+        jar.take(&begun);
+        authorizes.push(authorize);
+    }
+    let cookie_of = |authorize: &str| format!("__Host-clwd_state.{}", &state_of(authorize)[..16]);
+    assert_eq!(jar.states().len(), 4, "at most four handshakes in flight");
+    assert!(
+        !jar.states().contains(&cookie_of(&authorizes[0]).as_str()),
+        "the oldest handshake was not the one evicted"
+    );
+
+    // Each tab reaches the control plane, which sends it back with a code.
+    let mut callbacks = Vec::new();
+    for authorize in &authorizes {
+        let issued = http
+            .get(authorize)
+            .header(reqwest::header::COOKIE, &cp_cookie)
+            .send()
+            .await
+            .expect("authorize");
+        callbacks.push(location(&issued));
+    }
+
+    // The evicted tab restarts, and its restart evicts the next oldest (tab 1).
+    let restarted = send(callbacks[0].clone(), &jar)
+        .await
+        .expect("evicted callback");
+    let fresh = location(&restarted);
+    assert!(
+        fresh.contains("/authorize?state="),
+        "the evicted tab did not restart: {fresh}"
+    );
+    jar.take(&restarted);
+    assert!(!jar.states().contains(&cookie_of(&authorizes[1]).as_str()));
+
+    // Tabs 2 to 4 complete, each clearing only its own cookie.
+    let replayable = jar.get(&cookie_of(&authorizes[3])).expect("tab 3's cookie");
+    for tab in 2..5 {
+        let before = jar.states().len();
+        let done = send(callbacks[tab].clone(), &jar).await.expect("callback");
+        assert_eq!(location(&done), format!("/tab{tab}"), "tab {tab}");
+        jar.take(&done);
+        assert!(jar.get(APP_SESSION).is_some(), "tab {tab} got no session");
+        assert_eq!(
+            jar.states().len(),
+            before - 1,
+            "tab {tab} cleared more than its own"
+        );
+        assert!(!jar.states().contains(&cookie_of(&authorizes[tab]).as_str()));
+    }
+
+    // Tab 1's cookie went, but the browser is signed in now: to the app.
+    let late = send(callbacks[1].clone(), &jar)
+        .await
+        .expect("late callback");
+    assert_eq!(location(&late), "/", "tab 1 did not just go to the app");
+
+    // Tab 0's restart completes too.
+    let issued = http
+        .get(&fresh)
+        .header(reqwest::header::COOKIE, &cp_cookie)
+        .send()
+        .await
+        .expect("authorize");
+    let done = send(location(&issued), &jar)
+        .await
+        .expect("restarted callback");
+    assert_eq!(
+        location(&done),
+        "/",
+        "tab 0's restart returned somewhere else"
+    );
+    jar.take(&done);
+    assert!(
+        jar.states().is_empty(),
+        "a state cookie outlived its handshake"
+    );
+
+    // A second callback for tab 3's completed state, its cookie replayed:
+    // refused, never another redirect.
+    let replayed = http
+        .get(&callbacks[3])
+        .header(
+            reqwest::header::COOKIE,
+            format!("{}={replayable}", cookie_of(&authorizes[3])),
+        )
+        .send()
+        .await
+        .expect("replay");
+    let body: serde_json::Value = replayed.json().await.expect("an envelope");
+    assert_eq!(body["code"], "gateway.sign_in_failed");
+}
+
 /// Only a valid app-host session for the requested app reaches the hop:
 /// none, a session for another app, a forged one — each leaves the count at
 /// zero. And the hop's target is the resolved app, whatever the request says.
@@ -576,7 +818,7 @@ async fn no_code_or_state_is_ever_logged(pool: PgPool) {
         .send()
         .await
         .expect("begin");
-    let state_cookie = set_cookie_value(&begun, "__Host-clwd_state").expect("state cookie");
+    let (state_name, state_cookie) = state_cookie_set(&begun).expect("state cookie");
     let issued = http
         .get(location(&begun))
         .header(reqwest::header::COOKIE, &cp_cookie)
@@ -594,7 +836,7 @@ async fn no_code_or_state_is_ever_logged(pool: PgPool) {
         .get(&callback)
         .header(
             reqwest::header::COOKIE,
-            format!("__Host-clwd_state={state_cookie}"),
+            format!("{state_name}={state_cookie}"),
         )
         .send()
         .await
@@ -608,7 +850,7 @@ async fn no_code_or_state_is_ever_logged(pool: PgPool) {
     );
     for (what, value) in [
         ("code", &code),
-        ("state", &state_cookie),
+        ("state", &state_of(&location(&begun))),
         ("session", &session),
     ] {
         assert!(!text.contains(value.as_str()), "a {what} reached the logs");

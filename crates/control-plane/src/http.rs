@@ -1187,7 +1187,14 @@ mod tests {
     #[tokio::test]
     async fn a_bare_5xx_is_never_echoed_and_keeps_its_status() {
         let (status, json, _) = converted(|| {
-            (StatusCode::BAD_GATEWAY, "upstream db-7.internal refused").into_response()
+            // The marker has letters no request id can hold: a UUIDv7 id is
+            // hex with `-7` at its version position, so a hex-looking marker
+            // like `db-7` matched one id in 256 and failed for nothing.
+            (
+                StatusCode::BAD_GATEWAY,
+                "upstream zq-leak-marker.internal refused",
+            )
+                .into_response()
         })
         .await;
         assert_eq!(
@@ -1197,7 +1204,7 @@ mod tests {
         );
         assert_eq!(json["code"], "control-plane.internal");
         assert!(
-            !json.to_string().contains("db-7"),
+            !json.to_string().contains("zq-leak-marker"),
             "a server error's text leaked: {json}"
         );
     }

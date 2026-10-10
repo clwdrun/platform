@@ -37,7 +37,7 @@ it is decided before anything (#11) builds on a session model.
 | `__Host-clwd_session` | control plane | sign-in | `session::set_cookie` |
 | `__Host-clwd_signin` | control plane | sign-in start | `signin::flow_cookie` |
 | `__Host-clwd_app_session` | one app host | gateway, after the exchange | `gateway::signin::app_session_cookie` |
-| `__Host-clwd_state` | one app host | gateway, at handshake start | `gateway::signin::state_cookie` |
+| `__Host-clwd_state.<id>` | one app host, one per handshake in flight | gateway, at handshake start | `gateway::signin::state_cookie` |
 | `__Host-clwd_hs` | one app host | gateway, loop guard | `gateway::signin::counter_cookie` |
 
 Every one is `__Host-`: `Secure`, `Path=/`, no `Domain`, host-only. Every one's
@@ -56,18 +56,28 @@ names (they trim Unicode whitespace into the real name) and are banned in
 1. A visitor reaches `notes.acme.<apps domain>` with no app-host session. The
    gateway asks the control plane (internal listener) to begin a handshake for the
    app with the same-host path asked for, sets the returned state as
-   `__Host-clwd_state`, and redirects to `/authorize?state=…`.
+   `__Host-clwd_state.<id>`, where `<id>` is the state's first 16 hex characters,
+   and redirects to `/authorize?state=…`.
 2. The control plane finds the handshake by its state. With no control-plane
    session, it signs the visitor in first (`/auth/google?resume=<state>`) and comes
    back. It issues a single-use, 60-second code bound to the handshake and the
    session, and redirects to `https://<the handshake's app host>/__clwd/callback`.
    The host comes from the app row. There is no host or redirect parameter.
-3. The gateway checks the callback's `state` against the state cookie, exchanges
-   code and state server-to-server (internal listener, internal credential), sets
-   `__Host-clwd_app_session`, and redirects to the stored path.
+3. The gateway checks the callback's `state` against the state cookie named by
+   that state, exchanges code and state server-to-server (internal listener,
+   internal credential), sets `__Host-clwd_app_session`, clears that one state
+   cookie, and redirects to the stored path.
 
-On a state mismatch the gateway restarts the handshake instead of dead-ending, so
-two concurrent tabs both end signed in. More than four handshakes from one browser
+**Each handshake has its own state cookie** (#83). With one cookie per host, a
+second tab overwrote the first tab's state; both callbacks then mismatched and
+restarted, overwriting each other in turn, until the loop guard stopped them
+with `gateway.sign_in_loop`: two tabs opened while signed out could fail. Now
+concurrent handshakes do not touch each other's cookies. At most four are in
+flight per host, so a page opening many tabs cannot grow the `Cookie` header
+without limit; a fifth evicts the oldest. A callback whose cookie is gone
+(evicted, expired, or another browser's) goes to the app if the visitor has
+signed in meanwhile, and otherwise restarts its handshake instead of
+dead-ending. More than four handshakes from one browser
 for one host in a minute shows an error rather than another redirect. Redirects
 carrying a code or state send `Referrer-Policy: no-referrer` and `Cache-Control:
 no-store`, and no log line carries a query string.
