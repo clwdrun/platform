@@ -1,0 +1,39 @@
+name: advisories
+
+# `ci` checks advisories only when something is pushed. An advisory published
+# against a dependency we already lock arrives with no push, so on a quiet week
+# the gate never looks. This runs the same check against `main` every day, so a
+# new advisory fails a run within a day instead of on the next unrelated pull
+# request.
+on:
+  schedule:
+    - cron: "23 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_NET_RETRY: 3
+  # The seam dependency lives in a private repository; see ci.yml.
+  CARGO_NET_GIT_FETCH_WITH_CLI: true
+
+jobs:
+  advisories:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Authenticate for the clwd seam dependency
+        run: |
+          git config --global \
+            url."https://x-access-token:${{ secrets.CLWD_READ_TOKEN }}@github.com/".insteadOf \
+            "https://github.com/"
+
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
+        with:
+          tool: cargo-deny
+
+      - name: advisories
+        run: cargo deny check --hide-inclusion-graph advisories
