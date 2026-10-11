@@ -163,6 +163,34 @@ impl Exchanged {
 #[error("the control plane could not be reached for sign-in: {0}")]
 pub struct Unreachable(String);
 
+/// An HTTP failure talking to the control plane, as [`Unreachable`]: the
+/// URL left out (it can carry a code or a state), but what kind of failure it
+/// was and its whole cause chain kept. reqwest's own message is only "error
+/// sending request" for a timeout, a refused connection and a reset alike,
+/// which could not tell a pool wait from a dead connection (#90).
+fn unreachable(error: reqwest::Error) -> Unreachable {
+    let kind = if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connect"
+    } else if error.is_body() || error.is_decode() {
+        "body"
+    } else if error.is_request() {
+        "request"
+    } else {
+        "other"
+    };
+    let error = error.without_url();
+    let mut message = format!("{kind}: {error}");
+    let mut source = std::error::Error::source(&error);
+    while let Some(cause) = source {
+        message.push_str(": ");
+        message.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    Unreachable(message)
+}
+
 /// The gateway's client for the control plane's internal sign-in routes.
 pub struct SigninClient {
     client: reqwest::Client,
@@ -216,7 +244,7 @@ impl SigninClient {
             .json(&body)
             .send()
             .await
-            .map_err(|e| Unreachable(e.without_url().to_string()))
+            .map_err(unreachable)
     }
 
     /// Begin a handshake for `app_id`, returning its state.
@@ -238,10 +266,7 @@ impl SigninClient {
         if response.status() != StatusCode::CREATED {
             return Err(Unreachable(format!("begin answered {}", response.status())));
         }
-        let body: BeginResponse = response
-            .json()
-            .await
-            .map_err(|e| Unreachable(e.without_url().to_string()))?;
+        let body: BeginResponse = response.json().await.map_err(unreachable)?;
         Ok(body.state)
     }
 
@@ -264,10 +289,7 @@ impl SigninClient {
             .await?;
         match response.status() {
             StatusCode::OK => {
-                let body: ExchangeResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| Unreachable(e.without_url().to_string()))?;
+                let body: ExchangeResponse = response.json().await.map_err(unreachable)?;
                 Ok(Some(Exchanged {
                     session: AppSession(body.session),
                     max_age_secs: body.max_age_secs,
@@ -301,10 +323,7 @@ impl SigninClient {
             .await?;
         match response.status() {
             StatusCode::OK => {
-                let body: CheckResponse = response
-                    .json()
-                    .await
-                    .map_err(|e| Unreachable(e.without_url().to_string()))?;
+                let body: CheckResponse = response.json().await.map_err(unreachable)?;
                 Ok(Some(Checked {
                     caller: Caller::new(
                         AppSubject::new(body.subject),
