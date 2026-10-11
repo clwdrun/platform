@@ -1,5 +1,6 @@
 //! Wire types shared across platform crates, plus tracing/otel setup.
 
+pub mod authz;
 pub mod cert;
 pub mod cookie;
 pub mod domains;

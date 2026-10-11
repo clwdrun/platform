@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select count(distinct (c.relname, t.tgname)) as \"n!\"\n             from pg_trigger t\n             join pg_class c on c.oid = t.tgrelid\n            where c.relnamespace = current_schema()::regnamespace\n              and c.relname = any($1) and t.tgname = any($2) and t.tgenabled = 'O'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "NameArray",
+        "NameArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "6d1fb07093894e3a84dd2cf4c63ed1ed568a4caaecdeed42d5a21f129449fd1a"
+}

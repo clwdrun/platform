@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from gateway_leases where renewed_at < now() - make_interval(secs => $1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d8d034a9f98f9e152ff4d4b2b71016a99034a8a6364313cdd10ef62e3bdbdd96"
+}

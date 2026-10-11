@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "insert into gateway_leases (gateway_id, applied_seq, lease_until)\n               values ($1, $2, case when $4 then now() + make_interval(secs => $3) else now() end)\n               on conflict (gateway_id) do update\n                 set applied_seq = greatest(gateway_leases.applied_seq, excluded.applied_seq),\n                     lease_until = case when $4 then excluded.lease_until\n                                        else gateway_leases.lease_until end,\n                     renewed_at = now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int8",
+        "Float8",
+        "Bool"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "89e7070e92bf5636fe8af7441a00b49c16341dd5aa269655ba5b94fdcbfe8c65"
+}

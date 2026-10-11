@@ -5,6 +5,7 @@
 //! lives here in the library so it can be unit-tested without standing up a
 //! listener.
 
+pub mod authz;
 pub mod cert;
 pub mod edge;
 pub mod host;
