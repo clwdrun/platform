@@ -543,6 +543,20 @@ pub struct Harness {
     pub control_plane_port: u16,
     pub gateway_port: u16,
     pub evil_port: u16,
+    /// Every server thread this harness started: stopped when it drops.
+    servers: Servers,
+    /// Files and directories this harness made: removed when it drops,
+    /// after the servers that use them have stopped.
+    _scratch: Vec<Scratch>,
+}
+
+impl Drop for Harness {
+    /// Stop every server this test started, whether it passed or panicked:
+    /// a server left running keeps threads, sockets and retries going for the
+    /// rest of the binary, under every test that runs after it (#90).
+    fn drop(&mut self) {
+        self.servers.stop_all();
+    }
 }
 
 /// The whoami fixture (`crates/e2e/fixtures/whoami`), built for wasm32-wasip2
@@ -622,6 +636,7 @@ impl Harness {
 
     async fn start_with(pool: PgPool, kind: Hop) -> Self {
         logs();
+        no_server_outlives_its_test();
         control_plane::acme::install_crypto_provider();
 
         // Apps: two in `acme`, one in `other`.
@@ -717,9 +732,9 @@ impl Harness {
             seen_cookies: Mutex::default(),
             seen_paths: Mutex::default(),
         });
-        let cert_dir = std::env::temp_dir().join(format!("e2e-certs-{}", uuid::Uuid::now_v7()));
+        let cert_dir = Scratch::dir("certs");
         for org in ["acme", "other"] {
-            let dir = cert_dir.join(org);
+            let dir = cert_dir.path().join(org);
             std::fs::create_dir_all(&dir).expect("cert dir");
             std::fs::File::create(dir.join("cert.pem"))
                 .and_then(|mut f| f.write_all(certs().cert_pem.as_bytes()))
@@ -729,6 +744,8 @@ impl Harness {
                 .expect("key.pem");
         }
         let internal_base = format!("http://127.0.0.1:{internal_port}");
+        let servers = Servers::default();
+        let mut scratch = vec![cert_dir];
         let (hop, worker): (Arc<dyn AppUpstream>, _) = match kind {
             Hop::Test => (upstream.clone(), None),
             Hop::Given(hop) => (hop, None),
@@ -736,13 +753,13 @@ impl Harness {
                 let worker = Arc::new(
                     worker::Worker::new(artifacts.clone(), my_uid()).expect("the worker starts"),
                 );
-                let socket = socket_path();
+                let socket = Scratch::socket();
                 // Its own runtime on its own threads, as its own process has in
                 // production. On the test's single-threaded runtime, running
                 // app code would starve the control plane beside it.
-                let (serving, path) = (Arc::clone(&worker), socket.clone());
+                let (serving, path) = (Arc::clone(&worker), socket.path().to_path_buf());
                 let (ready, bound) = tokio::sync::oneshot::channel();
-                std::thread::spawn(move || {
+                servers.spawn("worker", move |mut stop| {
                     let runtime = tokio::runtime::Builder::new_multi_thread()
                         .enable_all()
                         .build()
@@ -751,18 +768,27 @@ impl Harness {
                         let listener =
                             tokio::net::UnixListener::bind(&path).expect("bind the worker");
                         let _ = ready.send(());
-                        serving.serve(listener).await;
+                        tokio::select! {
+                            () = serving.serve(listener) => {}
+                            _ = stop.wait_for(|stop| *stop) => {}
+                        }
                     });
                 });
                 bound.await.expect("the worker is listening");
-                (
-                    Arc::new(gateway::worker::WorkerUpstream::new(&socket, my_uid())),
-                    Some(worker),
-                )
+                let upstream = gateway::worker::WorkerUpstream::new(socket.path(), my_uid());
+                scratch.push(socket);
+                (Arc::new(upstream), Some(worker))
             }
         };
-        let gateway_port =
-            start_gateway(&pool, &internal_base, &hop, &cert_dir, control_plane_port).await;
+        let gateway_port = start_gateway(
+            &pool,
+            &internal_base,
+            &hop,
+            scratch[0].path(),
+            control_plane_port,
+            &servers,
+        )
+        .await;
         for port in [control_plane_port, evil_port] {
             wait_for_port(port).await;
         }
@@ -776,6 +802,8 @@ impl Harness {
             control_plane_port,
             gateway_port,
             evil_port,
+            servers,
+            _scratch: scratch,
         }
     }
 
@@ -848,6 +876,7 @@ async fn start_gateway(
     hop: &Arc<dyn AppUpstream>,
     cert_dir: &std::path::Path,
     control_plane_port: u16,
+    servers: &Servers,
 ) -> u16 {
     for attempt in 1..=5 {
         let gateway_port = free_port();
@@ -856,7 +885,7 @@ async fn start_gateway(
             hop.clone(),
             cert_dir.to_path_buf(),
         );
-        std::thread::spawn(move || {
+        let server = servers.spawn("gateway", move |stop| {
             use pingora::apps::http_app::HttpServer;
             use pingora::listeners::tls::TlsSettings;
             use pingora::server::Server;
@@ -886,7 +915,11 @@ async fn start_gateway(
             let mut service = Service::new("e2e-gateway".to_owned(), HttpServer::new_app(edge));
             service.add_tls_with_settings(&format!("127.0.0.1:{gateway_port}"), None, tls);
             server.add_service(service);
-            server.run_forever();
+            // `run`, not `run_forever`: it returns once told to stop, and
+            // installs no process-wide signal handlers in a test binary.
+            server.run(pingora::server::RunArgs {
+                shutdown_signal: Box::new(StopSignal(stop)),
+            });
         });
         wait_for_port(gateway_port).await;
         let before: i64 = sqlx::query_scalar("select count(*) from handshakes")
@@ -904,6 +937,8 @@ async fn start_gateway(
         if probe.is_ok() && after > before {
             return gateway_port;
         }
+        // This attempt's server answered for nobody: stop it now.
+        servers.stop(server);
         eprintln!(
             "e2e: gateway port {gateway_port} answered for another harness (attempt {attempt}); retrying"
         );
@@ -965,10 +1000,12 @@ const NAVIGATION_DEADLINE: Duration = Duration::from_secs(30);
 pub struct Chrome {
     pub browser: Browser,
     _handler: tokio::task::JoinHandle<()>,
+    /// The profile directory: removed after the browser above is dropped.
+    _profile: Scratch,
 }
 
 async fn launch(rules: &str, spki_pin: Option<&str>) -> Chrome {
-    let dir = std::env::temp_dir().join(format!("e2e-chrome-{}", uuid::Uuid::now_v7()));
+    let profile = Scratch::dir("chrome");
     let mut builder = BrowserConfig::builder()
         .chrome_executable(chrome_binary())
         .new_headless_mode()
@@ -977,7 +1014,7 @@ async fn launch(rules: &str, spki_pin: Option<&str>) -> Chrome {
         // DevTools protocol. Off: the only trust is the pinned key below, and
         // the no-bypass control proves it (it caught this default).
         .respect_https_errors()
-        .user_data_dir(dir)
+        .user_data_dir(profile.path())
         .arg(("host-resolver-rules", rules));
     if let Some(pin) = spki_pin {
         builder = builder.arg(("ignore-certificate-errors-spki-list", pin));
@@ -993,6 +1030,7 @@ async fn launch(rules: &str, spki_pin: Option<&str>) -> Chrome {
     Chrome {
         browser,
         _handler: handle,
+        _profile: profile,
     }
 }
 
@@ -1068,4 +1106,239 @@ pub async fn wait_to_leave(page: &Page, from: &str) {
 /// The page's URL.
 pub async fn url(page: &Page) -> String {
     page.url().await.ok().flatten().unwrap_or_default()
+}
+
+// ------------------------------------------------------------ servers ----
+
+/// Server threads alive right now, across every test in this binary.
+static LIVE_SERVERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Held by a server thread for its whole life.
+struct Alive;
+
+impl Alive {
+    fn new() -> Self {
+        LIVE_SERVERS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Alive {
+    fn drop(&mut self) {
+        LIVE_SERVERS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// One server thread and the signal that stops it. Dropping the signal's
+/// sender stops the server too, so a forgotten harness still cleans up.
+pub struct ServerThread {
+    name: &'static str,
+    stop: tokio::sync::watch::Sender<bool>,
+    thread: std::thread::JoinHandle<()>,
+}
+
+/// Every server thread a harness started.
+#[derive(Default)]
+pub struct Servers(Mutex<Vec<Option<ServerThread>>>);
+
+impl Servers {
+    /// Start `serve` on a thread of its own, handing it the stop signal. The
+    /// thread is counted live until it returns.
+    fn spawn(
+        &self,
+        name: &'static str,
+        serve: impl FnOnce(tokio::sync::watch::Receiver<bool>) + Send + 'static,
+    ) -> usize {
+        let (stop, stopped) = tokio::sync::watch::channel(false);
+        let alive = Alive::new();
+        let thread = std::thread::spawn(move || {
+            let _alive = alive;
+            serve(stopped);
+        });
+        let mut threads = self.0.lock().expect("servers");
+        threads.push(Some(ServerThread { name, stop, thread }));
+        threads.len() - 1
+    }
+
+    /// Stop one server, by the index `spawn` returned.
+    fn stop(&self, index: usize) {
+        let server = self.0.lock().expect("servers")[index].take();
+        if let Some(server) = server {
+            let _ = server.stop.send(true);
+            join(server);
+        }
+    }
+
+    /// Stop every server this harness started, and wait for each to exit.
+    fn stop_all(&self) {
+        let servers: Vec<ServerThread> = std::mem::take(&mut *self.0.lock().expect("servers"))
+            .into_iter()
+            .flatten()
+            .collect();
+        for server in &servers {
+            let _ = server.stop.send(true);
+        }
+        for server in servers {
+            join(server);
+        }
+    }
+}
+
+/// Wait up to ten seconds for a stopped server's thread to exit. One that
+/// does not is left counted live, and the exit check fails the binary.
+fn join(server: ServerThread) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !server.thread.is_finished() {
+        if std::time::Instant::now() > deadline {
+            eprintln!("e2e: the {} server did not stop within 10 s", server.name);
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let _ = server.thread.join();
+}
+
+/// pingora's shutdown signal, from the harness rather than from Unix signals.
+/// A closed channel (the harness dropped without stopping) also stops it.
+struct StopSignal(tokio::sync::watch::Receiver<bool>);
+
+#[async_trait::async_trait]
+impl pingora::server::ShutdownSignalWatch for StopSignal {
+    async fn recv(&self) -> pingora::server::ShutdownSignal {
+        let mut stop = self.0.clone();
+        let _ = stop.wait_for(|stop| *stop).await;
+        pingora::server::ShutdownSignal::FastShutdown
+    }
+}
+
+/// The end-of-suite check: when this test binary exits, no server any test
+/// started may still be alive. Registered once; it turns a leak into a failed
+/// binary rather than a slower, noisier one.
+fn no_server_outlives_its_test() {
+    static REGISTERED: OnceLock<()> = OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        extern "C" fn check() {
+            let live = LIVE_SERVERS.load(std::sync::atomic::Ordering::SeqCst);
+            let left = LIVE_SCRATCH.load(std::sync::atomic::Ordering::SeqCst);
+            let recreated = std::fs::read_dir(scratch_root()).map_or(0, Iterator::count);
+            let _ = std::fs::remove_dir_all(scratch_root());
+            if recreated > 0 {
+                eprintln!(
+                    "e2e: {recreated} scratch path(s) recreated after removal, in {}",
+                    scratch_root().display()
+                );
+            }
+            if live > 0 || left > 0 {
+                eprintln!(
+                    "e2e: {live} test server(s) still alive and {left} scratch path(s) left when the binary exited"
+                );
+                // SAFETY: `_exit` ends the process at once, which is all this
+                // handler is for; it runs no further handlers.
+                unsafe { libc::_exit(1) };
+            }
+        }
+        // SAFETY: `check` is a plain `extern "C" fn` with no captures.
+        unsafe {
+            libc::atexit(check);
+        }
+    });
+}
+
+/// When a request under load was refused, say why before the assertion fails:
+/// the gateway's warning for whichever control-plane call failed (the route
+/// lookup or the session check, with its error), the control plane's pool
+/// state for any slow or failed acquire, and Postgres's connections against
+/// its limit (#90).
+pub async fn explain_refusals(pool: &PgPool) {
+    let text = logs().text();
+    let causes: Vec<&str> = text
+        .lines()
+        .filter(|l| {
+            l.contains("cold lookup")
+                || l.contains("app session check failed")
+                || l.contains("waited for a database connection")
+                || l.contains("time to acquire exceeded")
+                || l.contains("too many clients")
+        })
+        .collect();
+    eprintln!("REFUSALS {} cause lines", causes.len());
+    for line in causes.iter().take(200) {
+        eprintln!("REFUSALS {}", &line[..line.len().min(500)]);
+    }
+    let connections: Result<(i64, String), _> = sqlx::query_as(
+        "select (select count(*) from pg_stat_activity), current_setting('max_connections')",
+    )
+    .fetch_one(pool)
+    .await;
+    eprintln!(
+        "REFUSALS postgres connections (all databases), max: {connections:?}; this test's pool size {} idle {}",
+        pool.size(),
+        pool.num_idle()
+    );
+}
+
+/// Scratch paths that exist right now, across every test in this binary.
+static LIVE_SCRATCH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A file or directory a test made, removed when this is dropped (on a pass
+/// or a panic). Left behind, Chrome profiles filled `/tmp`'s quota after a
+/// few hundred runs (#90). Sockets get short paths of their own, because a
+/// Unix socket path must fit in 108 bytes.
+pub struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    /// A fresh directory, `<scratch root>/<kind>-<id>`.
+    fn dir(kind: &str) -> Self {
+        let path = scratch_root().join(format!("{kind}-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&path).expect("a scratch directory");
+        LIVE_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(path)
+    }
+
+    /// A socket path short enough for `SUN_LEN`; the socket is made by
+    /// whatever binds it.
+    pub fn socket() -> Self {
+        LIVE_SCRATCH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self(socket_path())
+    }
+
+    pub fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for Scratch {
+    /// Releasing the guard is what the exit check counts: a path whose guard
+    /// was never dropped is a leak. Physical removal can lag the release:
+    /// Chrome is killed asynchronously, and its helper processes write into
+    /// the profile while they exit, so a profile is removed again until it
+    /// stays gone, and whatever remains is removed with the scratch root at
+    /// exit.
+    fn drop(&mut self) {
+        LIVE_SCRATCH.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if self.0.starts_with(scratch_root()) {
+            let path = self.0.clone();
+            let _ = std::fs::remove_dir_all(&path);
+            std::thread::spawn(move || {
+                for _ in 0..25 {
+                    std::thread::sleep(Duration::from_millis(200));
+                    let _ = std::fs::remove_dir_all(&path);
+                }
+            });
+        } else if let Err(e) = std::fs::remove_file(&self.0)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            eprintln!("e2e: could not remove {}: {e}", self.0.display());
+        }
+    }
+}
+
+/// Where scratch directories go: one directory per test binary run, under
+/// the system temp directory (in RAM here). Not under `target/`: Chrome
+/// writes its profile constantly, and on disk that I/O slowed every browser
+/// test running beside it.
+fn scratch_root() -> std::path::PathBuf {
+    static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
+    ROOT.get_or_init(|| std::env::temp_dir().join(format!("clwd-e2e-{}", std::process::id())))
+        .clone()
 }

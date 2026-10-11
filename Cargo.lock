@@ -2071,6 +2071,7 @@ dependencies = [
  "hyper 1.11.0",
  "hyper-util",
  "identity",
+ "libc",
  "opendal",
  "openidconnect",
  "pingora",
