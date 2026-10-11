@@ -15,6 +15,8 @@ use support::{
     text, url, wait_to_leave,
 };
 
+use std::sync::Arc;
+
 use control_plane::session;
 use sqlx::PgPool;
 
@@ -902,6 +904,12 @@ struct Visitor {
     subject: String,
     /// The control-plane session the app session hangs off.
     parent: control_plane::ids::SessionId,
+    /// The control-plane session's `Cookie` pair, for signing out.
+    cp_cookie: String,
+    /// The app-host session secret, for a gateway driven directly.
+    secret: String,
+    app_id: uuid::Uuid,
+    user_id: uuid::Uuid,
 }
 
 async fn visitor(pool: &PgPool, email: &str, member: bool) -> Visitor {
@@ -912,11 +920,17 @@ async fn visitor_of(pool: &PgPool, app: &str, email: &str, member: bool) -> Visi
     let user = control_plane::db::create_user(pool, email)
         .await
         .expect("user");
-    let parent = session::issue(pool, &cookie_key(), user.id)
+    let issued = session::issue(pool, &cookie_key(), user.id)
         .await
         .expect("issue")
-        .expect("a session")
-        .id;
+        .expect("a session");
+    let parent = issued.id;
+    let cp_cookie = issued
+        .set_cookie
+        .split(';')
+        .next()
+        .expect("a name=value pair")
+        .to_owned();
     let app: uuid::Uuid = sqlx::query_scalar(
         "select a.id from apps a join orgs o on o.id = a.org_id where o.slug = 'acme' and a.name = $1",
     )
@@ -962,6 +976,10 @@ async fn visitor_of(pool: &PgPool, app: &str, email: &str, member: bool) -> Visi
         cookie: format!("{APP_SESSION}={secret}"),
         subject,
         parent,
+        cp_cookie,
+        secret,
+        app_id: app,
+        user_id: user.id.as_uuid(),
     }
 }
 
@@ -1150,11 +1168,10 @@ async fn a_revoked_session_runs_nothing(pool: PgPool) {
     let client = h.http();
     let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
     assert_eq!(status, 200, "positive control: the session works");
-    sqlx::query("update sessions set revoked_at = now() where id = $1")
-        .bind(v.parent.as_uuid())
-        .execute(&pool)
-        .await
-        .expect("revoke");
+    // The API revoke path, whose bound is zero: the next request is refused
+    // with no wait of the test's own. (A raw SQL revoke's 3-second bound has
+    // its own test.)
+    sign_out(&client, &v).await;
     let before = invocations(&h);
     let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
     assert_ne!(status, 200);
@@ -1368,4 +1385,441 @@ async fn a_misbehaving_worker_is_contained(pool: PgPool) {
             assert_eq!(json["code"], "gateway.app_unreachable", "{path}");
         }
     }
+}
+
+// ======================================================================
+// #12: the authorization cache. Each test warms the cache first and checks
+// the warm request really was a hit, so what it proves is invalidation, not
+// a miss. Changes made outside the API wait on `settle`, which is the revoke
+// API's own wait: the contract is "within the lease" for those.
+// ======================================================================
+
+/// Wait until no gateway can serve a decision older than the newest change.
+async fn settle(pool: &PgPool) {
+    let seq = control_plane::relay::latest(pool).await.expect("latest");
+    control_plane::relay::converged(pool, seq)
+        .await
+        .expect("every gateway converges");
+}
+
+fn hits(h: &Harness) -> u64 {
+    h.authz
+        .stats()
+        .hits
+        .load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Two requests as `v`; the second must be a cache hit.
+async fn warm(h: &Harness, client: &reqwest::Client, v: &Visitor, host: &str) {
+    let (status, json) = on_app(client, host, "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 200, "positive control: the session works: {json}");
+    let before = hits(h);
+    let (status, json) = on_app(client, host, "/whoami", &v.cookie, &[]).await;
+    assert_eq!(status, 200, "{json}");
+    assert_eq!(hits(h), before + 1, "the warm request was not a cache hit");
+}
+
+/// `POST /auth/logout` as `v`, the API revoke path.
+async fn sign_out(client: &reqwest::Client, v: &Visitor) {
+    let response = client
+        .post(format!("https://{CONTROL_PLANE}/auth/logout"))
+        .header(reqwest::header::COOKIE, &v.cp_cookie)
+        .header("sec-fetch-site", "same-origin")
+        .send()
+        .await
+        .expect("the control plane answers");
+    assert_eq!(response.status(), 204);
+}
+
+/// Refused, and no app code ran.
+async fn refused(h: &Harness, client: &reqwest::Client, v: &Visitor, host: &str, case: &str) {
+    let before = invocations(h);
+    let (status, json) = on_app(client, host, "/whoami", &v.cookie, &[]).await;
+    assert_ne!(status, 200, "{case}: a stale allow was served: {json}");
+    assert_eq!(invocations(h), before, "{case}: app code ran");
+}
+
+/// Test 1: signing out (the API path) denies the very next request, from a
+/// warm cache, with no wait of the test's own.
+#[sqlx::test(migrations = "../../migrations")]
+async fn signing_out_denies_the_next_request_from_a_warm_cache(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    warm(&h, &client, &v, NOTES).await;
+    sign_out(&client, &v).await;
+    refused(&h, &client, &v, NOTES, "sign-out").await;
+}
+
+/// What a staleness case changes, and what the next request must show.
+enum Expect {
+    Refused,
+    /// Allowed, with this field of the caller changed.
+    Changed(&'static str),
+}
+
+/// Test 2: every decision input, changed directly in SQL with a warm cache.
+/// The cases are keyed by table and must cover exactly
+/// `control_plane::authz::INPUTS`, so adding an input without a case here
+/// fails this test. Run in one harness; app and org deletion last.
+#[sqlx::test(migrations = "../../migrations")]
+async fn every_decision_input_invalidates_a_warm_cache(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let client = h.http();
+    let cases: &[(&str, &str, &str, Expect)] = &[
+        (
+            "app_sessions",
+            "notes",
+            "update app_sessions set expires_at = now() where parent_session_id = $1",
+            Expect::Refused,
+        ),
+        (
+            "sessions",
+            "notes",
+            "update sessions set revoked_at = now() where id = $1",
+            Expect::Refused,
+        ),
+        (
+            "users",
+            "notes",
+            "update users set deleted_at = now() where id = (select user_id from sessions where id = $1)",
+            Expect::Refused,
+        ),
+        (
+            "users",
+            "notes",
+            "update users set email = 'renamed@example.com' where id = (select user_id from sessions where id = $1)",
+            Expect::Changed("email"),
+        ),
+        (
+            "org_members",
+            "notes",
+            "delete from org_members where user_id = (select user_id from sessions where id = $1)",
+            Expect::Refused,
+        ),
+        (
+            "app_subjects",
+            "notes",
+            "update app_subjects set subject = gen_random_uuid() where user_id = (select user_id from sessions where id = $1)",
+            Expect::Changed("subject"),
+        ),
+        (
+            "apps",
+            "notes",
+            "update apps set deleted_at = now() where name = 'notes' and $1::uuid is not null",
+            Expect::Refused,
+        ),
+        (
+            "orgs",
+            "wiki",
+            "update orgs set deleted_at = now() where slug = 'acme' and $1::uuid is not null",
+            Expect::Refused,
+        ),
+    ];
+    let covered: std::collections::BTreeSet<&str> = cases.iter().map(|c| c.0).collect();
+    let inputs: std::collections::BTreeSet<&str> = control_plane::authz::INPUTS
+        .iter()
+        .map(|i| i.table)
+        .collect();
+    assert_eq!(covered, inputs, "a decision input has no staleness case");
+
+    for (i, (table, app, change, expect)) in cases.iter().enumerate() {
+        let v = visitor_of(&pool, app, &format!("v{i}@example.com"), true).await;
+        let host = if *app == "wiki" { WIKI } else { NOTES };
+        warm(&h, &client, &v, host).await;
+        let (_, before) = on_app(&client, host, "/whoami", &v.cookie, &[]).await;
+        sqlx::query(*change)
+            .bind(v.parent.as_uuid())
+            .execute(&pool)
+            .await
+            .expect(table);
+        settle(&pool).await;
+        match expect {
+            Expect::Refused => refused(&h, &client, &v, host, table).await,
+            Expect::Changed(field) => {
+                let (status, after) = on_app(&client, host, "/whoami", &v.cookie, &[]).await;
+                assert_eq!(status, 200, "{table}: {after}");
+                assert_ne!(
+                    after["caller"][field], before["caller"][field],
+                    "{table}: the cached {field} was served after it changed"
+                );
+            }
+        }
+    }
+}
+
+/// Test 3: a revocation typed straight into Postgres, bypassing every code
+/// path, still reaches a warm cache. This is what proves the triggers rather
+/// than the application's write paths.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revocation_typed_into_psql_reaches_a_warm_cache(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    warm(&h, &client, &v, NOTES).await;
+    // What an operator's psql session does: a transaction, a statement, a
+    // commit. No control-plane function is called.
+    let mut psql = pool.begin().await.expect("begin");
+    sqlx::query("update sessions set revoked_at = now() where id = $1")
+        .bind(v.parent.as_uuid())
+        .execute(&mut *psql)
+        .await
+        .expect("revoke by hand");
+    psql.commit().await.expect("commit");
+    settle(&pool).await;
+    refused(&h, &client, &v, NOTES, "psql").await;
+}
+
+/// Test 4: a dropped stream fails closed. Cut it (and keep it cut), revoke
+/// with no stream to carry the news, and request at once, inside the lease:
+/// refused, because a gateway without a stream bypasses its cache.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_dropped_stream_fails_closed(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    warm(&h, &client, &v, NOTES).await;
+    h.stream_proxy.cut();
+    support::wait_until("the gateway sees its stream drop", || {
+        h.authz
+            .stats()
+            .disconnects
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1
+    })
+    .await;
+    sqlx::query("update sessions set revoked_at = now() where id = $1")
+        .bind(v.parent.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    refused(&h, &client, &v, NOTES, "dropped stream").await;
+}
+
+/// A disabled trigger is a revocation that would never be announced, so the
+/// relay stops heartbeating and the gateway stops caching.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_disabled_trigger_sends_the_gateway_to_bypass(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    warm(&h, &client, &v, NOTES).await;
+    sqlx::query("alter table org_members disable trigger authz_del")
+        .execute(&pool)
+        .await
+        .expect("disable");
+    support::wait_until("the gateway stops caching", || !h.authz.is_caching()).await;
+    sqlx::query("delete from org_members where user_id = $1")
+        .bind(v.user_id)
+        .execute(&pool)
+        .await
+        .expect("remove the member, unannounced");
+    refused(&h, &client, &v, NOTES, "disabled trigger").await;
+    sqlx::query("alter table org_members enable trigger authz_del")
+        .execute(&pool)
+        .await
+        .expect("enable");
+}
+
+/// Test 7: with two gateways, a revoke returns only after both have dropped
+/// the entry; a gateway that never acks is waited out to its lease, and is
+/// in bypass when the revoke returns.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_revoke_waits_for_every_gateway(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let client = h.http();
+    // Gateway B: a second cache on the real control plane, through a proxy
+    // that can hold its acks.
+    let proxy = support::StreamProxy::start(
+        h.internal_base
+            .rsplit(':')
+            .next()
+            .and_then(|p| p.parse().ok())
+            .expect("internal port"),
+    )
+    .await;
+    let b = Arc::new(gateway::authz::Authz::new(Arc::new(
+        gateway::signin::SigninClient::new(h.internal_base.clone(), support::INTERNAL_SECRET)
+            .expect("client"),
+    )));
+    h.follow(b.clone(), &proxy.base());
+    support::wait_until("gateway B is caching", || b.is_caching()).await;
+    let on_b = |v: &Visitor| {
+        let (b, secret, app) = (b.clone(), v.secret.clone(), v.app_id.to_string());
+        async move {
+            b.authorize(&gateway::signin::AppSession::new(&secret), &app)
+                .await
+                .expect("reachable")
+                .is_some_and(|c| c.decision.is_allow())
+        }
+    };
+
+    // Acks held, then released: the revoke returns after the release. (This
+    // half proves the ordering holds; it cannot catch a revoke that skips the
+    // wait, because such a revoke races B's apply. The never-acks half below
+    // is the deterministic detector: it catches that every time.)
+    let v = visitor(&pool, "v@example.com", true).await;
+    warm(&h, &client, &v, NOTES).await;
+    assert!(on_b(&v).await && on_b(&v).await);
+    proxy.hold_acks().await;
+    let before = h.relay.current();
+    let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let revoke = {
+        let (client, cp_cookie, released, b) = (
+            client.clone(),
+            v.cp_cookie.clone(),
+            released.clone(),
+            b.clone(),
+        );
+        tokio::spawn(async move {
+            let response = client
+                .post(format!("https://{CONTROL_PLANE}/auth/logout"))
+                .header(reqwest::header::COOKIE, cp_cookie)
+                .header("sec-fetch-site", "same-origin")
+                .send()
+                .await
+                .expect("answers");
+            // B's state at the moment the revoke returned.
+            (
+                response.status(),
+                released.load(std::sync::atomic::Ordering::SeqCst),
+                b.is_caching(),
+            )
+        })
+    };
+    // The revocation is committed, and B has either applied it (its ack is
+    // what is held) or is in bypass: under load its follower can stall behind
+    // the held ack until its lease lapses, and bypass is the contract holding
+    // (seen once in 50 suite runs: applied one short, lease lapsed, refused).
+    // Bounded like `wait_until`, but a timeout says what state everything was
+    // in, so a recurrence explains itself: had the revoke returned, was B in
+    // bypass, and was a request to B refused.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !(h.relay.current() > before && (b.applied() >= h.relay.current() || !b.is_caching())) {
+        if std::time::Instant::now() > deadline {
+            let returned = revoke.is_finished();
+            let state = b.describe();
+            let stats = b.stats().snapshot();
+            let served = on_b(&v).await;
+            panic!(
+                "timed out waiting: B applies the revocation. relay.current={} before={before} \
+                 revoke_returned={returned} B: {state} B_served_the_revoked_session={served} \
+                 B stats: {stats:?}",
+                h.relay.current()
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    // Applied or in bypass, B refuses the revoked session.
+    assert!(
+        !on_b(&v).await,
+        "gateway B served the revoked session: {}",
+        b.describe()
+    );
+    released.store(true, std::sync::atomic::Ordering::SeqCst);
+    proxy.release();
+    let (status, after_release, b_caching) = revoke.await.expect("joined");
+    assert_eq!(status, 204);
+    // The contract at return: B has applied the revocation (its ack was let
+    // through and recorded), or B's own lease has lapsed, so it is in bypass.
+    assert!(
+        after_release || !b_caching,
+        "the revoke returned while gateway B could still serve its cached allow"
+    );
+    eprintln!(
+        "TEST7 branch={}",
+        if after_release {
+            "acked"
+        } else {
+            "lease-lapsed"
+        }
+    );
+    // And what B does, not only what it holds: the next request is refused.
+    refused(&h, &client, &v, NOTES, "gateway A").await;
+    assert!(!on_b(&v).await, "gateway B served the revoked session");
+
+    // B never acks: the revoke is waited out to B's lease, and B is no longer
+    // caching when it returns. A revoke that returned without waiting would
+    // find B's lease still live here.
+    let w = visitor(&pool, "w@example.com", true).await;
+    assert!(on_b(&w).await && on_b(&w).await);
+    proxy.hold_acks().await;
+    let started = std::time::Instant::now();
+    sign_out(&client, &w).await;
+    assert!(
+        started.elapsed() <= shared::authz::LEASE * 2,
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(!b.is_caching(), "B still caching after the revoke returned");
+    assert!(!on_b(&w).await, "gateway B served the revoked session");
+    proxy.release();
+}
+
+/// Test 8, cached: test 4's shape run twice, so the second round is answered
+/// from a warm cache, and still nobody sees anyone else.
+#[sqlx::test(migrations = "../../migrations")]
+async fn warm_concurrent_visitors_each_see_only_themselves(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let mut visitors = Vec::new();
+    for i in 0..64 {
+        visitors.push(visitor(&pool, &format!("v{i}@example.com"), true).await);
+    }
+    let client = h.http();
+    use futures::StreamExt as _;
+    for round in 0..2 {
+        let before = hits(&h);
+        let requests = visitors
+            .iter()
+            .flat_map(|v| std::iter::repeat_n(v, 4))
+            .map(|v| {
+                let client = client.clone();
+                async move { (v, on_notes(&client, "/whoami", &v.cookie, &[]).await) }
+            });
+        let answers: Vec<_> = futures::stream::iter(requests)
+            .buffer_unordered(64)
+            .collect()
+            .await;
+        assert_eq!(answers.len(), 256);
+        if answers.iter().any(|(_, (status, _))| *status != 200) {
+            support::explain_refusals(&pool).await;
+        }
+        for (v, (status, json)) in answers {
+            assert_eq!(status, 200, "{json}");
+            assert_eq!(json["caller"]["subject"], v.subject.as_str(), "{json}");
+            assert_eq!(json["caller_after"], json["caller"], "{json}");
+        }
+        if round == 1 {
+            assert_eq!(hits(&h) - before, 256, "the warm round was not all hits");
+        }
+    }
+}
+
+/// A revocation made outside the API, straight in SQL, takes effect within
+/// the lease: the contract's 3-second bound for changes no caller waits on.
+/// Measured from the commit to the first refused request.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_sql_revocation_takes_effect_within_the_lease(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let v = visitor(&pool, "v@example.com", true).await;
+    let client = h.http();
+    warm(&h, &client, &v, NOTES).await;
+    sqlx::query("update sessions set revoked_at = now() where id = $1")
+        .bind(v.parent.as_uuid())
+        .execute(&pool)
+        .await
+        .expect("revoke");
+    let committed = std::time::Instant::now();
+    loop {
+        let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
+        if status != 200 {
+            break;
+        }
+        assert!(
+            committed.elapsed() <= shared::authz::LEASE,
+            "still served {:?} after the revocation committed",
+            committed.elapsed()
+        );
+    }
+    eprintln!("SQLREVOKE took effect after {:?}", committed.elapsed());
 }

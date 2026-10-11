@@ -543,6 +543,14 @@ pub struct Harness {
     pub control_plane_port: u16,
     pub gateway_port: u16,
     pub evil_port: u16,
+    /// The gateway's authorization cache (#12).
+    pub authz: Arc<gateway::authz::Authz>,
+    /// The control plane's invalidation relay.
+    pub relay: Arc<control_plane::relay::Relay>,
+    /// The control plane's internal listener, for a second gateway's stream.
+    pub internal_base: String,
+    /// Between the harness gateway and the relay.
+    pub stream_proxy: Arc<StreamProxy>,
     /// Every server thread this harness started: stopped when it drops.
     servers: Servers,
     /// The control plane's own pool: closed when this drops.
@@ -721,9 +729,13 @@ impl Harness {
         )
         .await
         .expect("discovery against the mock issuer");
+        let relay = control_plane::relay::Relay::start(&pool)
+            .await
+            .expect("the invalidation relay starts");
         let control_plane_pool = control_plane_pool(&pool).await;
         let state =
             control_plane::http::AppState::new(control_plane_pool.clone(), artifacts.clone())
+                .with_relay(relay.clone())
                 .with_signin(signin)
                 .with_internal_secret(INTERNAL_SECRET)
                 .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
@@ -793,7 +805,7 @@ impl Harness {
                 (Arc::new(upstream), Some(worker))
             }
         };
-        let gateway_port = start_gateway(
+        let (gateway_port, authz) = start_gateway(
             &pool,
             &internal_base,
             &hop,
@@ -805,6 +817,18 @@ impl Harness {
         for port in [control_plane_port, evil_port] {
             wait_for_port(port).await;
         }
+        // The gateway reaches the relay through a proxy a test can cut, so a
+        // dropped stream stays dropped instead of reconnecting at once.
+        let stream_proxy = StreamProxy::start(internal_port).await;
+        follow(
+            &servers,
+            authz.clone(),
+            &stream_proxy.base(),
+            uuid::Uuid::now_v7(),
+        );
+        // Every test runs with the cache live, as production does once its
+        // stream is up: the bypass path is the exception tests choose.
+        wait_until("the gateway's cache is live", || authz.is_caching()).await;
 
         Self {
             upstream,
@@ -815,6 +839,10 @@ impl Harness {
             control_plane_port,
             gateway_port,
             evil_port,
+            authz,
+            relay,
+            internal_base,
+            stream_proxy,
             servers,
             control_plane_pool,
             _scratch: scratch,
@@ -836,6 +864,12 @@ impl Harness {
         .await
         .expect("join");
         assert_eq!(added.rows_affected(), 1, "the visitor has signed in");
+    }
+
+    /// Follow a stream into another gateway's cache, stopped with this
+    /// harness.
+    pub fn follow(&self, authz: Arc<gateway::authz::Authz>, internal_base: &str) {
+        follow(&self.servers, authz, internal_base, uuid::Uuid::now_v7());
     }
 
     fn resolver_rules(&self) -> String {
@@ -891,8 +925,9 @@ async fn start_gateway(
     cert_dir: &std::path::Path,
     control_plane_port: u16,
     servers: &Servers,
-) -> u16 {
+) -> (u16, Arc<gateway::authz::Authz>) {
     for attempt in 1..=5 {
+        let (sent, received) = std::sync::mpsc::channel();
         let gateway_port = free_port();
         let (internal_base, hop, cert_dir) = (
             internal_base.to_owned(),
@@ -913,13 +948,13 @@ async fn start_gateway(
             let signin = Arc::new(
                 gateway::signin::SigninClient::new(internal_base, INTERNAL_SECRET).expect("client"),
             );
-            let edge = gateway::edge::Edge::new(lookup, apps.clone()).serving(
-                gateway::edge::Serving::new(
-                    signin,
-                    shared::domains::ControlPlaneDomain::parse(CONTROL_PLANE).expect("cp domain"),
-                    hop,
-                ),
+            let serving = gateway::edge::Serving::new(
+                signin,
+                shared::domains::ControlPlaneDomain::parse(CONTROL_PLANE).expect("cp domain"),
+                hop,
             );
+            let _ = sent.send(serving.authz());
+            let edge = gateway::edge::Edge::new(lookup, apps.clone()).serving(serving);
             let store = Arc::new(shared::cert::DirCertStore::new(&cert_dir));
             let resolver = gateway::cert::CertResolver::new(store, apps);
             let tls = TlsSettings::with_callbacks(gateway::tls::DynamicCert::callbacks(resolver))
@@ -949,7 +984,7 @@ async fn start_gateway(
             .await
             .expect("count");
         if probe.is_ok() && after > before {
-            return gateway_port;
+            return (gateway_port, received.recv().expect("the gateway's cache"));
         }
         // This attempt's server answered for nobody: stop it now.
         servers.stop(server);
@@ -1454,4 +1489,134 @@ fn connections_left_to_test_databases() -> Option<Vec<String>> {
     .join()
     .ok()
     .flatten()
+}
+
+/// Follow the invalidation stream at `internal_base` into `authz`, as the
+/// gateway binary does: on a thread and runtime of its own, stopped with the
+/// harness's other servers.
+fn follow(
+    servers: &Servers,
+    authz: Arc<gateway::authz::Authz>,
+    internal_base: &str,
+    gateway: uuid::Uuid,
+) {
+    let base = internal_base.to_owned();
+    servers.spawn("stream", move |mut stop| {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("stream runtime")
+            .block_on(async move {
+                tokio::select! {
+                    () = gateway::authz::follow(authz, base, Arc::from(INTERNAL_SECRET), gateway) => {}
+                    _ = stop.wait_for(|stop| *stop) => {}
+                }
+            });
+    });
+}
+
+/// Wait for `condition`, polling, failing after ten seconds. For conditions
+/// the product reaches on its own (a stream connecting, a lease lapsing), not
+/// for ordering a test's own steps, which use barriers.
+pub async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !condition() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// A TCP proxy in front of the control plane's internal listener, for the
+/// invalidation stream. A test can cut it (close every connection and refuse
+/// new ones, as a partition would) or hold acks (connections whose request is
+/// an ack wait at a gate), without touching the product.
+pub struct StreamProxy {
+    port: u16,
+    cut: std::sync::atomic::AtomicBool,
+    /// Acks take a read lock; holding acks is holding the write lock.
+    gate: Arc<tokio::sync::RwLock<()>>,
+    held: Mutex<Option<tokio::sync::OwnedRwLockWriteGuard<()>>>,
+    /// Each connection, and whether its first request was an ack.
+    open: Mutex<Vec<(Arc<std::sync::atomic::AtomicBool>, tokio::task::AbortHandle)>>,
+}
+
+impl StreamProxy {
+    pub async fn start(internal_port: u16) -> Arc<Self> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the proxy");
+        let proxy = Arc::new(Self {
+            port: listener.local_addr().expect("addr").port(),
+            cut: std::sync::atomic::AtomicBool::new(false),
+            gate: Arc::default(),
+            held: Mutex::default(),
+            open: Mutex::default(),
+        });
+        let serving = proxy.clone();
+        tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                if serving.cut.load(std::sync::atomic::Ordering::SeqCst) {
+                    continue; // dropped: refused
+                }
+                let proxy = serving.clone();
+                let is_ack = Arc::new(std::sync::atomic::AtomicBool::new(false));
+                let marked = is_ack.clone();
+                let task = tokio::spawn(async move {
+                    let mut head = [0u8; 32];
+                    let Ok(n) = inbound.peek(&mut head).await else {
+                        return;
+                    };
+                    if head[..n].starts_with(b"POST /internal/authz/ack") {
+                        marked.store(true, std::sync::atomic::Ordering::SeqCst);
+                        let _ = proxy.gate.read().await;
+                    }
+                    let Ok(mut outbound) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", internal_port)).await
+                    else {
+                        return;
+                    };
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                });
+                serving
+                    .open
+                    .lock()
+                    .expect("open")
+                    .push((is_ack, task.abort_handle()));
+            }
+        });
+        proxy
+    }
+
+    pub fn base(&self) -> String {
+        format!("http://127.0.0.1:{}", self.port)
+    }
+
+    /// Close every connection and refuse new ones.
+    pub fn cut(&self) {
+        self.cut.store(true, std::sync::atomic::Ordering::SeqCst);
+        for (_, task) in self.open.lock().expect("open").drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Hold every ack from now on, until [`Self::release`].
+    pub async fn hold_acks(&self) {
+        let guard = self.gate.clone().write_owned().await;
+        *self.held.lock().expect("held") = Some(guard);
+        // A kept-alive ack connection already past the gate would carry the
+        // next ack unheld: close it, so the next ack opens one at the gate.
+        for (is_ack, task) in self.open.lock().expect("open").iter() {
+            if is_ack.load(std::sync::atomic::Ordering::SeqCst) {
+                task.abort();
+            }
+        }
+    }
+
+    /// Let held acks through, and stop holding.
+    pub fn release(&self) {
+        self.held.lock().expect("held").take();
+    }
 }

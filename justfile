@@ -331,3 +331,27 @@ migrate:
 [doc('re-record .sqlx after changing a query')]
 prepare:
     cargo sqlx prepare --workspace -- --all-targets
+
+# The control plane's authorization suite in a loop, keeping every failing
+# run's full output (#12). For chasing a flake in a security control, where a
+# failure that cannot be reread is a failure that cannot be diagnosed.
+[doc('run the control-plane authz suite N times; keep failing runs under target/soak (needs a database)')]
+authz-soak runs="300":
+    #!/usr/bin/env bash
+    set -uo pipefail
+    dir="target/soak/$(date +%Y%m%dT%H%M%S)"
+    mkdir -p "$dir"
+    cargo test -q -p control-plane --test authz --no-run
+    failed=0
+    for i in $(seq 1 {{runs}}); do
+      out="$dir/run-$i.log"
+      if cargo test -q -p control-plane --test authz > "$out" 2>&1 \
+         && grep -q '^test result: ok' "$out"; then
+        rm "$out"
+      else
+        failed=$((failed + 1))
+        echo "run $i failed: $out"
+      fi
+    done
+    echo "authz-soak: $(( {{runs}} - failed )) passed, $failed failed, of {{runs}}; failures kept in $dir"
+    [ "$failed" -eq 0 ]
