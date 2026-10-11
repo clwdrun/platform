@@ -39,6 +39,9 @@ futures = { workspace = true }
 http = { workspace = true }
 bytes = { workspace = true }
 async-trait = { workspace = true }
+# The end-of-suite check that no test server is still alive at exit
+# (`support::no_server_outlives_its_test`). Already in the tree.
+libc = "0.2"
 serde_json = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }

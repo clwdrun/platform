@@ -108,6 +108,53 @@ pub struct LiveApp {
     pub digest: Option<String>,
 }
 
+/// Connections the per-request statements are waiting for right now.
+static WAITING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// The longest any per-request statement has waited for a connection, in ms.
+static LONGEST_WAIT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A connection for one of the per-request statements (`what`: the session
+/// check or the route resolve), with the wait measured.
+///
+/// A wait over a second, or a failure, is logged with the pool's state at that
+/// moment: its size, idle connections, maximum, how many per-request
+/// statements are waiting, and the longest wait so far. The gateway gives up
+/// on the control plane after 5 s, so these lines are what name the cause when
+/// it does (#12, and the sizing in #48). sqlx exposes no count of waiters, so
+/// this counts its own.
+///
+/// # Errors
+///
+/// What [`sqlx::Pool::acquire`] reports, `PoolTimedOut` included.
+pub async fn acquire_for(
+    pool: &sqlx::PgPool,
+    what: &'static str,
+) -> sqlx::Result<sqlx::pool::PoolConnection<sqlx::Postgres>> {
+    use std::sync::atomic::Ordering;
+    let waiting = WAITING.fetch_add(1, Ordering::Relaxed) + 1;
+    let started = std::time::Instant::now();
+    let acquired = pool.acquire().await;
+    WAITING.fetch_sub(1, Ordering::Relaxed);
+    let waited_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    let longest_ms = LONGEST_WAIT_MS
+        .fetch_max(waited_ms, Ordering::Relaxed)
+        .max(waited_ms);
+    if acquired.is_err() || waited_ms > 1000 {
+        tracing::warn!(
+            what,
+            waited_ms,
+            longest_ms,
+            size = pool.size(),
+            idle = pool.num_idle(),
+            max = pool.options().get_max_connections(),
+            waiting,
+            error = acquired.as_ref().err().map(ToString::to_string),
+            "a per-request statement waited for a database connection"
+        );
+    }
+    acquired
+}
+
 /// Resolve `{app}.{org}` to the live app it names, and the version to run, for
 /// the gateway's host router. `None` when the org or the app does not exist, is
 /// soft-deleted, or the app is not that org's — the three cases the gateway

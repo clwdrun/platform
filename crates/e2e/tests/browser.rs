@@ -1099,8 +1099,15 @@ async fn no_platform_cookie_reaches_the_wasm_boundary(pool: PgPool) {
     );
 }
 
+/// How many of test 4's requests are in flight at once: 16× the worker's
+/// threads, so invocations overlap throughout, without queuing all 256
+/// session checks at once behind the control plane, which shares this test's
+/// single thread. (#90 measured 16 as well: the refusals continued, with the
+/// pool idle at the time, so concurrency is not their cause.)
+const IN_FLIGHT: usize = 64;
+
 /// Test 4: concurrent requests from different visitors each see only their
-/// own caller. 64 visitors, 4 requests each, 256 in all, 64 in flight at a
+/// own caller. 64 visitors, 4 requests each, 256 in all, [`IN_FLIGHT`] at a
 /// time: overlapping invocations on a handful of worker threads. A caller kept anywhere
 /// across invocations shows up as the wrong subject, and one overwritten
 /// mid-request as `caller_after` disagreeing with `caller`.
@@ -1119,15 +1126,15 @@ async fn concurrent_visitors_each_see_only_themselves(pool: PgPool) {
             let client = client.clone();
             async move { (v, on_notes(&client, "/whoami", &v.cookie, &[]).await) }
         });
-    // At most 64 in flight: 16× the worker's threads, so invocations overlap
-    // throughout, without queuing all 256 session checks at once behind the
-    // control plane, which shares this test's single thread.
     use futures::StreamExt as _;
     let answers: Vec<_> = futures::stream::iter(requests)
-        .buffer_unordered(64)
+        .buffer_unordered(IN_FLIGHT)
         .collect()
         .await;
     assert_eq!(answers.len(), 256);
+    if answers.iter().any(|(_, (status, _))| *status != 200) {
+        support::explain_refusals(&pool).await;
+    }
     for (v, (status, json)) in answers {
         assert_eq!(status, 200, "{json}");
         assert_eq!(json["caller"]["subject"], v.subject.as_str(), "{json}");
@@ -1259,8 +1266,9 @@ async fn a_misbehaving_worker_is_contained(pool: PgPool) {
     use shared::hop::{self, RequestHead, ResponseHead};
     use tokio::io::AsyncWriteExt as _;
 
-    let socket = support::socket_path();
-    let listener = tokio::net::UnixListener::bind(&socket).expect("bind");
+    // Removed when the test ends, like every path a test makes (#90).
+    let socket = support::Scratch::socket();
+    let listener = tokio::net::UnixListener::bind(socket.path()).expect("bind");
     tokio::spawn(async move {
         loop {
             let Ok((mut stream, _)) = listener.accept().await else {
@@ -1321,7 +1329,7 @@ async fn a_misbehaving_worker_is_contained(pool: PgPool) {
     let h = Harness::with_hop(
         pool.clone(),
         std::sync::Arc::new(gateway::worker::WorkerUpstream::new(
-            &socket,
+            socket.path(),
             support::my_uid(),
         )),
     )

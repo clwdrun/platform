@@ -38,7 +38,11 @@ pub async fn resolve(
     Path((org, app)): Path<(String, String)>,
     axum::Extension(request_id): axum::Extension<RequestId>,
 ) -> Response {
-    match db::resolve_live_app(&state.pool, &org, &app).await {
+    let resolved = match db::acquire_for(&state.pool, "route resolve").await {
+        Ok(mut connection) => db::resolve_live_app(&mut *connection, &org, &app).await,
+        Err(source) => Err(source),
+    };
+    match resolved {
         Ok(Some(found)) => Json(Resolution {
             app_id: found.id,
             org_id: found.org_id,

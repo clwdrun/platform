@@ -265,6 +265,9 @@ pub async fn check(
     secret: &AppSessionSecret,
     app_id: AppId,
 ) -> Result<Option<Checked>, Error> {
+    let mut connection = crate::db::acquire_for(pool, "session check")
+        .await
+        .map_err(unavailable)?;
     let row = sqlx::query!(
         r#"select sub.subject as "subject: AppSubject",
                   u.email,
@@ -287,7 +290,7 @@ pub async fn check(
         &secret.digest()[..],
         app_id.as_uuid(),
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *connection)
     .await
     .map_err(unavailable)?;
     Ok(row.map(|row| Checked {
