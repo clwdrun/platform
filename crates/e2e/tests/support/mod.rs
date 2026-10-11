@@ -545,6 +545,8 @@ pub struct Harness {
     pub evil_port: u16,
     /// Every server thread this harness started: stopped when it drops.
     servers: Servers,
+    /// The control plane's own pool: closed when this drops.
+    control_plane_pool: PgPool,
     /// Files and directories this harness made: removed when it drops,
     /// after the servers that use them have stopped.
     _scratch: Vec<Scratch>,
@@ -556,6 +558,14 @@ impl Drop for Harness {
     /// rest of the binary, under every test that runs after it (#90).
     fn drop(&mut self) {
         self.servers.stop_all();
+        // Closed here, at the test's end: `#[sqlx::test]` drops the test's
+        // database next, and cannot while connections to it are open. Spawned
+        // because closing awaits; sqlx's own teardown awaits its pool's close
+        // before the drop, which runs this too. The exit check proves it.
+        let pool = self.control_plane_pool.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { pool.close().await });
+        }
     }
 }
 
@@ -637,6 +647,7 @@ impl Harness {
     async fn start_with(pool: PgPool, kind: Hop) -> Self {
         logs();
         no_server_outlives_its_test();
+        watch_for_stalls();
         control_plane::acme::install_crypto_provider();
 
         // Apps: two in `acme`, one in `other`.
@@ -710,10 +721,12 @@ impl Harness {
         )
         .await
         .expect("discovery against the mock issuer");
-        let state = control_plane::http::AppState::new(pool.clone(), artifacts.clone())
-            .with_signin(signin)
-            .with_internal_secret(INTERNAL_SECRET)
-            .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
+        let control_plane_pool = control_plane_pool(&pool).await;
+        let state =
+            control_plane::http::AppState::new(control_plane_pool.clone(), artifacts.clone())
+                .with_signin(signin)
+                .with_internal_secret(INTERNAL_SECRET)
+                .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
         let control_plane_port = serve_tls(control_plane::http::router(state.clone())).await;
         let internal = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -803,6 +816,7 @@ impl Harness {
             gateway_port,
             evil_port,
             servers,
+            control_plane_pool,
             _scratch: scratch,
         }
     }
@@ -1218,6 +1232,13 @@ fn no_server_outlives_its_test() {
     static REGISTERED: OnceLock<()> = OnceLock::new();
     REGISTERED.get_or_init(|| {
         extern "C" fn check() {
+            let connections = connections_left_to_test_databases().unwrap_or_default();
+            if !connections.is_empty() {
+                eprintln!(
+                    "e2e: {} connection(s) to test databases still open after the suite: {connections:?}",
+                    connections.len()
+                );
+            }
             let live = LIVE_SERVERS.load(std::sync::atomic::Ordering::SeqCst);
             let left = LIVE_SCRATCH.load(std::sync::atomic::Ordering::SeqCst);
             let recreated = std::fs::read_dir(scratch_root()).map_or(0, Iterator::count);
@@ -1228,7 +1249,7 @@ fn no_server_outlives_its_test() {
                     scratch_root().display()
                 );
             }
-            if live > 0 || left > 0 {
+            if live > 0 || left > 0 || !connections.is_empty() {
                 eprintln!(
                     "e2e: {live} test server(s) still alive and {left} scratch path(s) left when the binary exited"
                 );
@@ -1256,6 +1277,10 @@ pub async fn explain_refusals(pool: &PgPool) {
         .filter(|l| {
             l.contains("cold lookup")
                 || l.contains("app session check failed")
+                || l.contains("slow in its handler")
+                || l.contains("waited to be handled")
+                || l.contains("slow inside Postgres")
+                || l.contains("runtime stalled")
                 || l.contains("waited for a database connection")
                 || l.contains("time to acquire exceeded")
                 || l.contains("too many clients")
@@ -1341,4 +1366,92 @@ fn scratch_root() -> std::path::PathBuf {
     static ROOT: OnceLock<std::path::PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| std::env::temp_dir().join(format!("clwd-e2e-{}", std::process::id())))
         .clone()
+}
+
+/// Log whenever this test's runtime falls behind. `#[sqlx::test]` runs each
+/// test on a current-thread runtime, and the harness serves the control plane
+/// on it beside the test's own client: a request the control plane cannot get
+/// to is a stall here, not a slow handler (#90). Ends with the runtime.
+fn watch_for_stalls() {
+    tokio::spawn(async {
+        let tick = Duration::from_millis(50);
+        loop {
+            let asleep = std::time::Instant::now();
+            tokio::time::sleep(tick).await;
+            let late_ms = asleep.elapsed().saturating_sub(tick).as_millis();
+            if late_ms > 250 {
+                tracing::warn!(late_ms, "e2e: the test's runtime stalled");
+            }
+        }
+    });
+}
+
+/// The control plane's pool, as production should size one (#48), not
+/// `#[sqlx::test]`'s: that closes connections idle for a second, so each burst
+/// reopened them, and under the suite's load opening a Postgres connection
+/// took 0.5 to 4.5 s, past the gateway's 5 s budget (#90). All five are opened
+/// here, none times out idle, and a shortage fails after 3 s as its own error
+/// (`control-plane.timeout`), never as the gateway's timeout.
+///
+/// Opening is not a request, so it gets its own 30 s budget: `connect_with`
+/// opens the five one after another inside the 3 s, which under load does not
+/// fit. They are opened together, and an open that misses the 3 s is retried
+/// and logged.
+async fn control_plane_pool(test_pool: &PgPool) -> PgPool {
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(5)
+        .min_connections(5)
+        .idle_timeout(None)
+        .acquire_timeout(Duration::from_secs(3))
+        .connect_lazy_with((*test_pool.connect_options()).clone());
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut opened = Vec::new();
+    while opened.len() < 5 {
+        let wanted = 5 - opened.len();
+        for result in futures::future::join_all((0..wanted).map(|_| pool.acquire())).await {
+            match result {
+                Ok(connection) => opened.push(connection),
+                Err(error) if std::time::Instant::now() < deadline => {
+                    tracing::warn!(%error, "e2e: opening a control-plane connection took over 3 s; retrying")
+                }
+                Err(error) => panic!("the control plane's pool, opened at start: {error}"),
+            }
+        }
+    }
+    drop(opened);
+    pool
+}
+
+/// After the suite: no connection to any test database is left open. Polls
+/// for up to ten seconds, since a closed connection's backend takes a moment
+/// to exit. `None` when there is no database to ask.
+fn connections_left_to_test_databases() -> Option<Vec<String>> {
+    let url = std::env::var("DATABASE_URL").ok()?;
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        runtime.block_on(async move {
+            use sqlx::Connection as _;
+            let mut connection = sqlx::PgConnection::connect(&url).await.ok()?;
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let left: Vec<String> = sqlx::query_scalar(
+                    "select datname::text from pg_stat_activity
+                      where datname like '\\_sqlx\\_test%' and pid <> pg_backend_pid()",
+                )
+                .fetch_all(&mut connection)
+                .await
+                .ok()?;
+                if left.is_empty() || std::time::Instant::now() > deadline {
+                    return Some(left);
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+    })
+    .join()
+    .ok()
+    .flatten()
 }
