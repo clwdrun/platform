@@ -268,6 +268,7 @@ pub async fn check(
     let mut connection = crate::db::acquire_for(pool, "session check")
         .await
         .map_err(unavailable)?;
+    let queried = std::time::Instant::now();
     let row = sqlx::query!(
         r#"select sub.subject as "subject: AppSubject",
                   u.email,
@@ -293,6 +294,13 @@ pub async fn check(
     .fetch_optional(&mut *connection)
     .await
     .map_err(unavailable)?;
+    let query_ms = queried.elapsed().as_millis();
+    if query_ms > 250 {
+        tracing::warn!(
+            query_ms,
+            "the session check's statement was slow inside Postgres"
+        );
+    }
     Ok(row.map(|row| Checked {
         subject: row.subject,
         email: row.email,
@@ -568,6 +576,22 @@ pub(crate) async fn check_route(
     Extension(request_id): Extension<RequestId>,
     body: Bytes,
 ) -> Response {
+    let entered = std::time::Instant::now();
+    // The gateway's request id is a UUIDv7, stamped when it sent the check:
+    // how long the check waited before this handler ran at all (#90).
+    if let Ok(sent) = uuid::Uuid::parse_str(request_id.as_str())
+        && let Some(stamp) = sent.get_timestamp()
+    {
+        let (secs, nanos) = stamp.to_unix();
+        let sent_ms = u128::from(secs) * 1000 + u128::from(nanos) / 1_000_000;
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_millis());
+        let queued_ms = now_ms.saturating_sub(sent_ms);
+        if queued_ms > 1000 {
+            tracing::warn!(%request_id, queued_ms, "a session check waited to be handled");
+        }
+    }
     let result = async {
         let request: CheckRequest = parse_body(&body)?;
         let secret = AppSessionSecret::parse(&request.session).ok_or(Error::Unauthenticated {})?;
@@ -576,6 +600,13 @@ pub(crate) async fn check_route(
             .ok_or(Error::Unauthenticated {})
     }
     .await;
+    // The gateway gives up after 5 s. With its request id, this says whether
+    // a refused check spent that time in the handler (pool and Postgres, each
+    // logged above when slow) or before it, waiting to be scheduled (#90).
+    let handler_ms = entered.elapsed().as_millis();
+    if handler_ms > 1000 {
+        tracing::warn!(%request_id, handler_ms, "a session check was slow in its handler");
+    }
     match result {
         Ok(checked) => axum::Json(CheckResponse {
             subject: checked.subject,

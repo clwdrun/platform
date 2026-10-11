@@ -26,6 +26,9 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
 clwd-bundle = { workspace = true }
+# A request id on each control-plane check, to match a refusal with the
+# control plane's own log of it (#90). Already in the tree.
+uuid = { workspace = true }
 
 [dev-dependencies]
 # A real HTTP server to point the lookup client at: warm the cache over real

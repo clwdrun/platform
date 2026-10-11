@@ -315,12 +315,21 @@ impl SigninClient {
         session: &AppSession,
         app_id: &str,
     ) -> Result<Option<Checked>, Unreachable> {
+        // A fresh id, sent and kept, so a refused check can be matched with
+        // what the control plane logged for it (#90).
+        let request_id = uuid::Uuid::now_v7().to_string();
         let response = self
-            .post(
-                "/internal/app-sessions/check",
-                serde_json::json!({ "session": session.0, "app_id": app_id }),
-            )
-            .await?;
+            .client
+            .post(format!("{}/internal/app-sessions/check", self.base))
+            .bearer_auth(self.secret.as_ref())
+            .header("x-request-id", &request_id)
+            .json(&serde_json::json!({ "session": session.0, "app_id": app_id }))
+            .send()
+            .await
+            .map_err(|error| {
+                let Unreachable(message) = unreachable(error);
+                Unreachable(format!("request {request_id}: {message}"))
+            })?;
         match response.status() {
             StatusCode::OK => {
                 let body: CheckResponse = response.json().await.map_err(unreachable)?;
