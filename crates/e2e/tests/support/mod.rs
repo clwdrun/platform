@@ -1428,32 +1428,34 @@ fn watch_for_stalls() {
 /// here, none times out idle, and a shortage fails after 3 s as its own error
 /// (`control-plane.timeout`), never as the gateway's timeout.
 ///
-/// Opening is not a request, so it gets its own 30 s budget: `connect_with`
-/// opens the five one after another inside the 3 s, which under load does not
-/// fit. They are opened together, and an open that misses the 3 s is retried
-/// and logged.
+/// Opening is not a request, so it gets its own budget. Through `acquire`, an
+/// open is cancelled at the 3 s deadline: under load, where opens take longer,
+/// every retry was cancelled too. With no idle timeout and no max lifetime,
+/// sqlx's own maintenance task opens `min_connections` at creation with a
+/// 300 s deadline, so the pool is ready once all five are idle.
 async fn control_plane_pool(test_pool: &PgPool) -> PgPool {
     let pool = sqlx::postgres::PgPoolOptions::new()
         .max_connections(5)
         .min_connections(5)
         .idle_timeout(None)
+        .max_lifetime(None)
         .acquire_timeout(Duration::from_secs(3))
         .connect_lazy_with((*test_pool.connect_options()).clone());
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    let mut opened = Vec::new();
-    while opened.len() < 5 {
-        let wanted = 5 - opened.len();
-        for result in futures::future::join_all((0..wanted).map(|_| pool.acquire())).await {
-            match result {
-                Ok(connection) => opened.push(connection),
-                Err(error) if std::time::Instant::now() < deadline => {
-                    tracing::warn!(%error, "e2e: opening a control-plane connection took over 3 s; retrying")
-                }
-                Err(error) => panic!("the control plane's pool, opened at start: {error}"),
-            }
-        }
+    let started = std::time::Instant::now();
+    while pool.num_idle() < 5 {
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "the control plane's pool, opened at start: {} of 5 open after 120 s",
+            pool.num_idle()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    drop(opened);
+    if started.elapsed() > Duration::from_secs(3) {
+        tracing::warn!(
+            opened_ms = started.elapsed().as_millis(),
+            "e2e: opening the control plane's pool took over 3 s"
+        );
+    }
     pool
 }
 
