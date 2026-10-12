@@ -14,6 +14,10 @@ name = "control-plane"
 path = "src/main.rs"
 
 [dev-dependencies]
+# The binary tests (#48) run a real gateway's authorization follower against
+# the spawned control plane, and signal it.
+gateway = { version = "0.1.0", path = "../gateway" }
+libc = "0.2"
 # The mock OIDC issuer the sign-in route tests run against: it signs real ID
 # tokens with a throwaway RSA key generated at runtime (no key material in the
 # repo), and checks the client's Basic auth and PKCE as Google does. All four
