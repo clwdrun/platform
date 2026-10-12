@@ -117,12 +117,13 @@ struct Cp {
     internal: SocketAddr,
     ops: SocketAddr,
     output: Arc<Mutex<String>>,
+    readers: Vec<tokio::task::JoinHandle<()>>,
 }
 
 fn collect(
     output: &Arc<Mutex<String>>,
     stream: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-) {
+) -> tokio::task::JoinHandle<()> {
     let output = output.clone();
     tokio::spawn(async move {
         let mut lines = BufReader::new(stream).lines();
@@ -131,7 +132,7 @@ fn collect(
             out.push_str(&line);
             out.push('\n');
         }
-    });
+    })
 }
 
 impl Cp {
@@ -146,14 +147,17 @@ impl Cp {
             .spawn()
             .expect("spawn the control-plane binary");
         let output = Arc::new(Mutex::new(String::new()));
-        collect(&output, child.stdout.take().expect("stdout"));
-        collect(&output, child.stderr.take().expect("stderr"));
+        let readers = vec![
+            collect(&output, child.stdout.take().expect("stdout")),
+            collect(&output, child.stderr.take().expect("stderr")),
+        ];
         Self {
             child,
             public: env.public,
             internal: env.internal,
             ops: env.ops,
             output,
+            readers,
         }
     }
 
@@ -216,10 +220,13 @@ impl Cp {
 async fn exits(env: &Env, within: Duration) -> (ExitStatus, String) {
     let mut cp = Cp::start(env);
     let status = cp.exit(within).await;
-    // The output readers finish once the pipes close.
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline && !cp.output().contains("Error") {
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    // The readers finish at end of file, once the exited child's pipes close:
+    // only then is the whole message captured, not just its first line.
+    for reader in std::mem::take(&mut cp.readers) {
+        tokio::time::timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the output pipes close within 5 s of exit")
+            .expect("reader");
     }
     (status, cp.output())
 }
