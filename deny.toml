@@ -38,6 +38,15 @@ ignore = [
   { id = "RUSTSEC-2024-0388", reason = "derivative 2.2.0 via pingora -> gateway; owned by #5" },
   { id = "RUSTSEC-2025-0069", reason = "daemonize 0.5.0 via pingora -> gateway; owned by #5" },
 
+  # unsafe-libyaml: unmaintained (informational), not a vulnerability.
+  # pingora-core parses YAML through serde_yaml only for its server
+  # configuration. The gateway calls `Server::new(None)`, which parses
+  # pingora's built-in "---\nversion: 1" and never a file, argument or anything
+  # else from outside the platform. No fix today: pingora 0.9.0 still depends on
+  # serde_yaml ^0.9, and making it optional is upstream cloudflare/pingora#779.
+  # Review by 2027-01-12, or sooner if #5 changes the pingora version.
+  { id = "RUSTSEC-2024-0449", reason = "unsafe-libyaml 0.2.11 via serde_yaml -> pingora -> gateway; YAML never from outside; owned by #5; review by 2027-01-12" },
+
   # openidconnect 4.0.1 -> rsa 0.9.10. Marvin is a timing sidechannel in RSA
   # decryption; the OIDC paths here verify signatures rather than decrypt, but
   # that is a reason to track it, not to call it inapplicable. Owned by #9.
