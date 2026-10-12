@@ -139,10 +139,15 @@ jobs:
       # artifact changes but is not in the default key — the build profile is
       # not. Without the bump, the old full-debuginfo cache kept restoring as a
       # "full match", every run rebuilt cold, and no new cache was ever saved.
+      #
+      # `save-if` on every rust-cache step: only `main` saves. A pull request
+      # restores `main`'s cache and leaves it alone; per-PR copies filled the
+      # 10 GB quota and evicted the entries every run restores from.
       - name: Cache cargo build
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: lean-debuginfo
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       # Isolated, and early. Every later step depends on this having worked, and
       # a credential problem that first surfaces inside a compile reads as a
@@ -276,6 +281,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: release-worker
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Install just
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
@@ -368,6 +374,7 @@ jobs:
         uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: clwd
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build clwd alone
         working-directory: clwd
