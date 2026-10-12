@@ -490,12 +490,14 @@ async fn config_failures_are_legible(pool: PgPool) {
     }
 }
 
-/// 4. The internal and ops listeners refuse a public or unspecified address
-/// without the override, and the unspecified one even with it.
+/// 4. Every listener refuses a public or unspecified address without its
+/// override, and the unspecified one even with it. All three serve plain
+/// HTTP: the public one is reached through the gateway's TLS, never directly.
 #[sqlx::test(migrations = "../../migrations")]
 async fn no_unspecified_or_public_bind_by_accident(pool: PgPool) {
     let base = Env::new(&database_url(&pool), "http://127.0.0.1:9");
     for (var, allow) in [
+        ("CLWD_PUBLIC_LISTEN", "CLWD_PUBLIC_LISTEN_ALLOW_PUBLIC"),
         ("CLWD_INTERNAL_LISTEN", "CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC"),
         ("CLWD_OPS_LISTEN", "CLWD_OPS_LISTEN_ALLOW_PUBLIC"),
     ] {

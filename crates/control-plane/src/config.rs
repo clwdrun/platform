@@ -9,10 +9,11 @@
 //! | variable | required | validation |
 //! |---|---|---|
 //! | `DATABASE_URL` | yes | non-empty; redacted in `Debug` |
-//! | `CLWD_PUBLIC_LISTEN` | yes | `ip:port` |
-//! | `CLWD_INTERNAL_LISTEN` | yes | `ip:port`, loopback or private, never unspecified ([`private_only`]) |
-//! | `CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC` | no | `1` lets the internal listener bind a public address |
-//! | `CLWD_OPS_LISTEN` | yes | as `CLWD_INTERNAL_LISTEN` |
+//! | `CLWD_PUBLIC_LISTEN` | yes | `ip:port`, loopback or private, never unspecified ([`private_only`]) |
+//! | `CLWD_PUBLIC_LISTEN_ALLOW_PUBLIC` | no | `1` lets the public listener bind a public address |
+//! | `CLWD_INTERNAL_LISTEN` | yes | as `CLWD_PUBLIC_LISTEN` |
+//! | `CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC` | no | as `CLWD_PUBLIC_LISTEN_ALLOW_PUBLIC` |
+//! | `CLWD_OPS_LISTEN` | yes | as `CLWD_PUBLIC_LISTEN` |
 //! | `CLWD_OPS_LISTEN_ALLOW_PUBLIC` | no | as `CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC` |
 //! | `CLWD_INTERNAL_SECRET` | yes | at least 32 bytes |
 //! | `CLWD_SESSION_KEY` | yes | at least 32 bytes ([`CookieKey::from_secret`]) |
@@ -118,9 +119,11 @@ impl fmt::Debug for Secret {
     }
 }
 
-/// The address the public router binds: reachable by whatever forwards the
-/// platform's own hosts to it. A distinct type from the other two, so the
-/// addresses cannot be swapped by position.
+/// The address the public router binds: reachable by the gateway, which
+/// forwards the platform's own hosts to it (#95). Private by policy like the
+/// other two: it serves plain HTTP, so a reachable bind would expose sign-in
+/// and the OAuth callback without TLS and without the gateway. A distinct
+/// type from the other two, so the addresses cannot be swapped by position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PublicListen(pub SocketAddr);
 
@@ -274,7 +277,10 @@ impl Config {
 
         let database_url = Secret(require("DATABASE_URL", "the control plane's database")?);
 
-        let public = PublicListen(address("CLWD_PUBLIC_LISTEN")?);
+        let public = address("CLWD_PUBLIC_LISTEN")?;
+        private_only(public, flag("CLWD_PUBLIC_LISTEN_ALLOW_PUBLIC")?)
+            .map_err(|why| invalid("CLWD_PUBLIC_LISTEN", why))?;
+        let public = PublicListen(public);
         let internal = address("CLWD_INTERNAL_LISTEN")?;
         private_only(internal, flag("CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC")?)
             .map_err(|why| invalid("CLWD_INTERNAL_LISTEN", why))?;
@@ -498,7 +504,7 @@ fn https_unless(raw: &str, insecure: bool) -> Result<reqwest::Url, String> {
     }
 }
 
-/// The bind policy for the internal and ops listeners.
+/// The bind policy for every listener: all three serve plain HTTP.
 ///
 /// Never the unspecified address (`0.0.0.0`, `::`), with or without the
 /// override: "every interface" includes the public one, and on a host that
@@ -696,11 +702,15 @@ mod tests {
 
     #[test]
     fn private_listeners_refuse_public_and_unspecified_addresses() {
-        for var in ["CLWD_INTERNAL_LISTEN", "CLWD_OPS_LISTEN"] {
-            let allow = if var == "CLWD_INTERNAL_LISTEN" {
-                "CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC"
-            } else {
-                "CLWD_OPS_LISTEN_ALLOW_PUBLIC"
+        for var in [
+            "CLWD_PUBLIC_LISTEN",
+            "CLWD_INTERNAL_LISTEN",
+            "CLWD_OPS_LISTEN",
+        ] {
+            let allow = match var {
+                "CLWD_PUBLIC_LISTEN" => "CLWD_PUBLIC_LISTEN_ALLOW_PUBLIC",
+                "CLWD_INTERNAL_LISTEN" => "CLWD_INTERNAL_LISTEN_ALLOW_PUBLIC",
+                _ => "CLWD_OPS_LISTEN_ALLOW_PUBLIC",
             };
             let err = err_of(with(&[(var, "203.0.113.7:9000")]));
             assert!(

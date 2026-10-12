@@ -28,3 +28,7 @@ infra/**/*.tfvars.json
 infra/**/.terraform.lock.hcl
 crash.log
 .pebble/
+
+# local run logs: test loops, gates, probes. Kept outside target/, which
+# `cargo clean` removes.
+/runs/
