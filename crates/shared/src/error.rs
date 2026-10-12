@@ -134,18 +134,12 @@ macro_rules! define_error {
             /// What to do about it: a short, actionable next step.
             ///
             /// Never absent. `meaning` and `hint` are required literals in the
-            /// invocation, so a code cannot ship without either.
+            /// invocation, so a code cannot ship without either. A delegating
+            /// variant forwards its source's hint, as it forwards its code: the
+            /// crate that decides the failure says how to recover from it.
             pub fn hint(&self) -> &'static str {
                 match self {
-                    // `clwd_bundle::Error` has `code()` and `retryable()` but no
-                    // `hint()`, so there is nothing to forward. This points at
-                    // the published table rather than restating 38 entries here,
-                    // where they would drift from it.
-                    //
-                    // That is papering over an absence, not a design: the text
-                    // belongs with the crate that owns the code, and
-                    // `clwdrun/clwd#63` is the fix.
-                    $( Self::$dvariant { .. } => DELEGATED_HINT, )*
+                    $( Self::$dvariant { source } => source.hint(), )*
                     $( Self::$variant { .. } => $hint, )*
                 }
             }
@@ -182,13 +176,6 @@ macro_rules! define_error {
         }),*];
     };
 }
-
-/// What a delegated error offers in place of a hint of its own.
-///
-/// A real next step rather than a null. The table it points at is generated from
-/// the code, so this cannot drift from it the way a restatement would.
-pub const DELEGATED_HINT: &str =
-    "see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover";
 
 /// What a delegated `bundle.*` error means, in place of per-code text this crate
 /// cannot see — `clwd_bundle` does not expose its codes or their meanings yet.
@@ -665,7 +652,25 @@ mod tests {
         assert_eq!(err.code(), "bundle.member_digest_mismatch");
         assert_eq!(err.status(), 400);
         assert!(!err.retryable(), "a malformed bundle stays malformed");
-        assert_eq!(err.hint(), DELEGATED_HINT);
+        assert_eq!(
+            err.hint(),
+            clwd_bundle::Error::MemberDigestMismatch { path: "x".into() }.hint(),
+            "the bundle crate's own hint, forwarded"
+        );
+    }
+
+    /// A delegated `bundle.*` envelope, byte for byte, with the hint the bundle
+    /// crate wrote for that code — not a pointer to a table.
+    #[test]
+    fn a_delegated_bundle_envelope_carries_the_real_hint() {
+        let id = RequestId::sanitize("req-42").expect("well formed");
+        let json =
+            serde_json::to_string(&Envelope::new(&bundle_sample(), &id)).expect("serializes");
+
+        assert_eq!(
+            json,
+            r#"{"code":"bundle.member_digest_mismatch","message":"member \"app.wasm\" does not match its declared digest","hint":"Rebuild the bundle with `clwd build` and discard the copy whose contents fail their digest.","retryable":false,"request_id":"req-42"}"#
+        );
     }
 
     /// Reading a *stored* artifact that will not decode is our failure, not the
