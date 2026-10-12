@@ -62,6 +62,7 @@ pub const VISITOR_DOMAIN: &str = "example.com";
 /// The key the control plane signs its cookies with in this harness.
 pub fn cookie_key() -> control_plane::signin::CookieKey {
     control_plane::signin::CookieKey::from_secret(b"e2e-cookie-key-of-some-length-0123")
+        .expect("a long enough test secret")
 }
 
 fn free_port() -> u16 {

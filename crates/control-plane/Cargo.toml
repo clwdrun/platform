@@ -14,6 +14,10 @@ name = "control-plane"
 path = "src/main.rs"
 
 [dev-dependencies]
+# The binary tests (#48) run a real gateway's authorization follower against
+# the spawned control plane, and signal it.
+gateway = { version = "0.1.0", path = "../gateway" }
+libc = "0.2"
 # The mock OIDC issuer the sign-in route tests run against: it signs real ID
 # tokens with a throwaway RSA key generated at runtime (no key material in the
 # repo), and checks the client's Basic auth and PKCE as Google does. All four
@@ -24,8 +28,6 @@ rand = "0.8"
 base64 = "0.22"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
-# An in-memory artifact store for the router tests, which store nothing.
-opendal = { workspace = true }
 clwd-bundle = { workspace = true }
 bytes = { workspace = true }
 # Captures every log line the token tests produce, so the leak test can grep
@@ -40,6 +42,12 @@ jsonschema = { version = "0.56.0", default-features = false }
 wiremock = "0.6"
 
 [dependencies]
+# Serving over sockets (#48), with hyper directly: axum's `serve` builds the
+# connection builder without a timer, which silently disables hyper's header
+# read timeout. Both are already in the tree via axum and reqwest; these add
+# the server side and `server-graceful` for the drain.
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "server", "server-graceful", "service"] }
 # The invalidation relay's streaming response body (#12); also the
 # chunked-upload test's body with no known length.
 futures = { workspace = true }
@@ -87,6 +95,9 @@ rustls-pki-types = "1"
 # dependency only to read one constant, which pulled 39 crates in for a
 # `usize` and was reverted in #47. The constant still comes from `shared`.
 builder = { workspace = true }
+# The serving binary's artifact store: a directory (`CLWD_ARTIFACT_ROOT`), as
+# the worker reads it. The router tests use its in-memory backend.
+opendal = { workspace = true }
 # API tokens (#4): the digest, the secret's randomness, per-token limits.
 sha2 = { workspace = true }
 getrandom = { workspace = true }

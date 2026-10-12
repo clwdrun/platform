@@ -163,14 +163,28 @@ seam:
 # migration that merely mentions dropping something still has to say what
 # reverting it would mean, and writing that sentence is cheaper than arguing
 # with the grep.
-[doc('every destructive migration carries a rollback plan')]
+#
+# And every migration must work with the build before it (#48): during a
+# rollout the database runs ahead of the old binary, which the server allows.
+# So a `drop` or `rename` must also say, in a `PREVIOUS BUILD:` comment, why
+# the build before it no longer reads what it removes: the contract step of an
+# expand-then-contract sequence, a release after the expand. Applied
+# migrations cannot gain the comment (their checksum would change), so this
+# half covers migrations after the last one that predates the rule.
+[doc('every destructive migration carries a rollback plan, and says why the previous build survives it')]
 rollback-plans:
     #!/usr/bin/env bash
     set -uo pipefail
+    predates_rule=20261014130000
     missing=""
+    unexplained=""
     for f in migrations/*.sql; do
       if grep -qiE '\b(drop|truncate|rename)\b' "$f" && ! grep -q 'ROLLBACK PLAN' "$f"; then
         missing="${missing}  ${f}"$'\n'
+      fi
+      version=$(basename "$f" | cut -d_ -f1)
+      if [ "$version" -gt "$predates_rule" ] && grep -qiE '\b(drop|rename)\b' "$f" && ! grep -q 'PREVIOUS BUILD:' "$f"; then
+        unexplained="${unexplained}  ${f}"$'\n'
       fi
     done
     if [ -n "$missing" ]; then
@@ -178,7 +192,13 @@ rollback-plans:
       printf '%s' "$missing"
       exit 1
     fi
-    echo "ok: every destructive migration carries a rollback plan"
+    if [ -n "$unexplained" ]; then
+      echo "error: a migration drops or renames something with no PREVIOUS BUILD: comment saying why the"
+      echo "       build before it does not read it (expand, release, then contract; docs/development.md):"
+      printf '%s' "$unexplained"
+      exit 1
+    fi
+    echo "ok: every destructive migration carries a rollback plan, and says why the previous build survives it"
 
 # .sqlx is what lets CI build with no database. It rots silently the moment a
 # query changes, so the gate checks it rather than trusting it.

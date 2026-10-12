@@ -321,6 +321,7 @@ async fn start_issuer() -> Issuer {
 
 fn key() -> CookieKey {
     CookieKey::from_secret(b"a-test-signing-secret-of-some-length")
+        .expect("a long enough test secret")
 }
 
 async fn state(pool: &PgPool, issuer: &Issuer) -> AppState {

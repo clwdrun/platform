@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from authz_outbox where (seq, kind, entity) in\n                (select seq, kind, entity from authz_outbox\n                  where created_at < now() - make_interval(secs => $1)\n                  limit $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c9388dc07ea8493f0b294705ed6d1d2568b5c6f9965d19df74986a2bdce3c374"
+}

@@ -230,7 +230,7 @@ async fn publish_inner(
 
     let claimed = db::claim_app_version(&state.pool, org_id, app_id, &digest)
         .await
-        .map_err(internal)?;
+        .map_err(crate::auth::unavailable)?;
 
     let Some(row) = claimed else {
         // Empty means *either* the conflict fired *or* no live app matched.
@@ -238,7 +238,7 @@ async fn publish_inner(
         // the one making progress and both answers are stable by now.
         let existing = db::app_version_by_digest(&state.pool, org_id, app_id, &digest)
             .await
-            .map_err(internal)?;
+            .map_err(crate::auth::unavailable)?;
 
         return match existing {
             // A conflict. Finish the work rather than assuming whoever holds
@@ -247,7 +247,7 @@ async fn publish_inner(
                 state.artifacts.put(&validated).await?;
                 let ready = db::mark_app_version_ready(&state.pool, row.id)
                     .await
-                    .map_err(internal)?;
+                    .map_err(crate::auth::unavailable)?;
                 Ok((Published::AlreadyExisted(ready), certificate))
             }
             // No row, so the app is absent or deleted. A 404, never a 200:
@@ -262,13 +262,6 @@ async fn publish_inner(
     state.artifacts.put(&validated).await?;
     let ready = db::mark_app_version_ready(&state.pool, row.id)
         .await
-        .map_err(internal)?;
+        .map_err(crate::auth::unavailable)?;
     Ok((Published::Created(ready), certificate))
-}
-
-/// A driver failure is ours, not the caller's.
-fn internal(source: sqlx::Error) -> Error {
-    Error::Internal {
-        source: source.into(),
-    }
 }

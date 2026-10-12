@@ -58,6 +58,10 @@ pub struct ReconcileReport {
     pub renewed: usize,
     /// Of those, renewals that failed (recorded visibly, retried later).
     pub failed: usize,
+    /// Of those, claims released unstarted because the process is stopping.
+    pub released: usize,
+    /// The claim itself failed, so nothing was attempted.
+    pub claim_failed: bool,
 }
 
 /// Run one renewal pass with the production intervals.
@@ -81,6 +85,20 @@ pub async fn reconcile_with(
     stale_after: Duration,
     retry_after: Duration,
 ) -> ReconcileReport {
+    pass(pool, issuer, limit, stale_after, retry_after, None).await
+}
+
+/// One pass. With `stop`, checks it before each row: once it is set, the rows
+/// not yet started are released (see [`db::cert_release_claims`]) rather than
+/// left `renewing` for [`STALE_RENEWING_AFTER`], and the pass returns.
+async fn pass(
+    pool: &sqlx::PgPool,
+    issuer: &CertIssuer,
+    limit: i64,
+    stale_after: Duration,
+    retry_after: Duration,
+    stop: Option<&tokio::sync::watch::Receiver<bool>>,
+) -> ReconcileReport {
     let due = match db::claim_due_for_renewal(
         pool,
         limit,
@@ -92,7 +110,10 @@ pub async fn reconcile_with(
         Ok(due) => due,
         Err(error) => {
             tracing::error!(%error, "renewal reconciler: claim failed; skipping this pass");
-            return ReconcileReport::default();
+            return ReconcileReport {
+                claim_failed: true,
+                ..ReconcileReport::default()
+            };
         }
     };
     let mut report = ReconcileReport {
@@ -102,7 +123,21 @@ pub async fn reconcile_with(
         claimed: due.len(),
         ..ReconcileReport::default()
     };
-    for cert in due {
+    for (index, cert) in due.iter().enumerate() {
+        if stop.is_some_and(|stop| *stop.borrow()) {
+            let unstarted: Vec<_> = due[index..].iter().map(|c| c.org_id).collect();
+            match db::cert_release_claims(pool, &unstarted).await {
+                Ok(released) => report.released = released,
+                Err(error) => {
+                    tracing::warn!(%error, "could not release unstarted renewals; they are reclaimed once stale")
+                }
+            }
+            tracing::info!(
+                released = report.released,
+                "renewal reconciler stopping between rows"
+            );
+            break;
+        }
         let slug = match OrgSlug::parse(&cert.slug) {
             Ok(slug) => slug,
             Err(error) => {
@@ -151,4 +186,138 @@ pub async fn reconcile_with(
         "renewal reconciler pass complete"
     );
     report
+}
+
+/// How often the reconciler runs a pass.
+pub const PASS_EVERY: Duration = Duration::from_secs(60);
+
+/// The longest wait between attempts to set up the ACME account.
+const ACCOUNT_MAX_RETRY: Duration = Duration::from_secs(300);
+
+/// What the reconciler is doing, for `/readyz` (#48). Reported, never a
+/// reason to be unready: certificates renew weeks ahead, and an instance
+/// that cannot reach the CA can still serve every request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ReconcilerState {
+    /// `CLWD_CERT_RECONCILER=off`.
+    Off,
+    /// Setting up the ACME account.
+    Starting,
+    /// The last pass claimed and completed what was due.
+    Running,
+    /// The account could not be set up, or the last pass had failures.
+    Failing,
+    /// Stopped at shutdown.
+    Stopped,
+}
+
+impl ReconcilerState {
+    /// The name `/readyz` reports.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Starting => "starting",
+            Self::Running => "running",
+            Self::Failing => "failing",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// A [`ReconcilerState`] shared between the reconciler and readiness.
+#[derive(Debug)]
+pub struct StateCell(std::sync::Mutex<ReconcilerState>);
+
+impl StateCell {
+    #[must_use]
+    pub fn new(state: ReconcilerState) -> Self {
+        Self(std::sync::Mutex::new(state))
+    }
+
+    #[must_use]
+    pub fn get(&self) -> ReconcilerState {
+        *self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set(&self, state: ReconcilerState) {
+        let mut current = self
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *current != state {
+            tracing::info!(
+                from = current.as_str(),
+                to = state.as_str(),
+                "certificate reconciler state changed"
+            );
+            *current = state;
+        }
+    }
+}
+
+async fn stopped(stop: &mut tokio::sync::watch::Receiver<bool>) {
+    let _ = stop.wait_for(|stop| *stop).await;
+}
+
+/// Run the reconciler until `stop` is set: set up the issuer with `connect`
+/// (retrying with backoff, since it reaches the CA), then a pass every
+/// [`PASS_EVERY`]. A pass in progress when `stop` is set finishes its current
+/// row and releases the rest.
+pub async fn run<F, Fut>(
+    pool: sqlx::PgPool,
+    connect: F,
+    state: std::sync::Arc<StateCell>,
+    mut stop: tokio::sync::watch::Receiver<bool>,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = Result<CertIssuer, String>>,
+{
+    state.set(ReconcilerState::Starting);
+    let mut wait = Duration::from_secs(1);
+    let issuer = loop {
+        match connect().await {
+            Ok(issuer) => break issuer,
+            Err(error) => {
+                tracing::warn!(%error, retry_in_s = wait.as_secs(), "certificate reconciler: ACME account setup failed");
+                state.set(ReconcilerState::Failing);
+            }
+        }
+        tokio::select! {
+            () = tokio::time::sleep(wait) => {}
+            () = stopped(&mut stop) => {
+                state.set(ReconcilerState::Stopped);
+                return;
+            }
+        }
+        wait = (wait * 2).min(ACCOUNT_MAX_RETRY);
+    };
+    loop {
+        let report = pass(
+            &pool,
+            &issuer,
+            CLAIM_LIMIT,
+            STALE_RENEWING_AFTER,
+            FAILED_RETRY_AFTER,
+            Some(&stop),
+        )
+        .await;
+        if *stop.borrow() {
+            break;
+        }
+        state.set(if report.claim_failed || report.failed > 0 {
+            ReconcilerState::Failing
+        } else {
+            ReconcilerState::Running
+        });
+        tokio::select! {
+            () = tokio::time::sleep(PASS_EVERY) => {}
+            () = stopped(&mut stop) => break,
+        }
+    }
+    state.set(ReconcilerState::Stopped);
 }

@@ -280,6 +280,19 @@ define_error! {
             meaning: "The caller is authenticated but not permitted to do this: a token without the scope the operation requires, a signed-in user who is not the one allowed to make this change, or a browser request from another origin. The message says which.",
             hint: "act on what the message names: a token with that scope, the permitted user, or a request from the control plane's own pages";
 
+        /// Sign-in cannot start or finish because the identity provider has
+        /// not been reached yet: the control plane starts without it, so an
+        /// outage at the provider stops new sign-ins rather than every
+        /// existing session (#48).
+        ///
+        /// Retryable and 503, never `control-plane.internal`: nothing is
+        /// wrong with the request or with this service's code, and the same
+        /// request succeeds once the provider answers.
+        #[error("the identity provider has not been reached yet")]
+        ProviderUnavailable {} => "identity.provider_unavailable", 503, true,
+            meaning: "Sign-in is unavailable because the control plane has not yet reached the identity provider. Existing sessions are unaffected.",
+            hint: "retry sign-in in a minute; if it persists the identity provider is down or unreachable from the control plane";
+
         /// A named resource does not exist, or the caller may not see it.
         ///
         /// Deliberately does not distinguish the two. Telling an unauthorised
@@ -460,6 +473,7 @@ pub fn owned_samples() -> Vec<Error> {
         Error::Forbidden {
             what: "this route needs the `publish` scope".into(),
         },
+        Error::ProviderUnavailable {},
         Error::NotFound {
             what: "app 0198f0c1-8b3e-7000-8000-0000000000a2".into(),
         },

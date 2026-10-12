@@ -89,6 +89,16 @@ no-database claim by unsetting `DATABASE_URL` rather than by assertion.
 Migrations are forward-only. A destructive one has no `down` to run, so it carries
 a written `ROLLBACK PLAN` comment instead; `just rollback-plans` fails without one.
 
+**Every migration must work with the previous build.** The control plane refuses
+to start against a database *behind* it, but allows one *ahead* of it, because
+during a rollout migrations run first and the old build keeps serving until it is
+replaced (decision record 0004). So no migration may drop or rename a column,
+table or constraint that the previous build reads. Use expand, then contract:
+add the new shape and make the code read it (one release), then remove the old
+shape in a later release, once no running build reads it. A migration that drops
+or renames anything carries a `PREVIOUS BUILD:` comment saying why the build
+before it does not need what it removes; `just rollback-plans` fails without one.
+
 ### A check that passes without checking is worse than no check
 
 The recurring failure in this repository is not a check that fails. It is a check that

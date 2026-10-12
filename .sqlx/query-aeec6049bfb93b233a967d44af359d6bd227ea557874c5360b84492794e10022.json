@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update certificates set last_renewal_attempt = '-infinity'\n            where org_id = any($1) and state = 'renewing'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aeec6049bfb93b233a967d44af359d6bd227ea557874c5360b84492794e10022"
+}

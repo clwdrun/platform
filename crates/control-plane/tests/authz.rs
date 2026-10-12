@@ -362,7 +362,8 @@ async fn the_sequence_is_read_in_the_decisions_snapshot(pool: PgPool) {
     .expect("member");
     let parent = control_plane::session::issue(
         &pool,
-        &control_plane::signin::CookieKey::from_secret(b"a-test-signing-secret-of-some-length"),
+        &control_plane::signin::CookieKey::from_secret(b"a-test-signing-secret-of-some-length")
+            .expect("a long enough test secret"),
         user.id,
     )
     .await

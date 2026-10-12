@@ -197,16 +197,31 @@ fn retry_after_secs(wait: Duration) -> u64 {
 }
 
 /// A lookup that could not be made is a denial, reported as what it is.
+///
+/// Two failures are the database being slow rather than anything being
+/// wrong, and both are `control-plane.timeout`, retryable: no connection free
+/// within the pool's acquire timeout, and a statement cancelled by the
+/// serving pool's `statement_timeout` (SQLSTATE 57014, #48).
 pub(crate) fn unavailable(source: sqlx::Error) -> Error {
-    match source {
-        sqlx::Error::PoolTimedOut => Error::Timeout {
+    let slow = match &source {
+        sqlx::Error::PoolTimedOut => true,
+        sqlx::Error::Database(e) => e.code().as_deref() == Some(QUERY_CANCELED),
+        _ => false,
+    };
+    if slow {
+        Error::Timeout {
             dependency: "the database".to_owned(),
-        },
-        other => Error::Internal {
-            source: other.into(),
-        },
+        }
+    } else {
+        Error::Internal {
+            source: source.into(),
+        }
     }
 }
+
+/// SQLSTATE `query_canceled`: what Postgres reports when `statement_timeout`
+/// ends a statement.
+const QUERY_CANCELED: &str = "57014";
 
 fn request_id_of(request: &Request) -> RequestId {
     request
@@ -336,7 +351,7 @@ pub async fn issue(
         &scopes.to_names(),
     )
     .await
-    .map_err(|e| Error::Internal { source: e.into() })?
+    .map_err(unavailable)?
     .ok_or_else(|| Error::NotFound {
         what: match app_id {
             Some(app) => format!("app {app}"),
@@ -501,7 +516,7 @@ pub async fn revoke_route(
             },
             &request_id,
         ),
-        Err(e) => render(&Error::Internal { source: e.into() }, &request_id),
+        Err(e) => render(&unavailable(e), &request_id),
     }
 }
 
