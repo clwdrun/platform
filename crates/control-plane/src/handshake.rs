@@ -36,13 +36,15 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
+use shared::authz::{Decision, Tag};
 use shared::return_path::ReturnPath;
 use shared::{Error, RequestId};
 use sqlx::PgPool;
 
 use crate::auth::unavailable;
+use crate::authz;
 use crate::http::{AppState, render};
-use crate::ids::{AppId, AppSessionId, AppSubject, HandshakeId, OrgId};
+use crate::ids::{AppId, AppSessionId, AppSubject, HandshakeId, OrgId, SessionId, UserId};
 use crate::openapi::{Body, Doc, Success};
 use crate::session;
 
@@ -225,7 +227,8 @@ pub async fn exchange(
 
 // ----------------------------------------------------------- check ----
 
-/// Who a live app-host session belongs to, as the app is allowed to see it.
+/// Who a live app-host session belongs to, as the app is allowed to see it,
+/// and what the decision about them depends on.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct Checked {
@@ -235,27 +238,63 @@ pub struct Checked {
     pub email: String,
     /// The app's org.
     pub org_id: OrgId,
-    /// Whether the visitor is a member of the app's org. The interim access
-    /// rule until #12: a session for a non-member reaches no app code.
+    /// Whether the visitor is a member of the app's org: the interim rule's
+    /// one fact (#14 replaces).
     pub member: bool,
+    /// The rows the decision was read from. A change to any of them
+    /// invalidates a gateway's cached copy (#12).
+    pub app_session_id: AppSessionId,
+    pub session_id: SessionId,
+    pub user_id: UserId,
+    /// How long until the earlier of the two sessions expires, by the
+    /// database's clock.
+    pub ttl: std::time::Duration,
+    /// The invalidation counter in the same snapshot: every change numbered
+    /// at or below it is reflected here, none above it.
+    pub as_of: shared::authz::Seq,
+}
+
+impl Checked {
+    /// What the decision depends on, as the invalidation stream names it.
+    #[must_use]
+    pub fn tags(&self, app_id: AppId) -> Vec<Tag> {
+        vec![
+            Tag::AppSession(self.app_session_id.as_uuid()),
+            Tag::Session(self.session_id.as_uuid()),
+            Tag::User(self.user_id.as_uuid()),
+            Tag::App(app_id.as_uuid()),
+            Tag::Org(self.org_id.as_uuid()),
+        ]
+    }
+
+    /// The policy's question about this visitor and `app_id`.
+    #[must_use]
+    pub fn request(&self, app_id: AppId) -> authz::Request {
+        authz::Request::new(
+            authz::Principal::user(self.user_id),
+            authz::Action::View,
+            authz::Resource::App {
+                app_id,
+                org_id: self.org_id,
+            },
+            authz::Context::new(self.member),
+        )
+    }
 }
 
 /// The visitor behind `secret`, if it is a live app-host session **for
 /// `app_id`**.
 ///
-/// The per-request check, and the only query the session model adds to the
-/// app request path: one statement, an index probe on `secret_sha256`. Both
-/// the app-host session and its parent control-plane session must be live,
-/// so the effective expiry is the earlier of the two, and signing out or
-/// revoking the parent ends every child on its very next request. Nothing is
-/// cached, so revocation latency is zero; #12's cache must keep that or argue
-/// for a bound.
+/// The per-request check: one statement (`queries/authz_check.sql`), an index
+/// probe on `secret_sha256`. The app-host session, its parent control-plane
+/// session, the user, the app and the app's org must all be live, so signing
+/// out or revoking the parent ends every child. The gateway caches allow
+/// decisions made from this; the database's triggers on every table it reads
+/// tell the gateway when one is stale (#12, `docs/decisions/0003`).
 ///
-/// The same statement returns what the app is told (its pairwise subject,
-/// the verified email, the app's org) and whether the visitor is a member of
-/// the app's org: a left join, not a second query. **#12 replaces the
-/// membership rule** with its policy; #15/#16 widen it to "a member, or holds a
-/// grant on this app".
+/// It must read the **primary**. The gateway's staleness guard assumes this
+/// sees every change the invalidation stream has already announced; a lagging
+/// replica breaks the revocation contract.
 ///
 /// # Errors
 ///
@@ -269,25 +308,8 @@ pub async fn check(
         .await
         .map_err(unavailable)?;
     let queried = std::time::Instant::now();
-    let row = sqlx::query!(
-        r#"select sub.subject as "subject: AppSubject",
-                  u.email,
-                  ap.org_id as "org_id: OrgId",
-                  -- #12 replaces: interim org-member rule.
-                  (m.user_id is not null) as "member!"
-             from app_sessions a
-             join sessions s on s.id = a.parent_session_id
-             join users u on u.id = s.user_id
-             join apps ap on ap.id = a.app_id
-             join app_subjects sub on sub.app_id = a.app_id and sub.user_id = u.id
-             left join org_members m on m.org_id = ap.org_id and m.user_id = u.id
-            where a.secret_sha256 = $1
-              and a.app_id = $2
-              and a.expires_at > now()
-              and s.revoked_at is null
-              and s.expires_at > now()
-              and u.deleted_at is null
-              and ap.deleted_at is null"#,
+    let row = sqlx::query_file!(
+        "queries/authz_check.sql",
         &secret.digest()[..],
         app_id.as_uuid(),
     )
@@ -306,6 +328,14 @@ pub async fn check(
         email: row.email,
         org_id: row.org_id,
         member: row.member,
+        app_session_id: row.app_session_id,
+        session_id: row.session_id,
+        user_id: row.user_id,
+        ttl: std::time::Duration::from_millis(u64::try_from(row.ttl_ms).unwrap_or(0)),
+        // A negative counter is ruled out by its check constraint; were it
+        // ever read, `ZERO` makes the answer older than everything: never
+        // cached past the first event.
+        as_of: shared::authz::Seq::from_db(row.as_of).unwrap_or(shared::authz::Seq::ZERO),
     }))
 }
 
@@ -501,14 +531,26 @@ pub(crate) struct CheckRequest {
 
 #[derive(Serialize, Deserialize, utoipa::ToSchema)]
 pub(crate) struct CheckResponse {
+    /// Allow or deny, and why (#12). The gateway runs app code only on allow.
+    #[schema(value_type = Object)]
+    decision: Decision,
     /// The visitor's pairwise subject for this app.
     #[schema(value_type = String, format = Uuid)]
     subject: AppSubject,
     email: String,
     #[schema(value_type = String, format = Uuid)]
     org_id: OrgId,
-    /// Whether the visitor is a member of the app's org (#12 replaces).
-    member: bool,
+    /// What the decision depends on: a gateway drops its cached copy when the
+    /// invalidation stream names any of these.
+    #[schema(value_type = Vec<Object>)]
+    tags: Vec<Tag>,
+    /// How long, at most, the decision may be cached: the earlier session
+    /// expiry, measured on the database's clock.
+    ttl_ms: u64,
+    /// The invalidation stream position this answer reflects: a gateway drops
+    /// it when a later event names one of `tags`.
+    #[schema(value_type = u64)]
+    as_of: shared::authz::Seq,
 }
 
 fn parse_body<T: serde::de::DeserializeOwned>(body: &[u8]) -> Result<T, Error> {
@@ -597,6 +639,7 @@ pub(crate) async fn check_route(
         let secret = AppSessionSecret::parse(&request.session).ok_or(Error::Unauthenticated {})?;
         check(&state.pool, &secret, request.app_id)
             .await?
+            .map(|checked| (checked, request.app_id))
             .ok_or(Error::Unauthenticated {})
     }
     .await;
@@ -608,11 +651,14 @@ pub(crate) async fn check_route(
         tracing::warn!(%request_id, handler_ms, "a session check was slow in its handler");
     }
     match result {
-        Ok(checked) => axum::Json(CheckResponse {
+        Ok((checked, app_id)) => axum::Json(CheckResponse {
+            decision: authz::POLICY.decide(&checked.request(app_id)),
+            tags: checked.tags(app_id),
+            ttl_ms: u64::try_from(checked.ttl.as_millis()).unwrap_or(u64::MAX),
+            as_of: checked.as_of,
             subject: checked.subject,
             email: checked.email,
             org_id: checked.org_id,
-            member: checked.member,
         })
         .into_response(),
         Err(error) => render(&error, &request_id),
@@ -653,7 +699,10 @@ fn check_response_example() -> serde_json::Result<serde_json::Value> {
         "subject": "3f2a1c4e-9b7d-4e21-8c3a-5d6f7e8a9b0c",
         "email": "ada@example.com",
         "org_id": crate::openapi::EXAMPLE_ORG,
-        "member": true,
+        "decision": {"effect": "allow", "reason": "org_member"},
+        "tags": [{"kind": "app_session", "id": "0190a6c4-0000-7000-8000-000000000001"}],
+        "ttl_ms": 3_600_000,
+        "as_of": 42,
     }))
 }
 
@@ -712,7 +761,7 @@ pub(crate) fn check_doc() -> Doc {
     Doc {
         operation_id: "checkAppSession",
         summary: "Check an app-host session",
-        description: "Gateway only, on every app request. 200 with the visitor's identity for this app if the session is live for this app and its parent control-plane session is live; identity.unauthenticated otherwise. `member` is false when the visitor is not a member of the app's org, and the gateway runs no app code for them.",
+        description: "Gateway only, on every app request. 200 with the visitor's identity for this app if the session is live for this app and its parent control-plane session is live; identity.unauthenticated otherwise. `decision` is the policy's allow or deny (#12); the gateway runs app code only on allow, and may cache an allow until `ttl_ms` or until the invalidation stream names one of `tags`.",
         params: &[],
         request: Some(Body::json::<CheckRequest>(
             "The session and the app requested.",

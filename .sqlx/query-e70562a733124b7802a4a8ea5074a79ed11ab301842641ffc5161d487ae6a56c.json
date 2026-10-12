@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select n from authz_seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "authz_seq",
+            "name": "n"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e70562a733124b7802a4a8ea5074a79ed11ab301842641ffc5161d487ae6a56c"
+}

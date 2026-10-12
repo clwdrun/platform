@@ -29,6 +29,11 @@ clwd-bundle = { workspace = true }
 # A request id on each control-plane check, to match a refusal with the
 # control plane's own log of it (#90). Already in the tree.
 uuid = { workspace = true }
+# The authorization cache (#12): the cache key is a session's SHA-256, the
+# stream names gateways and rows by UUID, and the lease reads CLOCK_BOOTTIME,
+# which std's Instant does not. All three were already in the tree.
+sha2 = { workspace = true }
+libc = "0.2"
 
 [dev-dependencies]
 # A real HTTP server to point the lookup client at: warm the cache over real

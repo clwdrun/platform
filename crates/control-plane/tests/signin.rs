@@ -2079,7 +2079,8 @@ async fn a_code_exchanges_once_for_a_session_bound_to_its_app_and_parent(pool: P
     assert_eq!(live.json["email"], EMAIL);
     assert_eq!(live.json["org_id"], other_org.id.to_string());
     assert_eq!(
-        live.json["member"], false,
+        live.json["decision"],
+        serde_json::json!({"effect": "deny", "reason": "not_a_member"}),
         "the signed-in user is not a member of acme"
     );
     assert_eq!(
@@ -2187,7 +2188,10 @@ async fn the_subject_is_pairwise_random_and_stable(pool: PgPool) {
         "pairwise: another app sees another subject"
     );
 
-    assert_eq!(first.json["member"], false);
+    assert_eq!(
+        first.json["decision"],
+        serde_json::json!({"effect": "deny", "reason": "not_a_member"})
+    );
     sqlx::query("insert into org_members (org_id, user_id, joined_via) values ($1, $2, 'domain')")
         .bind(acme.id.as_uuid())
         .bind(user_id)
@@ -2195,7 +2199,10 @@ async fn the_subject_is_pairwise_random_and_stable(pool: PgPool) {
         .await
         .expect("join acme");
     let member = check_session(&state, &app_session(&state, &cookie, notes).await, notes).await;
-    assert_eq!(member.json["member"], true);
+    assert_eq!(
+        member.json["decision"],
+        serde_json::json!({"effect": "allow", "reason": "org_member"})
+    );
     assert_eq!(member.json["subject"], first.json["subject"]);
 }
 

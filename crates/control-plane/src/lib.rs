@@ -2,6 +2,7 @@
 
 pub mod acme;
 pub mod auth;
+pub mod authz;
 pub mod cloudflare;
 pub mod db;
 #[cfg(test)]
@@ -13,6 +14,7 @@ pub mod openapi;
 pub mod orgs;
 pub mod publish;
 pub mod reconcile;
+pub mod relay;
 pub mod resolve;
 pub mod session;
 pub mod signin;

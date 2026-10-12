@@ -596,7 +596,7 @@
     },
     "/auth/logout": {
       "post": {
-        "description": "Revokes the session the session cookie names, server-side, and clears the cookie. Idempotent and uninformative: a request with no session, or with an expired, revoked or forged one, gets the same `204`. A `POST` so that a cross-site image tag cannot sign anyone out.\n\n**Authentication:** none required; the session cookie is read if sent. Must come from the control plane's own origin.",
+        "description": "Revokes the session the session cookie names, server-side, and clears the cookie. Idempotent and uninformative: a request with no session, or with an expired, revoked or forged one, gets the same `204`. A `POST` so that a cross-site image tag cannot sign anyone out. Returns only once every gateway has dropped any cached decision from before the revocation, or its lease has lapsed: a request that starts after this returns is denied on every gateway (#12). `control-plane.timeout` means the revocation is committed but not yet confirmed; retry.\n\n**Authentication:** none required; the session cookie is read if sent. Must come from the control plane's own origin.",
         "operationId": "sign_out",
         "responses": {
           "204": {

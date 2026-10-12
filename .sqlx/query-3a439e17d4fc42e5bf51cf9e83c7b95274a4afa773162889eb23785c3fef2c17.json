@@ -1,0 +1,110 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "-- The per-request decision's one statement (#11, #12): who a live app-host\n-- session belongs to, for this app, and the facts the policy decides from.\n--\n-- Every relation read here is a decision input, and must be in\n-- `control_plane::authz::INPUTS` with its invalidation triggers: a test reads\n-- this file's plan and fails on any relation that is not, except `authz_seq`.\n-- That one is read for `as_of`: the invalidation counter in this statement's\n-- own snapshot. Every change numbered at or below it is reflected in this\n-- answer, and none above it, so a gateway drops the answer exactly when a\n-- later change names one of its tags. The tag columns\n-- name what the gateway's cached decision depends on; `ttl_ms` is the\n-- remaining life of the earlier-expiring of the two sessions, computed on the\n-- database's clock so the gateway never compares its clock with ours.\nselect sub.subject as \"subject: AppSubject\",\n       u.email,\n       ap.org_id as \"org_id: OrgId\",\n       -- #14 replaces: the interim org-member rule's one fact.\n       (m.user_id is not null) as \"member!\",\n       a.id as \"app_session_id: AppSessionId\",\n       s.id as \"session_id: SessionId\",\n       u.id as \"user_id: UserId\",\n       greatest(0, extract(epoch from least(a.expires_at, s.expires_at) - now()) * 1000)::bigint\n           as \"ttl_ms!\",\n       -- MUST stay a column of this one statement. One statement is one\n       -- snapshot, so this number and the decision describe the same moment.\n       -- Read in a second query, a revocation committing between the two\n       -- would be counted in `as_of` but missing from the decision: the\n       -- gateway would see nothing newer than the entry and serve the stale\n       -- allow. A test holds this (the_sequence_is_read_in_the_decisions_snapshot).\n       (select n from authz_seq) as \"as_of!\"\n  from app_sessions a\n  join sessions s       on s.id = a.parent_session_id\n  join users u          on u.id = s.user_id\n  join apps ap          on ap.id = a.app_id\n  join orgs o           on o.id = ap.org_id\n  join app_subjects sub on sub.app_id = a.app_id and sub.user_id = u.id\n  left join org_members m on m.org_id = ap.org_id and m.user_id = u.id\n where a.secret_sha256 = $1\n   and a.app_id = $2\n   and a.expires_at > now()\n   and s.revoked_at is null\n   and s.expires_at > now()\n   and u.deleted_at is null\n   and ap.deleted_at is null\n   and o.deleted_at is null\n",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "subject: AppSubject",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "app_subjects",
+            "name": "subject"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "email",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "email"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "apps",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "member!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 4,
+        "name": "app_session_id: AppSessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "app_sessions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "session_id: SessionId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "sessions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "user_id: UserId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "users",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "ttl_ms!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 8,
+        "name": "as_of!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Bytea",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null,
+      false,
+      false,
+      false,
+      null,
+      null
+    ]
+  },
+  "hash": "3a439e17d4fc42e5bf51cf9e83c7b95274a4afa773162889eb23785c3fef2c17"
+}

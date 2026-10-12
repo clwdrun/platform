@@ -24,8 +24,6 @@ rand = "0.8"
 base64 = "0.22"
 tower = { workspace = true, features = ["util"] }
 http-body-util = "0.1"
-# Only to build a body with no known length, for the chunked-upload test.
-futures = { workspace = true }
 # An in-memory artifact store for the router tests, which store nothing.
 opendal = { workspace = true }
 clwd-bundle = { workspace = true }
@@ -42,6 +40,9 @@ jsonschema = { version = "0.56.0", default-features = false }
 wiremock = "0.6"
 
 [dependencies]
+# The invalidation relay's streaming response body (#12); also the
+# chunked-upload test's body with no known length.
+futures = { workspace = true }
 axum = { workspace = true }
 sqlx = { workspace = true }
 uuid = { workspace = true }

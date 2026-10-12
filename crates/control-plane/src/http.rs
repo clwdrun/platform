@@ -110,6 +110,11 @@ pub struct AppState {
     /// `control-plane.internal` — fail closed. Set via
     /// [`AppState::with_apps_domain`].
     pub apps_domain: Option<shared::domains::AppsDomain>,
+    /// The authorization invalidation relay (#12). `None` means the stream
+    /// route answers `control-plane.timeout` and no lease is renewed, so every
+    /// gateway stays on the uncached check — fail closed. Set via
+    /// [`AppState::with_relay`].
+    pub relay: Option<std::sync::Arc<crate::relay::Relay>>,
 }
 
 impl AppState {
@@ -141,6 +146,7 @@ impl AppState {
             internal_secret: None,
             signin: None,
             txt_lookup: None,
+            relay: None,
             apps_domain: None,
         }
     }
@@ -164,6 +170,13 @@ impl AppState {
     #[must_use]
     pub fn with_apps_domain(mut self, apps: shared::domains::AppsDomain) -> Self {
         self.apps_domain = Some(apps);
+        self
+    }
+
+    /// Relay authorization invalidations to gateways through `relay`.
+    #[must_use]
+    pub fn with_relay(mut self, relay: std::sync::Arc<crate::relay::Relay>) -> Self {
+        self.relay = Some(relay);
         self
     }
 
@@ -377,6 +390,20 @@ pub fn production_routes() -> Vec<Route> {
             Access::Internal,
             crate::handshake::check_doc(),
             crate::handshake::check_route,
+        ),
+        Route::new(
+            Verb::Get,
+            "/internal/authz/stream",
+            Access::Internal,
+            crate::relay::stream_doc(),
+            crate::relay::stream_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/internal/authz/ack",
+            Access::Internal,
+            crate::relay::ack_doc(),
+            crate::relay::ack_route,
         ),
         Route::new(
             Verb::Post,

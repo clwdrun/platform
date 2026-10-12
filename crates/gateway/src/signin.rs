@@ -15,6 +15,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::StatusCode;
+use shared::authz::{Decision, Seq, Tag};
 use shared::hop::{AppSubject, Caller, OrgId};
 use shared::return_path::ReturnPath;
 use thiserror::Error;
@@ -133,6 +134,11 @@ impl AppSession {
     pub fn new(value: &str) -> Self {
         Self(value.to_owned())
     }
+
+    /// The secret itself, for the request that checks it and for hashing.
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
 }
 
 impl fmt::Debug for AppSession {
@@ -159,7 +165,7 @@ impl Exchanged {
 }
 
 /// The control plane could not be asked.
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 #[error("the control plane could not be reached for sign-in: {0}")]
 pub struct Unreachable(String);
 
@@ -339,7 +345,10 @@ impl SigninClient {
                         Some(body.email),
                         OrgId::new(body.org_id),
                     ),
-                    member: body.member,
+                    decision: body.decision,
+                    tags: body.tags,
+                    ttl: Duration::from_millis(body.ttl_ms),
+                    as_of: body.as_of,
                 }))
             }
             StatusCode::UNAUTHORIZED | StatusCode::BAD_REQUEST => Ok(None),
@@ -350,10 +359,13 @@ impl SigninClient {
 
 #[derive(serde::Deserialize)]
 struct CheckResponse {
+    decision: Decision,
     subject: String,
     email: String,
     org_id: String,
-    member: bool,
+    tags: Vec<Tag>,
+    ttl_ms: u64,
+    as_of: Seq,
 }
 
 /// A live app-host session's visitor.
@@ -362,9 +374,15 @@ struct CheckResponse {
 pub struct Checked {
     /// Who the app is told is calling.
     pub caller: Caller,
-    /// Whether the visitor is a member of the app's org. The interim access
-    /// rule until #12: a non-member's request reaches no app code.
-    pub member: bool,
+    /// The control plane's policy decision. App code runs only on allow.
+    pub decision: Decision,
+    /// What the decision depends on, as the invalidation stream names it.
+    pub tags: Vec<Tag>,
+    /// How long, at most, the decision may be cached.
+    pub ttl: Duration,
+    /// The invalidation stream position the decision reflects, read in the
+    /// same snapshot as the decision itself.
+    pub as_of: Seq,
 }
 
 #[must_use]

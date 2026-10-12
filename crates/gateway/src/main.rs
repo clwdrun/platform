@@ -67,13 +67,42 @@ fn main() -> anyhow::Result<()> {
                 .context("CLWD_WORKER_UID must name the worker's user id")?
                 .parse()
                 .context("CLWD_WORKER_UID must be a number")?;
-            let signin = Arc::new(SigninClient::new(control_plane, internal_secret)?);
+            let signin = Arc::new(SigninClient::new(
+                control_plane.clone(),
+                internal_secret.clone(),
+            )?);
             tracing::info!(%socket, worker_uid, "serving apps through the worker");
-            edge = edge.serving(Serving::new(
+            let serving = Serving::new(
                 signin,
                 control_plane_domain.clone(),
                 Arc::new(WorkerUpstream::new(socket, worker_uid)),
-            ));
+            );
+            // The authorization cache's invalidation stream (#12), on a thread
+            // and runtime of its own: pingora owns the others. Until it has
+            // connected and been granted a lease, every request takes the
+            // uncached check.
+            let (authz, gateway_id) = (serving.authz(), uuid::Uuid::now_v7());
+            let (base, secret) = (
+                control_plane.clone(),
+                Arc::<str>::from(internal_secret.as_str()),
+            );
+            std::thread::Builder::new()
+                .name("authz-stream".to_owned())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => runtime
+                            .block_on(gateway::authz::follow(authz, base, secret, gateway_id)),
+                        Err(error) => tracing::error!(
+                            %error,
+                            "no runtime for the invalidation stream; the cache stays bypassed"
+                        ),
+                    }
+                })
+                .context("starting the invalidation stream thread")?;
+            edge = edge.serving(serving);
         }
         Err(_) => tracing::warn!("CLWD_WORKER_SOCKET is unset; live apps answer gateway.not_ready"),
     }

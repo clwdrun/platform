@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select seq, kind, entity from authz_outbox\n                where seq in (select distinct seq from authz_outbox\n                               where seq > $1 order by seq limit $2)\n                order by seq",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "authz_outbox",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "authz_outbox",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "entity",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "authz_outbox",
+            "name": "entity"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Int8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f58cdb47248f757c829a61d3552037fbd8fdd54b813ebae804d4859a5ba34802"
+}

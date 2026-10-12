@@ -20,6 +20,7 @@ use pingora::protocols::http::ServerSession;
 use shared::domains::AppsDomain;
 use shared::{Envelope, RequestId};
 
+use crate::authz::Authz;
 use crate::host::parse_host;
 use crate::lookup::{Route, RouteLookup};
 use crate::signin::{
@@ -227,23 +228,36 @@ const MAX_BODY: usize = 16 * 1024 * 1024;
 /// the hop; then a live app answers `gateway.not_ready` as before.
 pub struct Serving {
     signin: Arc<SigninClient>,
+    /// Every app request's decision: cached when the invalidation stream says
+    /// it may be, the control plane's check otherwise (#12).
+    authz: Arc<Authz>,
     control_plane: ControlPlaneDomain,
     upstream: Arc<dyn AppUpstream>,
 }
 
 impl Serving {
-    /// Assemble the serving side.
+    /// Assemble the serving side. The authorization cache starts in bypass:
+    /// it serves nothing from cache until [`crate::authz::follow`] is running
+    /// against [`Self::authz`] and the control plane has granted a lease.
     #[must_use]
     pub fn new(
         signin: Arc<SigninClient>,
         control_plane: ControlPlaneDomain,
         upstream: Arc<dyn AppUpstream>,
     ) -> Self {
+        let authz = Arc::new(Authz::new(signin.clone()));
         Self {
             signin,
+            authz,
             control_plane,
             upstream,
         }
+    }
+
+    /// The authorization cache, for following the invalidation stream.
+    #[must_use]
+    pub fn authz(&self) -> Arc<Authz> {
+        self.authz.clone()
     }
 }
 
@@ -333,13 +347,14 @@ impl Edge {
 
         if let Found::One(value) = shared::cookie::find(cookie_slices(), APP_SESSION_COOKIE) {
             match serving
-                .signin
-                .check(&AppSession::new(value), target.app_id())
+                .authz
+                .authorize(&AppSession::new(value), target.app_id())
                 .await
             {
-                // #12 replaces: the interim org-member rule. Refused here, so
-                // a non-member's request never reaches the hop.
-                Ok(Some(checked)) if !checked.member => {
+                // Refused here, so a denied request never reaches the hop.
+                // Every reason today is the interim org-member rule's; #14's
+                // reasons get their own dispositions.
+                Ok(Some(checked)) if !checked.decision.is_allow() => {
                     return render_disposition(Disposition::NotAMember);
                 }
                 Ok(Some(checked)) => {

@@ -450,6 +450,17 @@ pub(crate) async fn logout(
         Err(Error::Unauthenticated {}) => {}
         Err(other) => return render(&other, &request_id),
     }
+    // The revocation contract (#12): return only once no gateway can serve a
+    // decision from before it. Waited on whether or not this request revoked
+    // anything, so a retry after a timeout still confirms, and the two cases
+    // take the same path.
+    let converged = match crate::relay::latest(&state.pool).await {
+        Ok(seq) => crate::relay::converged(&state.pool, seq).await,
+        Err(error) => Err(error),
+    };
+    if let Err(error) = converged {
+        return render(&error, &request_id);
+    }
     (
         StatusCode::NO_CONTENT,
         [(header::SET_COOKIE, session::clear_cookie())],
@@ -464,7 +475,11 @@ pub(crate) fn logout_doc() -> Doc {
         description: "Revokes the session the session cookie names, server-side, and clears the \
                       cookie. Idempotent and uninformative: a request with no session, or with an \
                       expired, revoked or forged one, gets the same `204`. A `POST` so that a \
-                      cross-site image tag cannot sign anyone out.",
+                      cross-site image tag cannot sign anyone out. Returns only once every \
+                      gateway has dropped any cached decision from before the revocation, or \
+                      its lease has lapsed: a request that starts after this returns is denied \
+                      on every gateway (#12). `control-plane.timeout` means the revocation is \
+                      committed but not yet confirmed; retry.",
         params: &[],
         request: None,
         success: vec![Success {
@@ -472,7 +487,7 @@ pub(crate) fn logout_doc() -> Doc {
             description: "Signed out: any session the cookie named is revoked, and the cookie is cleared.",
             body: None,
         }],
-        errors: &[],
+        errors: &["control-plane.timeout"],
     }
 }
 
