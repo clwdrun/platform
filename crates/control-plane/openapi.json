@@ -1039,11 +1039,11 @@
               "application/json": {
                 "examples": {
                   "bundle.*": {
-                    "description": "The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. What to do: see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover",
+                    "description": "The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. What to do: act on the envelope's hint, which names the fix for the specific code",
                     "summary": "bundle.*",
                     "value": {
                       "code": "bundle.member_digest_mismatch",
-                      "hint": "see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover",
+                      "hint": "Rebuild the bundle with `clwd build` and discard the copy whose contents fail their digest.",
                       "message": "member \"app.wasm\" does not match its declared digest",
                       "request_id": "0198f0c1-8b3e-7000-8000-0000000000a5",
                       "retryable": false
@@ -1077,7 +1077,7 @@
                 }
               }
             },
-            "description": "- `bundle.*`: The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. **What to do:** see docs/error-codes.md in clwdrun/clwd for this code's meaning and how to recover\n- `control-plane.egress_not_supported`: The bundle's manifest grants outbound network access (`capabilities.egress`), which deployed apps cannot use yet. Nothing was published. **What to do:** remove the hosts from `capabilities.egress` in clwd.toml, rebuild, and publish again\n- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
+            "description": "- `bundle.*`: The uploaded bundle was rejected by the bundle format. The code, `bundle.*`, names the specific defect. **What to do:** act on the envelope's hint, which names the fix for the specific code\n- `control-plane.egress_not_supported`: The bundle's manifest grants outbound network access (`capabilities.egress`), which deployed apps cannot use yet. Nothing was published. **What to do:** remove the hosts from `capabilities.egress` in clwd.toml, rebuild, and publish again\n- `control-plane.invalid_request`: A request body or parameter was not acceptable. The message says which part and why. **What to do:** check the request against the OpenAPI schema at /openapi.json"
           },
           "401": {
             "content": {

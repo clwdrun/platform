@@ -39,7 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::Value;
-use shared::error::{CATALOGUE, DELEGATED_HINT, DELEGATED_MEANING, bundle_sample, owned_samples};
+use shared::error::{CATALOGUE, DELEGATED_MEANING, bundle_sample, owned_samples};
 use shared::{Envelope, RequestId};
 use utoipa::ToSchema;
 use utoipa::openapi::content::{Content, ContentBuilder};
@@ -73,6 +73,12 @@ const JSON: &str = "application/json";
 pub(crate) const BUNDLE_CODES: &str = "bundle.*";
 
 const BUNDLE_TABLE: &str = "https://github.com/clwdrun/clwd/blob/main/docs/error-codes.md";
+
+/// What to do about a `bundle.*` error, for the family as a whole. Each code's
+/// envelope carries its own hint from the bundle crate; this documents that
+/// rather than restating 38 of them.
+const BUNDLE_FAMILY_HINT: &str =
+    "act on the envelope's hint, which names the fix for the specific code";
 
 /// Fixed identifiers for examples, so the committed document is stable. Each is
 /// a real UUIDv7 shape, never a real resource.
@@ -348,7 +354,7 @@ fn describe(
     code: &'static str,
 ) -> Result<(u16, &'static str, &'static str), SpecError> {
     if code == BUNDLE_CODES {
-        return Ok((400, DELEGATED_MEANING, DELEGATED_HINT));
+        return Ok((400, DELEGATED_MEANING, BUNDLE_FAMILY_HINT));
     }
     CATALOGUE
         .iter()

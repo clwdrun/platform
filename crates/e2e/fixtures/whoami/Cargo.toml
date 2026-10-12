@@ -13,7 +13,7 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-clwd-sdk = { version = "0.0.2", git = "https://github.com/clwdrun/clwd", tag = "v0.0.2" }
+clwd-sdk = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag = "v0.0.3" }
 
 [profile.release]
 opt-level = "z"
