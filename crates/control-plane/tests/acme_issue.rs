@@ -433,6 +433,8 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
             claimed: 1,
             renewed: 1,
             failed: 0,
+            released: 0,
+            claim_failed: false,
         },
         "one due row claimed and renewed, reported as counts"
     );
@@ -465,6 +467,8 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
             claimed: 0,
             renewed: 0,
             failed: 0,
+            released: 0,
+            claim_failed: false,
         },
         "rotation drained — a pass with nothing due claims nothing"
     );

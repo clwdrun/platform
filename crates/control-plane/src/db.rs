@@ -384,6 +384,26 @@ pub async fn claim_due_for_renewal(
         .collect())
 }
 
+/// Release claims a stopping reconciler did not start: still `renewing`, but
+/// with the attempt time pushed into the past, so the next pass on any
+/// instance reclaims them through the stale arm of
+/// [`claim_due_for_renewal`] instead of waiting out its interval (#48).
+///
+/// # Errors
+///
+/// The update failed.
+pub async fn cert_release_claims(pool: &sqlx::PgPool, org_ids: &[OrgId]) -> sqlx::Result<usize> {
+    let uuids: Vec<uuid::Uuid> = org_ids.iter().map(|id| id.as_uuid()).collect();
+    let done = sqlx::query!(
+        r#"update certificates set last_renewal_attempt = '-infinity'
+            where org_id = any($1) and state = 'renewing'"#,
+        &uuids,
+    )
+    .execute(pool)
+    .await?;
+    Ok(usize::try_from(done.rows_affected()).unwrap_or(usize::MAX))
+}
+
 /// Record that issuance or renewal failed, visibly. A silent failure is an
 /// outage with no deploy behind it, so the error is stored for the reconciler
 /// and an operator to see. The order URL is kept so the failure can be resumed.

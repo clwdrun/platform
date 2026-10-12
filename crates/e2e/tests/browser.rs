@@ -420,7 +420,7 @@ async fn signing_out_ends_the_app_session_on_the_next_request(pool: PgPool) {
     );
 
     let cp = chrome
-        .open(&format!("https://{CONTROL_PLANE}/healthz"))
+        .open(&format!("https://{CONTROL_PLANE}/openapi.json"))
         .await;
     let status: i64 = cp
         .evaluate("fetch('/auth/logout', {method: 'POST'}).then(r => r.status)")

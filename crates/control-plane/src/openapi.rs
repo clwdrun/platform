@@ -156,16 +156,6 @@ impl Body {
         }
     }
 
-    /// A plain-text body.
-    pub(crate) fn text(description: &'static str, example: ExampleFn) -> Self {
-        Self {
-            content_type: "text/plain",
-            description,
-            schema: SchemaSource::Inline(string_schema),
-            example: Some(example),
-        }
-    }
-
     /// Raw bytes. No example: a blob in a document teaches a caller nothing,
     /// so the description says where the bytes come from instead.
     pub(crate) fn binary(content_type: &'static str, description: &'static str) -> Self {

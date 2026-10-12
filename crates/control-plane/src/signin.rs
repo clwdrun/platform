@@ -57,14 +57,32 @@ pub struct CookieKey {
     pub(crate) decoding: DecodingKey,
 }
 
+/// The shortest secret a [`CookieKey`] accepts, in bytes.
+///
+/// 32 bytes is HS256's own output size: a shorter key is the weakest link in
+/// a signature that otherwise has 256 bits. Enforced here rather than only in
+/// configuration, so no caller can build a weak key.
+pub const MIN_COOKIE_KEY_BYTES: usize = 32;
+
+/// A cookie key secret shorter than [`MIN_COOKIE_KEY_BYTES`].
+#[derive(Debug, thiserror::Error)]
+#[error("a cookie key needs at least {MIN_COOKIE_KEY_BYTES} bytes of secret; this one has {0}")]
+pub struct WeakCookieKey(pub usize);
+
 impl CookieKey {
     /// Build the key from raw secret bytes.
-    #[must_use]
-    pub fn from_secret(secret: &[u8]) -> Self {
-        Self {
+    ///
+    /// # Errors
+    ///
+    /// [`WeakCookieKey`] if `secret` is shorter than [`MIN_COOKIE_KEY_BYTES`].
+    pub fn from_secret(secret: &[u8]) -> Result<Self, WeakCookieKey> {
+        if secret.len() < MIN_COOKIE_KEY_BYTES {
+            return Err(WeakCookieKey(secret.len()));
+        }
+        Ok(Self {
             encoding: EncodingKey::from_secret(secret),
             decoding: DecodingKey::from_secret(secret),
-        }
+        })
     }
 }
 
@@ -184,10 +202,21 @@ pub const FLOW_COOKIE: &str = "__Host-clwd_signin";
 /// How long a sign-in may take between the redirect and the callback.
 const FLOW_TTL_SECS: u64 = 600;
 
-/// Everything the two sign-in routes need: the discovered flow, the HTTP
+/// Everything the two sign-in routes need: the flow once discovered, the HTTP
 /// client it runs over, the cookie key, and the control plane's own origin.
+///
+/// # Discovery is not a startup dependency (#48)
+///
+/// The control plane also answers the gateways' session checks, which need
+/// only the database. If discovery were required to start, an outage at the
+/// identity provider would put the control plane in a restart loop and take
+/// every existing session down with it. So [`SignIn::new`] does no I/O, the
+/// flow is discovered in the background ([`SignIn::discover_until_ready`]),
+/// and until it is, both sign-in routes answer
+/// `identity.provider_unavailable`.
 pub struct SignIn {
-    flow: identity::Flow,
+    config: identity::OidcConfig,
+    flow: std::sync::OnceLock<identity::Flow>,
     http: reqwest::Client,
     key: CookieKey,
     origin: String,
@@ -208,16 +237,31 @@ impl SignIn {
         &self.key
     }
 
-    /// Discover the issuer and assemble the sign-in configuration.
+    /// Discover the issuer and assemble the sign-in configuration, in one
+    /// step. For tests; the serving binary uses [`SignIn::new`] and
+    /// [`SignIn::discover_until_ready`], so it can start before the provider
+    /// answers.
     ///
     /// # Errors
     ///
-    /// Whatever [`identity::Flow::discover`] reports, and
-    /// [`identity::FlowError::Unavailable`] if the HTTP client cannot be built.
+    /// Whatever [`SignIn::new`] or [`identity::Flow::discover`] reports.
     pub async fn discover(
         config: identity::OidcConfig,
         key: CookieKey,
     ) -> Result<Self, identity::FlowError> {
+        let signin = Self::new(config, key)?;
+        signin.discover_once().await?;
+        Ok(signin)
+    }
+
+    /// Assemble the sign-in configuration without contacting the provider.
+    ///
+    /// # Errors
+    ///
+    /// [`identity::FlowError::Rejected`] for a redirect URI that does not
+    /// parse, and [`identity::FlowError::Unavailable`] if the HTTP client
+    /// cannot be built.
+    pub fn new(config: identity::OidcConfig, key: CookieKey) -> Result<Self, identity::FlowError> {
         crate::acme::install_crypto_provider();
         let origin = reqwest::Url::parse(&config.redirect_uri)
             .map(|url| url.origin().ascii_serialization())
@@ -229,15 +273,91 @@ impl SignIn {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .map_err(|e| identity::FlowError::Unavailable(e.to_string()))?;
-        let flow = identity::Flow::discover(config, &http).await?;
         Ok(Self {
-            flow,
+            config,
+            flow: std::sync::OnceLock::new(),
             http,
             key,
             origin,
         })
     }
+
+    /// Whether discovery has succeeded, so sign-in can be served.
+    #[must_use]
+    pub fn discovered(&self) -> bool {
+        self.flow.get().is_some()
+    }
+
+    /// The issuer this sign-in is configured against.
+    #[must_use]
+    pub fn issuer(&self) -> &str {
+        &self.config.issuer
+    }
+
+    /// Discover the issuer once. A no-op once discovery has succeeded.
+    ///
+    /// # Errors
+    ///
+    /// Whatever [`identity::Flow::discover`] reports.
+    pub async fn discover_once(&self) -> Result<(), identity::FlowError> {
+        if self.discovered() {
+            return Ok(());
+        }
+        let config = identity::OidcConfig::new(
+            self.config.client_id.clone(),
+            self.config.client_secret.clone(),
+            self.config.redirect_uri.clone(),
+            self.config.issuer.clone(),
+        );
+        let flow = identity::Flow::discover(config, &self.http).await?;
+        // A concurrent discovery that won the race set an equivalent flow.
+        let _ = self.flow.set(flow);
+        Ok(())
+    }
+
+    /// Retry discovery until it succeeds, backing off from one second to a
+    /// minute between attempts, and log the first failure and the eventual
+    /// success. Runs for the life of the process; the caller spawns it and
+    /// drops the task at shutdown.
+    pub async fn discover_until_ready(&self) {
+        let mut wait = DISCOVERY_FIRST_RETRY;
+        let mut failures = 0u32;
+        loop {
+            match self.discover_once().await {
+                Ok(()) => {
+                    tracing::info!(issuer = %self.config.issuer, failures, "identity provider discovered; sign-in is available");
+                    return;
+                }
+                Err(error) => {
+                    failures += 1;
+                    // Once at warn, then at debug: a long outage must not fill
+                    // the log, and readiness reports the state meanwhile.
+                    if failures == 1 {
+                        tracing::warn!(issuer = %self.config.issuer, %error, "identity provider discovery failed; sign-in answers identity.provider_unavailable until it succeeds");
+                    } else {
+                        tracing::debug!(issuer = %self.config.issuer, %error, failures, "identity provider discovery failed again");
+                    }
+                }
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(DISCOVERY_MAX_RETRY);
+        }
+    }
+
+    /// The discovered flow, or the named error that says sign-in is waiting
+    /// for the provider.
+    fn flow(&self) -> Result<&identity::Flow, Error> {
+        self.flow.get().ok_or(Error::ProviderUnavailable {})
+    }
 }
+
+/// The first wait between discovery attempts.
+const DISCOVERY_FIRST_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest wait between discovery attempts: long enough not to hammer a
+/// provider that is down, short enough that sign-in returns within a minute of
+/// the provider coming back.
+const DISCOVERY_MAX_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 fn flow_cookie(value: &str, max_age_secs: u64) -> String {
     format!("{FLOW_COOKIE}={value}; Path=/; Max-Age={max_age_secs}; HttpOnly; Secure; SameSite=Lax")
@@ -275,7 +395,11 @@ pub(crate) async fn start(
     let Some(signin) = state.signin.as_deref() else {
         return render(&not_configured(), &request_id);
     };
-    let auth = signin.flow.authorize();
+    let flow = match signin.flow() {
+        Ok(flow) => flow,
+        Err(error) => return render(&error, &request_id),
+    };
+    let auth = flow.authorize();
     let sealed = match seal_flow(
         &signin.key,
         auth.state(),
@@ -355,7 +479,7 @@ async fn finish(state: &AppState, query: &str, headers: &HeaderMap) -> Result<Re
     let code = code.ok_or(Error::Unauthenticated {})?;
 
     let identity = signin
-        .flow
+        .flow()?
         .exchange(&signin.http, &code, &flow.pkce_verifier, &flow.nonce)
         .await
         .map_err(|e| match e {
@@ -511,7 +635,7 @@ pub(crate) fn start_doc() -> Doc {
             description: "Redirect to Google's authorization endpoint.",
             body: None,
         }],
-        errors: &[],
+        errors: &["identity.provider_unavailable"],
     }
 }
 
@@ -531,7 +655,11 @@ pub(crate) fn callback_doc() -> Doc {
             description: "Signed in: a session cookie is set and the browser is sent to the control plane's own root.",
             body: None,
         }],
-        errors: &["identity.unauthenticated", "control-plane.conflict"],
+        errors: &[
+            "identity.unauthenticated",
+            "identity.provider_unavailable",
+            "control-plane.conflict",
+        ],
     }
 }
 
@@ -542,7 +670,18 @@ mod tests {
     const SECRET: &[u8] = b"a-test-signing-secret-of-some-length";
 
     fn key() -> CookieKey {
-        CookieKey::from_secret(SECRET)
+        CookieKey::from_secret(SECRET).expect("a long enough test secret")
+    }
+
+    /// The length check lives in the constructor, so no caller (configuration
+    /// or otherwise) can build a key from a short secret.
+    #[test]
+    fn a_cookie_key_needs_32_bytes_of_secret() {
+        let short = [7u8; MIN_COOKIE_KEY_BYTES - 1];
+        let err = CookieKey::from_secret(&short).expect_err("31 bytes is too short");
+        assert_eq!(err.0, MIN_COOKIE_KEY_BYTES - 1);
+        assert!(CookieKey::from_secret(&[7u8; MIN_COOKIE_KEY_BYTES]).is_ok());
+        assert!(CookieKey::from_secret(b"").is_err());
     }
 
     /// A `now` comfortably in the past/future of the real clock, so expiry is
@@ -598,7 +737,8 @@ mod tests {
 
     #[test]
     fn a_cookie_signed_with_another_key_is_rejected() {
-        let other = CookieKey::from_secret(b"some-other-secret-entirely-different");
+        let other =
+            CookieKey::from_secret(b"some-other-secret-entirely-different").expect("long enough");
         let sealed = seal_flow(&other, "s", "n", "v", now(), 600, None).expect("sealing succeeds");
 
         assert!(matches!(

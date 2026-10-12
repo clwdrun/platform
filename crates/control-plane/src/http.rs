@@ -63,7 +63,7 @@ use tower_http::trace::TraceLayer;
 use shared::{Envelope, Error, RequestId};
 
 use crate::auth::{self, Limiter};
-use crate::openapi::{self, Doc, Success};
+use crate::openapi::{self, Doc};
 use crate::token::Scope;
 
 /// How long a request may run before it is abandoned.
@@ -71,7 +71,7 @@ use crate::token::Scope;
 /// Deliberately shorter than any sensible load-balancer idle timeout, so this
 /// layer is what ends a stuck request and the caller gets an envelope naming
 /// `control-plane.timeout` rather than a connection reset from somewhere else.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The header a client may use to supply its own correlation id.
 const REQUEST_ID_HEADER: &str = "x-request-id";
@@ -161,8 +161,8 @@ impl AppState {
 
     /// Enable the Google sign-in routes.
     #[must_use]
-    pub fn with_signin(mut self, signin: crate::signin::SignIn) -> Self {
-        self.signin = Some(std::sync::Arc::new(signin));
+    pub fn with_signin(mut self, signin: impl Into<std::sync::Arc<crate::signin::SignIn>>) -> Self {
+        self.signin = Some(signin.into());
         self
     }
 
@@ -191,7 +191,8 @@ impl AppState {
 /// Who may call a route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    /// Anyone. Only `/healthz` today.
+    /// Anyone: the OpenAPI document and the sign-in routes. Health lives on
+    /// the private ops listener (#48), not here.
     Public,
     /// An authenticated caller whose token carries this scope.
     Scoped(Scope),
@@ -328,13 +329,6 @@ impl Route {
 #[must_use]
 pub fn production_routes() -> Vec<Route> {
     vec![
-        Route::new(
-            Verb::Get,
-            "/healthz",
-            Access::Public,
-            healthz_doc(),
-            healthz,
-        ),
         Route::new(
             Verb::Get,
             "/openapi.json",
@@ -804,7 +798,7 @@ struct Rendered;
 /// A success is returned untouched: the status is checked first, and below 400
 /// there is no extension lookup, no header read and no body. The *decision* is
 /// one comparison, but the layer is not free — measured at about 1.1 µs per
-/// request in a release build (6.5 µs to 7.7 µs for `GET /healthz` through the
+/// request in a release build (6.5 µs to 7.7 µs for the former `GET /healthz` through the
 /// whole stack), which is the `from_fn` future and the request id cloned before
 /// the inner service runs. Against a database round trip of hundreds of
 /// microseconds that is noise; it is stated so nobody assumes it is zero.
@@ -973,28 +967,6 @@ fn on_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response {
     )
 }
 
-async fn healthz() -> &'static str {
-    "ok"
-}
-
-fn healthz_doc() -> Doc {
-    Doc {
-        operation_id: "health",
-        summary: "Liveness",
-        description: "Answers `ok` while the process is serving requests. For load balancers: it checks nothing downstream.",
-        params: &[],
-        request: None,
-        success: vec![Success {
-            status: StatusCode::OK,
-            description: "The process is serving requests.",
-            body: Some(openapi::Body::text("The literal text `ok`.", || {
-                Ok("ok".into())
-            })),
-        }],
-        errors: &[],
-    }
-}
-
 /// A route that fails, so the envelope has a normal failure to travel through.
 #[cfg(test)]
 async fn placeholder_not_found(
@@ -1055,7 +1027,8 @@ mod tests {
             .expect("router responds");
         let status = response.status();
         let (parts, body) = response.into_parts();
-        let bytes = to_bytes(body, 64 * 1024).await.expect("body reads");
+        // Large enough for the OpenAPI document, the biggest success body.
+        let bytes = to_bytes(body, 1024 * 1024).await.expect("body reads");
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json, Response::from_parts(parts, Body::empty()))
     }
@@ -1088,7 +1061,8 @@ mod tests {
         let response = service.oneshot(get("/")).await.expect("infallible");
         let status = response.status();
         let (parts, body) = response.into_parts();
-        let bytes = to_bytes(body, 64 * 1024).await.expect("body reads");
+        // Large enough for the OpenAPI document, the biggest success body.
+        let bytes = to_bytes(body, 1024 * 1024).await.expect("body reads");
         let json = serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null);
         (status, json, Response::from_parts(parts, Body::empty()))
     }
@@ -1130,7 +1104,7 @@ mod tests {
             "/v1/apps/dashboard",
             "/v1/panic",
             "/no/such/route",
-            "/healthz",
+            "/openapi.json",
         ] {
             let (_, _, response) = call(get(uri)).await;
             let leaked: Vec<&str> = response
@@ -1537,9 +1511,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn healthz_succeeds_and_still_carries_a_request_id() {
+    async fn a_success_still_carries_a_request_id() {
         let response = router(stateless())
-            .oneshot(get("/healthz"))
+            .oneshot(get("/openapi.json"))
             .await
             .expect("router responds");
         assert_eq!(response.status(), StatusCode::OK);

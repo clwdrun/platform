@@ -1364,6 +1364,8 @@ dependencies = [
  "governor",
  "hickory-resolver",
  "http-body-util",
+ "hyper 1.11.0",
+ "hyper-util",
  "identity",
  "instant-acme",
  "jsonschema",

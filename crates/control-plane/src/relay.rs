@@ -65,8 +65,32 @@ const QUEUE_WARN: f64 = 0.5;
 /// further back than the relay's own catch-up.
 const RETAIN_SECS: f64 = 3600.0;
 
+/// Outbox rows deleted per pruning statement. Measured in #48 at well under
+/// the 2 s statement timeout; see decision record 0004.
+const PRUNE_BATCH: i64 = 1000;
+
+/// Pruning statements per relay pass, so a large backlog is cleared over
+/// several passes rather than holding up heartbeats.
+const PRUNE_BATCHES_PER_PASS: usize = 50;
+
 /// A stream line is `None` when the relay closes every stream.
 type Line = Option<Arc<Message>>;
+
+/// A pool of `size` connections opened at once and never closed, the serving
+/// pool's shape (see [`crate::pool`]): the relay's connections inherit the
+/// serving pool's connect options, so they reopen under the same conditions
+/// and the same slow connects (#90).
+///
+/// The serving timeouts suit them. The listening connection waits for
+/// notifications between statements, which neither timeout counts, and every
+/// statement the relay runs is a bounded read or a batched delete.
+fn fixed(size: u32) -> PgPoolOptions {
+    PgPoolOptions::new()
+        .max_connections(size)
+        .min_connections(size)
+        .idle_timeout(None)
+        .max_lifetime(None)
+}
 
 /// The relay's shared state.
 #[derive(Debug)]
@@ -74,6 +98,8 @@ pub struct Relay {
     lines: broadcast::Sender<Line>,
     current: AtomicU64,
     healthy: AtomicBool,
+    /// Set by [`Relay::shut`]: no new stream is served.
+    shut: AtomicBool,
     /// Lease renewals' own connections, apart from the request pool.
     acks: PgPool,
 }
@@ -89,9 +115,7 @@ impl Relay {
     pub async fn start(pool: &PgPool) -> Result<Arc<Self>, sqlx::Error> {
         let options = (*pool.connect_options()).clone();
         // Created here: the ack route runs on this runtime.
-        let acks = PgPoolOptions::new()
-            .max_connections(2)
-            .connect_lazy_with(options.clone());
+        let acks = fixed(2).connect_lazy_with(options.clone());
         let (started, relay) = tokio::sync::oneshot::channel();
         std::thread::Builder::new()
             .name("authz-relay".to_owned())
@@ -108,12 +132,8 @@ impl Relay {
                 };
                 runtime.block_on(async move {
                     // Every connection the loop uses is made on this runtime.
-                    let own = PgPoolOptions::new()
-                        .max_connections(2)
-                        .connect_lazy_with(options.clone());
-                    let listening = PgPoolOptions::new()
-                        .max_connections(1)
-                        .connect_lazy_with(options);
+                    let own = fixed(2).connect_lazy_with(options.clone());
+                    let listening = fixed(1).connect_lazy_with(options);
                     let begun = async {
                         let mut listener = PgListener::connect_with(&listening).await?;
                         // LISTEN commits before the first read, so nothing
@@ -135,6 +155,7 @@ impl Relay {
                         lines,
                         current: AtomicU64::new(start.get()),
                         healthy: AtomicBool::new(false),
+                        shut: AtomicBool::new(false),
                         acks,
                     });
                     let weak = Arc::downgrade(&relay);
@@ -166,6 +187,14 @@ impl Relay {
     /// its cache until it reconnects: what a relay restart does.
     pub fn close_streams(&self) {
         let _ = self.lines.send(None);
+    }
+
+    /// End every open stream and serve no new one: the process is stopping
+    /// (#48). A gateway that reconnects in the moment before the listener
+    /// closes is refused rather than holding a stream open through the drain.
+    pub fn shut(&self) {
+        self.shut.store(true, Ordering::SeqCst);
+        self.close_streams();
     }
 
     fn send(&self, message: Message) {
@@ -350,15 +379,30 @@ async fn housekeeping(pool: &PgPool) {
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "could not read notification queue usage"),
     }
-    if let Err(error) = sqlx::query!(
-        "delete from authz_outbox where created_at < now() - make_interval(secs => $1)",
-        RETAIN_SECS,
-    )
-    .execute(pool)
-    .await
-    {
-        tracing::warn!(%error, "could not prune the authz outbox");
+    // In batches, each well inside the serving pool's 2 s statement timeout
+    // (#48): one unbounded delete after an outage, or after the relay was
+    // down for a day, would be cancelled every time and never finish.
+    for _ in 0..PRUNE_BATCHES_PER_PASS {
+        match sqlx::query!(
+            "delete from authz_outbox where (seq, kind, entity) in
+                (select seq, kind, entity from authz_outbox
+                  where created_at < now() - make_interval(secs => $1)
+                  limit $2)",
+            RETAIN_SECS,
+            PRUNE_BATCH,
+        )
+        .execute(pool)
+        .await
+        {
+            Ok(done) if done.rows_affected() < PRUNE_BATCH.unsigned_abs() => break,
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(%error, "could not prune the authz outbox");
+                break;
+            }
+        }
     }
+    // One statement: a lease row per gateway, so there are never many.
     if let Err(error) = sqlx::query!(
         "delete from gateway_leases where renewed_at < now() - make_interval(secs => $1)",
         RETAIN_SECS,
@@ -427,6 +471,9 @@ pub(crate) async fn stream_route(
     let Some(relay) = state.relay.clone() else {
         return render(&not_relaying(), &request_id);
     };
+    if relay.shut.load(Ordering::SeqCst) {
+        return render(&not_relaying(), &request_id);
+    }
     // Subscribe before reading the position, so nothing sent between the two
     // is missed; anything at or before the hello is skipped.
     let receiver = relay.lines.subscribe();

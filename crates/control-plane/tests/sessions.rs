@@ -18,6 +18,7 @@ use sqlx::PgPool;
 
 fn key() -> CookieKey {
     CookieKey::from_secret(b"a-test-signing-secret-of-some-length")
+        .expect("a long enough test secret")
 }
 
 /// The request headers a browser would send back for this `Set-Cookie`.
@@ -170,7 +171,8 @@ async fn revoked_expired_and_unknown_are_indistinguishable(pool: PgPool) {
 #[sqlx::test(migrations = "../../migrations")]
 async fn a_cookie_signed_by_another_key_is_rejected(pool: PgPool) {
     let (_, _, cookie) = signed_in(&pool).await;
-    let other = CookieKey::from_secret(b"some-other-secret-entirely-different");
+    let other =
+        CookieKey::from_secret(b"some-other-secret-entirely-different").expect("long enough");
 
     let err = session::authenticate(&pool, &other, &cookie)
         .await
