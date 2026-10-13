@@ -211,6 +211,11 @@ pub enum Access {
     /// A browser route that reads the session cookie but does not require
     /// one — logout, which succeeds whatever it is sent.
     SessionOptional,
+    /// Either caller: a bearer token carrying this scope, or a browser session
+    /// (same-origin, on a mutating route). The handler receives an
+    /// `Extension<auth::Caller>` saying which. For routes agents and people
+    /// both use (#108); see [`crate::auth::token_or_session`].
+    TokenOrSession(Scope),
 }
 
 impl Access {
@@ -219,7 +224,10 @@ impl Access {
     /// meant to make.
     #[must_use]
     pub fn uses_session_cookie(self) -> bool {
-        matches!(self, Self::Session | Self::SessionOptional)
+        matches!(
+            self,
+            Self::Session | Self::SessionOptional | Self::TokenOrSession(_)
+        )
     }
 }
 
@@ -419,6 +427,13 @@ pub fn production_routes() -> Vec<Route> {
             Access::Session,
             crate::orgs::auto_join_doc(),
             crate::orgs::auto_join_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/v1/orgs/{org_id}/apps",
+            Access::TokenOrSession(Scope::Write),
+            crate::apps::create_doc(),
+            crate::apps::create_route,
         ),
         Route::new(
             Verb::Post,
@@ -647,6 +662,20 @@ fn register(table: Vec<Route>, state: &AppState) -> Router<AppState> {
                 browser = browser.route(route.path, handler);
             }
             Access::Public => public = public.route(route.path, route.handler),
+            // One layer decides the path from the request, so a token caller
+            // is never subjected to the browser's origin check and a cookie
+            // caller never skips it. Registered on its own router: the
+            // `authenticate` layer below would refuse a cookie caller.
+            Access::TokenOrSession(scope) => {
+                let mutates = route.verb.mutates();
+                let state = state.clone();
+                let handler = route.handler.route_layer(middleware::from_fn(
+                    move |request: Request, next: Next| {
+                        crate::auth::token_or_session(scope, mutates, state.clone(), request, next)
+                    },
+                ));
+                browser = browser.route(route.path, handler);
+            }
             Access::Scoped(scope) => {
                 let handler = route.handler.route_layer(middleware::from_fn(
                     move |request: Request, next: Next| auth::require_scope(scope, request, next),
@@ -711,20 +740,25 @@ async fn require_same_origin(
     request: Request,
     next: Next,
 ) -> Response {
-    let request_id = request
-        .extensions()
-        .get::<RequestId>()
-        .cloned()
-        .unwrap_or_else(RequestId::generate);
+    match same_origin(&state, request.headers()) {
+        Ok(()) => next.run(request).await,
+        Err(error) => render(&error, &request_id_of(&request)),
+    }
+}
+
+/// The check [`require_same_origin`] applies, for a route that takes the
+/// cookie path only some of the time ([`Access::TokenOrSession`]).
+///
+/// # Errors
+///
+/// `identity.forbidden` for a cross-origin request; `control-plane.internal`
+/// when sign-in, and so the control plane's own origin, is not configured.
+pub(crate) fn same_origin(state: &AppState, headers: &axum::http::HeaderMap) -> Result<(), Error> {
     let Some(origin) = state.signin.as_deref().map(crate::signin::SignIn::origin) else {
-        return render(
-            &Error::Internal {
-                source: anyhow::anyhow!("sign-in is not configured on this control plane"),
-            },
-            &request_id,
-        );
+        return Err(Error::Internal {
+            source: anyhow::anyhow!("sign-in is not configured on this control plane"),
+        });
     };
-    let headers = request.headers();
     let fetch_site = headers
         .get("sec-fetch-site")
         .map(|v| v.to_str().unwrap_or(""));
@@ -735,17 +769,22 @@ async fn require_same_origin(
             .is_some_and(|v| v.as_bytes() == origin.as_bytes()),
     };
     if same_origin {
-        next.run(request).await
+        Ok(())
     } else {
-        render(
-            &Error::Forbidden {
-                what: "a cross-origin request; this operation must come from the control \
-                       plane's own pages"
-                    .to_owned(),
-            },
-            &request_id,
-        )
+        Err(Error::Forbidden {
+            what: "a cross-origin request; this operation must come from the control \
+                   plane's own pages"
+                .to_owned(),
+        })
     }
+}
+
+fn request_id_of(request: &Request) -> RequestId {
+    request
+        .extensions()
+        .get::<RequestId>()
+        .cloned()
+        .unwrap_or_else(RequestId::generate)
 }
 
 /// Assign a request id before anything else looks at the request.

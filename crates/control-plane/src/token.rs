@@ -115,7 +115,7 @@ pub fn digest_presented(presented: &str) -> Option<TokenDigest> {
 pub enum Scope {
     /// Read resources.
     Read,
-    /// Change app metadata. No route needs it yet.
+    /// Create apps and change their metadata (#108).
     Write,
     /// Publish a version of an app.
     Publish,

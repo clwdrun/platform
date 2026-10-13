@@ -354,7 +354,7 @@ async fn pending(
     apps: &shared::domains::AppsDomain,
 ) -> Result<Option<Pending>, Error> {
     let row = sqlx::query!(
-        r#"select h.id as "id: HandshakeId", a.name, o.slug
+        r#"select h.id as "id: HandshakeId", a.host_label, o.slug
              from handshakes h
              join apps a on a.id = h.app_id and a.deleted_at is null
              join orgs o on o.id = a.org_id and o.deleted_at is null
@@ -368,7 +368,9 @@ async fn pending(
         let slug = shared::cert::OrgSlug::parse(&row.slug).ok()?;
         Some(Pending {
             id: row.id,
-            app_host: apps.app_host(&row.name, &slug),
+            // The host label, never the display name: the URL must not move when
+            // the app is renamed (#108).
+            app_host: apps.app_host(&row.host_label, &slug),
         })
     }))
 }

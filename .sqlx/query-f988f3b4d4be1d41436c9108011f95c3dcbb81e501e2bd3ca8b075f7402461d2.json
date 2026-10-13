@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update apps set host_label = 'other' where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f988f3b4d4be1d41436c9108011f95c3dcbb81e501e2bd3ca8b075f7402461d2"
+}
