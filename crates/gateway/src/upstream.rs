@@ -120,10 +120,19 @@ impl UpstreamResponse {
     }
 }
 
-/// The app could not be reached.
+/// Why the app produced no answer.
 #[derive(Debug, thiserror::Error)]
-#[error("the app could not be reached: {0}")]
-pub struct UpstreamError(pub String);
+pub enum UpstreamError {
+    /// Nothing usable came back: no connection, a malformed or refused answer,
+    /// or no answer in time.
+    #[error("the app could not be reached: {0}")]
+    Unreachable(String),
+    /// The worker answered, reporting a failure by its code. Only the code
+    /// crosses: it is matched against the pinned catalogues and never shown to
+    /// a visitor, and no other worker text is carried at all (#11, #103).
+    #[error("the worker reported {0}")]
+    Reported(String),
+}
 
 /// Delivers a request to the app named by an [`AppTarget`].
 #[async_trait]

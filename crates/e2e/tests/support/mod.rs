@@ -395,10 +395,9 @@ impl AppUpstream for TestUpstream {
         target: &AppTarget,
         request: UpstreamRequest,
     ) -> Result<UpstreamResponse, UpstreamError> {
-        let name = *self
-            .names
-            .get(target.app_id())
-            .ok_or_else(|| UpstreamError(format!("no such app {}", target.app_id())))?;
+        let name = *self.names.get(target.app_id()).ok_or_else(|| {
+            UpstreamError::Unreachable(format!("no such app {}", target.app_id()))
+        })?;
         let cookie = request
             .headers
             .get(http::header::COOKIE)

@@ -157,6 +157,19 @@ seam:
       exit 1
     fi
     echo "ok: no path dependency escapes the workspace; every git dependency is tag-pinned"
+    # Only the worker runs app code. The gateway reads clwd-runtime's code
+    # tables (#103) and must not pull its wasm backend in with them.
+    for crate in gateway control-plane; do
+      if cargo tree -p "$crate" -e normal --prefix none | grep -q '^wasmtime '; then
+        echo "error: $crate links wasmtime; only the worker may"
+        exit 1
+      fi
+    done
+    if ! cargo tree -p worker -e normal --prefix none | grep -q '^wasmtime '; then
+      echo "error: the worker's tree shows no wasmtime, so the check above proves nothing"
+      exit 1
+    fi
+    echo "ok: only the worker links wasmtime"
 
 # Migrations are forward-only, so a destructive one has no `down` to run and
 # the plan has to be written down instead. Deliberately over-matches — a

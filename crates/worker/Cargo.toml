@@ -11,7 +11,7 @@ name = "worker"
 path = "src/main.rs"
 
 [dependencies]
-clwd-runtime = { workspace = true }
+clwd-runtime = { workspace = true, features = ["wasm"] }
 clwd-bundle = { workspace = true }
 shared = { workspace = true }
 builder = { workspace = true }

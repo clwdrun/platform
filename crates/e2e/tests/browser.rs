@@ -1253,9 +1253,12 @@ async fn a_tampered_artifact_is_refused_before_it_runs(pool: PgPool) {
         .await
         .expect("tamper");
 
+    // The worker reports `worker.artifact_unavailable`; the platform could not
+    // load what it stored, so the visitor gets the platform's failure (#103).
     let (status, json) = on_app(&h.http(), WIKI, "/whoami", &v.cookie, &[]).await;
-    assert_eq!(status, 502, "{json}");
-    assert_eq!(json["code"], "gateway.app_unreachable");
+    assert_eq!(status, 500, "{json}");
+    assert_eq!(json["code"], "gateway.internal");
+    assert_eq!(json["retryable"], false);
     assert_eq!(invocations(&h), 0, "a tampered artifact ran");
 }
 
@@ -1272,6 +1275,12 @@ async fn the_worker_refuses_a_bundle_that_grants_egress(pool: PgPool) {
     .await;
     let (status, json) = on_app(&h.http(), WIKI, "/whoami", &v.cookie, &[]).await;
     assert_eq!(status, 502, "{json}");
+    assert_eq!(json["code"], "gateway.app_failed", "{json}");
+    assert_eq!(json["retryable"], false, "{json}");
+    assert!(
+        !json.to_string().contains("worker."),
+        "the worker's code reached the visitor: {json}"
+    );
     assert_eq!(invocations(&h), 0, "a bundle granting egress ran");
 }
 
