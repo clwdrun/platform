@@ -6,6 +6,14 @@
 
 set shell := ["bash", "-uc"]
 
+# The ACME tests' servers, exactly as CI sets them. `PEBBLE_CA` must be absolute:
+# `cargo test` runs each test from its crate's directory, so the tests' relative
+# default is never found from the workspace root. A value already in the
+# environment wins.
+export PEBBLE_DIR := env_var_or_default("PEBBLE_DIR", "https://localhost:14000/dir")
+export CHALLTESTSRV := env_var_or_default("CHALLTESTSRV", "http://localhost:8055")
+export PEBBLE_CA := env_var_or_default("PEBBLE_CA", justfile_directory() / ".pebble/pebble.minica.pem")
+
 default:
     @just --list
 

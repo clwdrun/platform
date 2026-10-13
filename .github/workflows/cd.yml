@@ -113,8 +113,12 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           # Layer cache scoped per binary: the two images share a dependency
           # tree but not a final layer, and one scope would thrash.
+          #
+          # Written from `main` only, read everywhere (#102). A dispatch from
+          # another ref restores `main`'s layers and saves nothing; an empty
+          # `cache-to` exports no cache.
           cache-from: type=gha,scope=${{ matrix.bin }}
-          cache-to: type=gha,scope=${{ matrix.bin }},mode=max
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,scope={0},mode=max', matrix.bin) || '' }}
           # SLSA provenance built by buildx and attached to the image manifest.
           # This is not the same thing as a GitHub attestation and needs no API
           # of theirs — see the note above `permissions`.
