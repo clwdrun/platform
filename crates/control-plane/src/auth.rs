@@ -272,10 +272,8 @@ pub(crate) async fn token_or_session(
             Err(error) => return render(&error, &request_id),
         }
     } else {
-        if mutates {
-            if let Err(error) = crate::http::same_origin(&state, request.headers()) {
-                return render(&error, &request_id);
-            }
+        if mutates && let Err(error) = crate::http::same_origin(&state, request.headers()) {
+            return render(&error, &request_id);
         }
         let Some(signin) = state.signin.as_deref() else {
             return render(
