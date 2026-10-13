@@ -181,9 +181,13 @@ clwd-bundle = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag 
 # its caller types, the store traits (`BundleStore`, `SecretStore`,
 # `AppDataStore`, `AppIdResolver`), `Request`/`Response`/`InvokeOptions`/
 # `SpawnOptions`, and wasmtime itself. Pinned to the same tag as clwd-bundle,
-# always: the two move together. Only `crates/worker` depends on it, so the
-# gateway and the control plane link no wasmtime.
-clwd-runtime = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag = "v0.0.3", default-features = false, features = ["wasm"] }
+# always: the two move together.
+#
+# No features here: the `wasm` backend is turned on by `crates/worker` alone.
+# The gateway depends on the crate too, for its error-code tables (#103), and
+# with no backend feature that pulls no wasmtime — `just seam` asserts the
+# gateway and the control plane link none.
+clwd-runtime = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag = "v0.0.3", default-features = false }
 
 # Debug info is most of `target/`: a full-debuginfo gate run left ~19 GB, every
 # test binary ~290 MB with 44% of it DWARF, and the CI runner ran out of disk

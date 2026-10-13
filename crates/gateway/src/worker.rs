@@ -59,12 +59,12 @@ impl WorkerUpstream {
     ) -> Result<UpstreamResponse, UpstreamError> {
         let mut stream = UnixStream::connect(&self.socket)
             .await
-            .map_err(|e| UpstreamError(format!("connecting to the worker: {e}")))?;
-        let cred = stream
-            .peer_cred()
-            .map_err(|e| UpstreamError(format!("reading the worker's credentials: {e}")))?;
+            .map_err(|e| UpstreamError::Unreachable(format!("connecting to the worker: {e}")))?;
+        let cred = stream.peer_cred().map_err(|e| {
+            UpstreamError::Unreachable(format!("reading the worker's credentials: {e}"))
+        })?;
         if cred.uid() != self.worker_uid {
-            return Err(UpstreamError(format!(
+            return Err(UpstreamError::Unreachable(format!(
                 "the process on the worker socket runs as uid {}, not the worker's {}",
                 cred.uid(),
                 self.worker_uid
@@ -88,16 +88,19 @@ impl WorkerUpstream {
         };
         hop::write_frame(&mut stream, &head, &request.body)
             .await
-            .map_err(|e| UpstreamError(format!("sending to the worker: {e}")))?;
+            .map_err(|e| UpstreamError::Unreachable(format!("sending to the worker: {e}")))?;
         let (answer, body) = hop::read_frame::<_, ResponseHead>(&mut stream)
             .await
-            .map_err(|e| UpstreamError(format!("the worker's answer was refused: {e}")))?;
+            .map_err(|e| {
+                UpstreamError::Unreachable(format!("the worker's answer was refused: {e}"))
+            })?;
 
         if let Some(code) = answer.error {
-            return Err(UpstreamError(format!("the worker reported {code}")));
+            return Err(UpstreamError::Reported(code));
         }
-        let status = StatusCode::from_u16(answer.status)
-            .map_err(|_| UpstreamError(format!("the worker sent status {}", answer.status)))?;
+        let status = StatusCode::from_u16(answer.status).map_err(|_| {
+            UpstreamError::Unreachable(format!("the worker sent status {}", answer.status))
+        })?;
         let mut headers = HeaderMap::new();
         for (name, value) in answer.headers {
             // A header that is not valid HTTP is dropped, not forwarded: the
@@ -122,7 +125,9 @@ impl AppUpstream for WorkerUpstream {
     ) -> Result<UpstreamResponse, UpstreamError> {
         tokio::time::timeout(HOP_TIMEOUT, self.hop(target, request))
             .await
-            .map_err(|_| UpstreamError("the worker did not answer in time".to_owned()))?
+            .map_err(|_| {
+                UpstreamError::Unreachable("the worker did not answer in time".to_owned())
+            })?
     }
 }
 
@@ -172,7 +177,7 @@ mod tests {
             Bytes::from_static(b"body"),
         );
         let error = hop.forward(&target, request).await.expect_err("refused");
-        assert!(error.0.contains("not the worker's"), "{error}");
+        assert!(error.to_string().contains("not the worker's"), "{error}");
         assert_eq!(
             received.await.expect("listener"),
             0,

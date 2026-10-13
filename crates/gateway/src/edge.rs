@@ -29,8 +29,8 @@ use crate::signin::{
     constant_time_eq, counter_cookie, parse_state_cookie_value, state_cookie, state_cookie_name,
 };
 use crate::upstream::{
-    AppTarget, AppUpstream, UpstreamRequest, drop_platform_set_cookies, strip_client_identity,
-    strip_hop_by_hop,
+    AppTarget, AppUpstream, UpstreamError, UpstreamRequest, drop_platform_set_cookies,
+    strip_client_identity, strip_hop_by_hop,
 };
 use bytes::Bytes;
 use shared::cookie::Found;
@@ -66,6 +66,15 @@ enum Disposition {
     SignInFailed,
     /// The app could not be reached.
     AppUnreachable,
+    /// The app could not take this request right now, and the same request
+    /// may succeed shortly (#103).
+    AppUnavailable,
+    /// The app failed on this request, and sending it again fails the same
+    /// way (#103).
+    AppFailed,
+    /// The platform failed to serve the app: a code that names the platform's
+    /// own fault, or one no pinned catalogue knows (#103).
+    PlatformFailed,
     /// Signed in, but not a member of the app's org: the interim access rule
     /// until #12. No app code runs.
     NotAMember,
@@ -87,6 +96,39 @@ struct EnvelopeSpec {
     message: &'static str,
     hint: &'static str,
     retryable: bool,
+    /// Seconds for a `Retry-After` header, on a retryable answer that has one.
+    retry_after: Option<&'static str>,
+}
+
+/// The disposition for a failure the worker reported by code (#103).
+///
+/// The visitor's answer is the gateway's own. The code is matched against the
+/// pinned `clwd_runtime` catalogue, and whether the request is worth retrying
+/// comes from that crate's own per-code table — never from the worker, whose
+/// output is untrusted (#11), and never from the code's spelling. A code the
+/// catalogue does not know is not retryable. Pure, so it is tested directly.
+fn reported(code: &str) -> Disposition {
+    match code {
+        // The worker's own refusals. A bundle granting egress is the app's
+        // configuration, like `runtime.capability_denied`; an artifact the
+        // worker cannot load is ours.
+        "worker.egress_not_supported" => return Disposition::AppFailed,
+        "worker.artifact_unavailable" => return Disposition::PlatformFailed,
+        // The platform stored and serves the bundle, so its absence, or the
+        // runtime's own defect, is the platform's failure, not the app's.
+        "runtime.bundle_not_found" | "runtime.internal" => return Disposition::PlatformFailed,
+        _ => {}
+    }
+    match clwd_runtime::error::OWNED_RETRYABLE
+        .iter()
+        .find(|(known, _)| *known == code)
+    {
+        Some((_, true)) => Disposition::AppUnavailable,
+        Some((_, false)) => Disposition::AppFailed,
+        // A `bundle.*` code raised at spawn (the platform built and stored that
+        // bundle), or a code no pinned catalogue knows.
+        None => Disposition::PlatformFailed,
+    }
 }
 
 /// Map a resolved route (or its absence) to a disposition. `None` means the
@@ -110,6 +152,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "no application is served at this host",
             hint: "check the {app}.{org} host, and that the app is deployed",
             retryable: false,
+            retry_after: None,
         },
         Disposition::NotReady => EnvelopeSpec {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -117,6 +160,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "this application is not yet serving requests",
             hint: "the platform is bringing this app online; retry shortly",
             retryable: true,
+            retry_after: None,
         },
         Disposition::Reserved => EnvelopeSpec {
             status: StatusCode::NOT_FOUND,
@@ -124,6 +168,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "paths under /__clwd/ are reserved by the platform and never reach the app",
             hint: "serve this route from a different path; /__clwd/ belongs to the platform",
             retryable: false,
+            retry_after: None,
         },
         Disposition::DuplicateCookie => EnvelopeSpec {
             status: StatusCode::BAD_REQUEST,
@@ -131,6 +176,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "the request carries a platform cookie more than once",
             hint: "clear this site's cookies and open the app again",
             retryable: false,
+            retry_after: None,
         },
         Disposition::SignInRequired => EnvelopeSpec {
             status: StatusCode::UNAUTHORIZED,
@@ -138,6 +184,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "this app requires signing in",
             hint: "open the app in a browser to sign in, then retry",
             retryable: false,
+            retry_after: None,
         },
         Disposition::SignInLoop => EnvelopeSpec {
             status: StatusCode::CONFLICT,
@@ -145,6 +192,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "signing in to this app kept restarting, so it was stopped",
             hint: "wait a minute and open the app again; if it repeats, your browser may be blocking cookies for this site",
             retryable: true,
+            retry_after: None,
         },
         Disposition::SignInFailed => EnvelopeSpec {
             status: StatusCode::FORBIDDEN,
@@ -152,6 +200,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "this sign-in link was already used or has expired",
             hint: "open the app again to sign in",
             retryable: false,
+            retry_after: None,
         },
         Disposition::AppUnreachable => EnvelopeSpec {
             status: StatusCode::BAD_GATEWAY,
@@ -159,6 +208,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "the app could not be reached",
             hint: "retry shortly",
             retryable: true,
+            retry_after: None,
         },
         Disposition::NotAMember => EnvelopeSpec {
             status: StatusCode::FORBIDDEN,
@@ -166,6 +216,31 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "this app is only open to members of its organization",
             hint: "ask an owner of the organization to add you",
             retryable: false,
+            retry_after: None,
+        },
+        Disposition::AppUnavailable => EnvelopeSpec {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "gateway.app_unavailable",
+            message: "the app could not take this request right now",
+            hint: "The app is busy; try again shortly.",
+            retryable: true,
+            retry_after: Some("1"),
+        },
+        Disposition::AppFailed => EnvelopeSpec {
+            status: StatusCode::BAD_GATEWAY,
+            code: "gateway.app_failed",
+            message: "the app failed to handle this request",
+            hint: "The app failed to handle this request.",
+            retryable: false,
+            retry_after: None,
+        },
+        Disposition::PlatformFailed => EnvelopeSpec {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "gateway.internal",
+            message: "the platform could not serve this request",
+            hint: "This is a fault in the platform, not in your request; it has been logged.",
+            retryable: false,
+            retry_after: None,
         },
         Disposition::Unavailable => EnvelopeSpec {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -173,6 +248,7 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             message: "the platform could not resolve this host right now",
             hint: "a platform dependency is unreachable; retry shortly",
             retryable: true,
+            retry_after: None,
         },
     }
 }
@@ -202,6 +278,9 @@ fn render(spec: &EnvelopeSpec, request_id: &RequestId) -> Response<Vec<u8>> {
         HeaderValue::from_str(request_id.as_str())
             .unwrap_or_else(|_| HeaderValue::from_static("invalid")),
     );
+    if let Some(seconds) = spec.retry_after {
+        headers.insert(header::RETRY_AFTER, HeaderValue::from_static(seconds));
+    }
     response
 }
 
@@ -567,9 +646,17 @@ impl Edge {
                 *response.headers_mut() = upstream.headers;
                 response
             }
-            Err(error) => {
-                tracing::warn!(%error, "app unreachable");
+            Err(UpstreamError::Unreachable(detail)) => {
+                tracing::warn!(%detail, "app unreachable");
                 render_disposition(Disposition::AppUnreachable)
+            }
+            // The full code is for the app's author, in the log; the visitor
+            // gets the gateway's answer for it. `?` escapes it: the worker's
+            // output is untrusted, and a raw code could forge log lines.
+            Err(UpstreamError::Reported(code)) => {
+                let disposition = reported(&code);
+                tracing::warn!(app = %target.app_id(), code = ?code, "the app failed");
+                render_disposition(disposition)
             }
         }
     }
@@ -711,6 +798,110 @@ mod tests {
             assert_eq!(s.status, StatusCode::SERVICE_UNAVAILABLE);
             assert!(s.retryable, "a transient not-serving state is retryable");
             assert!(s.code.starts_with("gateway."), "gateway-namespaced code");
+        }
+    }
+
+    /// Every runtime code lands in the row #103 specifies. Exhaustive over the
+    /// pinned catalogue: a pin bump that adds a code fails here until someone
+    /// places it, rather than inheriting a row by accident.
+    #[test]
+    fn every_runtime_code_lands_in_its_row() {
+        use Disposition::{AppFailed, AppUnavailable, PlatformFailed};
+        let expected: &[(&str, Disposition)] = &[
+            ("runtime.spawn_deadline_exceeded", AppUnavailable),
+            ("runtime.invoke_deadline_exceeded", AppUnavailable),
+            ("runtime.stopped", AppUnavailable),
+            ("runtime.cpu_budget_exceeded", AppFailed),
+            ("runtime.memory_limit_exceeded", AppFailed),
+            ("runtime.response_too_large", AppFailed),
+            ("runtime.table_limit_exceeded", AppFailed),
+            ("runtime.trap", AppFailed),
+            ("runtime.capability_denied", AppFailed),
+            ("runtime.incompatible_interface", AppFailed),
+            ("runtime.bundle_not_found", PlatformFailed),
+            ("runtime.internal", PlatformFailed),
+        ];
+        let listed: std::collections::BTreeSet<&str> = expected.iter().map(|(c, _)| *c).collect();
+        let pinned: std::collections::BTreeSet<&str> =
+            clwd_runtime::error::OWNED_CODES.iter().copied().collect();
+        assert_eq!(
+            listed, pinned,
+            "the pinned clwd-runtime's codes changed: place each new one in a row"
+        );
+        for (code, want) in expected {
+            assert_eq!(reported(code), *want, "{code}");
+        }
+        // Where the app is at fault, the visitor's `retryable` is the crate's.
+        for (code, retryable) in clwd_runtime::error::OWNED_RETRYABLE {
+            if reported(code) != PlatformFailed {
+                assert_eq!(spec(reported(code)).retryable, *retryable, "{code}");
+            }
+        }
+        assert_eq!(reported("worker.egress_not_supported"), AppFailed);
+        assert_eq!(reported("worker.artifact_unavailable"), PlatformFailed);
+    }
+
+    /// The worker's code is matched exactly against the pinned catalogue; a
+    /// code it does not know — a typo, a forged lookalike, a code from a newer
+    /// runtime than the pin — is the platform's failure and never retryable.
+    /// A `bundle.*` code at spawn lands in the same row: the platform built
+    /// and stored that bundle.
+    #[test]
+    fn a_code_no_catalogue_knows_is_not_retryable() {
+        for code in [
+            "runtime.made_up",
+            "runtime.stopped ",
+            "RUNTIME.STOPPED",
+            "worker.retry_me",
+            "",
+            "bundle.member_digest_mismatch",
+        ] {
+            let disposition = reported(code);
+            assert_eq!(disposition, Disposition::PlatformFailed, "{code:?}");
+            assert!(!spec(disposition).retryable, "{code:?}");
+        }
+    }
+
+    /// The three rows a reported failure renders to, byte for byte, with their
+    /// status and `Retry-After`. Nothing the worker reported appears: the code
+    /// goes to the log, never to the visitor.
+    #[test]
+    fn the_runtime_rows_render_byte_for_byte() {
+        let id = RequestId::sanitize("req-42").expect("well formed");
+        let rows = [
+            (
+                "runtime.spawn_deadline_exceeded",
+                503,
+                Some("1"),
+                r#"{"code":"gateway.app_unavailable","message":"the app could not take this request right now","hint":"The app is busy; try again shortly.","retryable":true,"request_id":"req-42"}"#,
+            ),
+            (
+                "runtime.cpu_budget_exceeded",
+                502,
+                None,
+                r#"{"code":"gateway.app_failed","message":"the app failed to handle this request","hint":"The app failed to handle this request.","retryable":false,"request_id":"req-42"}"#,
+            ),
+            (
+                "runtime.internal",
+                500,
+                None,
+                r#"{"code":"gateway.internal","message":"the platform could not serve this request","hint":"This is a fault in the platform, not in your request; it has been logged.","retryable":false,"request_id":"req-42"}"#,
+            ),
+        ];
+        for (code, status, retry_after, body) in rows {
+            let response = render(&spec(reported(code)), &id);
+            assert_eq!(response.status().as_u16(), status, "{code}");
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok()),
+                retry_after,
+                "{code}"
+            );
+            let text = std::str::from_utf8(response.body()).expect("utf-8");
+            assert_eq!(text, body, "{code}");
+            assert!(!text.contains(code), "{code} reached the visitor");
         }
     }
 

@@ -26,6 +26,10 @@ tracing = { workspace = true }
 anyhow = { workspace = true }
 shared = { workspace = true }
 clwd-bundle = { workspace = true }
+# The runtime's code list and per-code `retryable` table, to map a failure the
+# worker reports (#103). No backend feature, so no wasmtime: `just seam`
+# asserts it.
+clwd-runtime = { workspace = true }
 # A request id on each control-plane check, to match a refusal with the
 # control plane's own log of it (#90). Already in the tree.
 uuid = { workspace = true }
