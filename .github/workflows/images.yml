@@ -63,7 +63,8 @@ jobs:
           secrets: |
             clwd_token=${{ secrets.CLWD_READ_TOKEN }}
           push: false
-          # Shares a cache scope with cd.yml, so a merge reuses what the pull
-          # request already built rather than compiling the same tree twice.
+          # Reads the cache `cd.yml` writes from `main`, and writes none: this
+          # workflow only runs on pull requests, and per-PR layer caches filled
+          # the repository's cache quota (#102) for a build no later run
+          # restores from.
           cache-from: type=gha,scope=${{ matrix.bin }}
-          cache-to: type=gha,scope=${{ matrix.bin }},mode=max

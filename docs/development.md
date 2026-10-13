@@ -79,7 +79,9 @@ Two traps when running tests by hand rather than through `just check`:
 - **`PEBBLE_CA` must be absolute.** The ACME tests default it to
   `.pebble/pebble.minica.pem`, which `cargo test` resolves from the *crate*
   directory, not the workspace root — so it is not found even with Pebble up.
-  Export the absolute path `just pebble-up` prints.
+  `just` sets it (and `PEBBLE_DIR`, `CHALLTESTSRV`) to CI's values for every
+  recipe, so `just gate` needs nothing exported; a bare `cargo test` still
+  needs the absolute path `just pebble-up` prints.
 
 `sqlx` macros are compile-time checked, and `.sqlx/` is what lets CI build with no
 database at all. After changing any query or migration, run `just prepare` and
