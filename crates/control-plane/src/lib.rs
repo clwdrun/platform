@@ -1,6 +1,7 @@
 //! Apps, orgs, versions, share grants.
 
 pub mod acme;
+pub mod apps;
 pub mod auth;
 pub mod authz;
 pub mod cloudflare;

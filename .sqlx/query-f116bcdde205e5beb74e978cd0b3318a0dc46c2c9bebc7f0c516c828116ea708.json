@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select a.id as \"id: AppId\", a.org_id as \"org_id: OrgId\", v.digest as \"digest?\"\n             from apps a\n             join orgs o on o.id = a.org_id\n             left join lateral (\n                 select digest from app_versions\n                  where app_id = a.id and state = 'ready'\n                  order by created_at desc, id desc\n                  limit 1\n             ) v on true\n            where o.slug = $1 and o.deleted_at is null\n              and a.name = $2 and a.deleted_at is null",
+  "query": "select a.id as \"id: AppId\", a.org_id as \"org_id: OrgId\", v.digest as \"digest?\"\n             from apps a\n             join orgs o on o.id = a.org_id\n             left join lateral (\n                 select digest from app_versions\n                  where app_id = a.id and state = 'ready'\n                  order by created_at desc, id desc\n                  limit 1\n             ) v on true\n            where o.slug = $1 and o.deleted_at is null\n              and a.host_label = $2 and a.deleted_at is null",
   "describe": {
     "columns": [
       {
@@ -49,5 +49,5 @@
       true
     ]
   },
-  "hash": "724fb8f43cbfad2318d5c0e44869cec3d72ad2f2833139877808282599c5044e"
+  "hash": "f116bcdde205e5beb74e978cd0b3318a0dc46c2c9bebc7f0c516c828116ea708"
 }

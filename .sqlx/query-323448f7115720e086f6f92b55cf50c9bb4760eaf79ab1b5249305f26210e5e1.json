@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "select h.id as \"id: HandshakeId\", a.name, o.slug\n             from handshakes h\n             join apps a on a.id = h.app_id and a.deleted_at is null\n             join orgs o on o.id = a.org_id and o.deleted_at is null\n            where h.state_sha256 = $1 and h.expires_at > now()",
+  "query": "select h.id as \"id: HandshakeId\", a.host_label, o.slug\n             from handshakes h\n             join apps a on a.id = h.app_id and a.deleted_at is null\n             join orgs o on o.id = a.org_id and o.deleted_at is null\n            where h.state_sha256 = $1 and h.expires_at > now()",
   "describe": {
     "columns": [
       {
@@ -16,12 +16,12 @@
       },
       {
         "ordinal": 1,
-        "name": "name",
+        "name": "host_label",
         "type_info": "Text",
         "origin": {
           "Table": {
             "table": "apps",
-            "name": "name"
+            "name": "host_label"
           }
         }
       },
@@ -48,5 +48,5 @@
       false
     ]
   },
-  "hash": "d62f8d72be874d63871fd9d44fb8dab870e0877572db95a78ae392486f599f17"
+  "hash": "323448f7115720e086f6f92b55cf50c9bb4760eaf79ab1b5249305f26210e5e1"
 }

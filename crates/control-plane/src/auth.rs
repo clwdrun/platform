@@ -231,6 +231,70 @@ fn request_id_of(request: &Request) -> RequestId {
         .unwrap_or_else(RequestId::generate)
 }
 
+/// Who called a route that accepts either kind of caller
+/// ([`crate::http::Access::TokenOrSession`]).
+#[derive(Debug, Clone)]
+pub enum Caller {
+    /// An API token, already checked for the route's scope.
+    Token(Principal),
+    /// A browser session, already checked for same origin on a mutating route.
+    Session(db::ActiveSession),
+}
+
+/// Middleware for [`crate::http::Access::TokenOrSession`].
+///
+/// A request carrying `Authorization` takes the token path and nothing else:
+/// authenticate, then require `scope`. One without it takes the cookie path:
+/// the same-origin check on a mutating route, then the session. Never both,
+/// and never a fallback from one to the other: a bad token is refused, not
+/// retried as a cookie, so the answer does not depend on what else the
+/// request happened to carry. Agents send tokens and no cookies (#108).
+pub(crate) async fn token_or_session(
+    scope: Scope,
+    mutates: bool,
+    state: AppState,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let request_id = request_id_of(&request);
+    let caller = if request.headers().contains_key(header::AUTHORIZATION) {
+        // Read before the lookup's await: see `authenticate`.
+        let presented = request
+            .headers()
+            .get(header::AUTHORIZATION)
+            .and_then(bearer)
+            .and_then(token::digest_presented);
+        match principal_for(&state, presented).await {
+            Ok(principal) => match principal.require(scope) {
+                Ok(()) => Caller::Token(principal),
+                Err(error) => return render(&error, &request_id),
+            },
+            Err(error) => return render(&error, &request_id),
+        }
+    } else {
+        if mutates {
+            if let Err(error) = crate::http::same_origin(&state, request.headers()) {
+                return render(&error, &request_id);
+            }
+        }
+        let Some(signin) = state.signin.as_deref() else {
+            return render(
+                &Error::Internal {
+                    source: anyhow::anyhow!("sign-in is not configured on this control plane"),
+                },
+                &request_id,
+            );
+        };
+        let headers = request.headers().clone();
+        match crate::session::authenticate(&state.pool, signin.key(), &headers).await {
+            Ok(session) => Caller::Session(session),
+            Err(error) => return render(&error, &request_id),
+        }
+    };
+    request.extensions_mut().insert(caller);
+    next.run(request).await
+}
+
 /// Deny unless the authenticated caller carries `scope`.
 ///
 /// Attached per route by `http::protected`, which is the only way to add a

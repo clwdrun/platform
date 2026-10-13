@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "update apps set name = 'journal' where id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "b72afd635d989314cf92e9a8d274c3b453d0ebb803ce64a20618ae9709ca9e40"
+}

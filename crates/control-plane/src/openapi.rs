@@ -66,6 +66,7 @@ pub const COMMITTED: &str = include_str!("../openapi.json");
 const SECURITY_SCHEME: &str = "bearerAuth";
 const COOKIE_SCHEME: &str = "sessionCookie";
 const SESSION_AUTHENTICATION: &str = "**Authentication:** a browser session cookie, set by Google sign-in (`GET /auth/google`). A state-changing request must also come from the control plane's own origin: `Sec-Fetch-Site: same-origin`, or, without that header, an exact `Origin` match. Other pages on the same site, including every app under the apex, are refused.";
+const SESSION_ORIGIN_RULE: &str = "a state-changing request must come from the control plane's own origin: `Sec-Fetch-Site: same-origin`, or, without that header, an exact `Origin` match.";
 const ENVELOPE: &str = "Envelope";
 const JSON: &str = "application/json";
 
@@ -331,6 +332,15 @@ pub(crate) fn documented_codes(route: &Route) -> Option<BTreeSet<&'static str>> 
             codes.insert("identity.unauthenticated");
         }
         Access::SessionOptional => {}
+        // The token path's codes; the cookie path adds the same-origin
+        // `forbidden` below, which the token path already lists.
+        Access::TokenOrSession(_) => {
+            codes.extend([
+                "identity.unauthenticated",
+                "identity.forbidden",
+                "control-plane.rate_limited",
+            ]);
+        }
     }
     // The same-origin check the route table puts on every cookie-authenticated
     // state-changing route (`http::require_same_origin`).
@@ -440,6 +450,13 @@ pub fn document() -> Result<OpenApi, SpecError> {
                 scope.as_str()
             ),
             Access::Session => SESSION_AUTHENTICATION.to_owned(),
+            Access::TokenOrSession(scope) => format!(
+                "**Authentication:** either a bearer token carrying the `{}` scope, or a \
+                 browser session. With a token, nothing else is checked: agents and scripts \
+                 use this path. With the session cookie, {}",
+                scope.as_str(),
+                SESSION_ORIGIN_RULE
+            ),
             Access::SessionOptional => {
                 "**Authentication:** none required; the session cookie is read if sent. \
                  Must come from the control plane's own origin."
@@ -485,6 +502,10 @@ pub fn document() -> Result<OpenApi, SpecError> {
             Access::Scoped(scope) => {
                 operation.security(SecurityRequirement::new(SECURITY_SCHEME, [scope.as_str()]))
             }
+            Access::TokenOrSession(scope) => operation.securities(Some(vec![
+                SecurityRequirement::new(SECURITY_SCHEME, [scope.as_str()]),
+                SecurityRequirement::new(COOKIE_SCHEME, Vec::<&str>::new()),
+            ])),
             Access::Session => {
                 operation.security(SecurityRequirement::new(COOKIE_SCHEME, Vec::<&str>::new()))
             }

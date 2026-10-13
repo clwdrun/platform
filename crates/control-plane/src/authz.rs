@@ -10,7 +10,7 @@
 
 use shared::authz::{Decision, Reason};
 
-use crate::ids::{AppId, OrgId, UserId};
+use crate::ids::{AppId, OrgId, TokenId, UserId};
 
 /// One decision input: a table, and the kind of [`shared::authz::Tag`] its
 /// changes invalidate.
@@ -58,25 +58,43 @@ pub const INPUTS: &[Input] = &[
 /// (`tgenabled = 'O'`) for the cache to be trusted.
 pub const TRIGGERS: &[&str] = &["authz_ins", "authz_upd", "authz_del", "authz_truncate"];
 
-/// Who is asking. #14 adds group memberships.
+/// Who is asking: a signed-in user, or an API token of one org. #14 adds group
+/// memberships.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
-pub struct Principal {
-    pub user_id: UserId,
+pub enum Principal {
+    User {
+        user_id: UserId,
+    },
+    /// A token speaks for its org, not for a person: it has no user to be a
+    /// member, so its [`Context::member_of_org`] is whether the resource is in
+    /// the token's own org.
+    Token {
+        token_id: TokenId,
+        org_id: OrgId,
+    },
 }
 
 impl Principal {
     #[must_use]
     pub const fn user(user_id: UserId) -> Self {
-        Self { user_id }
+        Self::User { user_id }
+    }
+
+    #[must_use]
+    pub const fn token(token_id: TokenId, org_id: OrgId) -> Self {
+        Self::Token { token_id, org_id }
     }
 }
 
-/// What they want to do. Only `view` exists before #14.
+/// What they want to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Action {
+    /// Open an app (#11, #12).
     View,
+    /// Create an app in an org (#108).
+    CreateApp,
 }
 
 /// What they want to do it to.
@@ -84,6 +102,7 @@ pub enum Action {
 #[non_exhaustive]
 pub enum Resource {
     App { app_id: AppId, org_id: OrgId },
+    Org { org_id: OrgId },
 }
 
 /// The facts a policy decides from, loaded by the same statement as the
@@ -137,15 +156,18 @@ pub trait Authorize: Send + Sync {
     fn decide(&self, request: &Request) -> Decision;
 }
 
-/// The interim rule until #14: members of the app's org may view it.
+/// The interim rule until #14: members of the org may view its apps and create
+/// apps in it.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrgMemberRule;
 
 impl Authorize for OrgMemberRule {
     fn decide(&self, request: &Request) -> Decision {
         match request.action {
-            Action::View if request.context.member_of_org => Decision::allow(Reason::OrgMember),
-            Action::View => Decision::deny(Reason::NotAMember),
+            Action::View | Action::CreateApp if request.context.member_of_org => {
+                Decision::allow(Reason::OrgMember)
+            }
+            Action::View | Action::CreateApp => Decision::deny(Reason::NotAMember),
         }
     }
 }
@@ -179,6 +201,34 @@ mod tests {
             OrgMemberRule.decide(&request(false)),
             Decision::deny(Reason::NotAMember)
         );
+    }
+
+    /// Creating an app follows the same interim rule, for a user and for a
+    /// token alike: the caller decides membership, the policy decides.
+    #[test]
+    fn the_interim_rule_lets_members_and_their_org_tokens_create_apps() {
+        let org_id = OrgId::new();
+        for principal in [
+            Principal::user(UserId::new()),
+            Principal::token(TokenId::new(), org_id),
+        ] {
+            for (member, want) in [
+                (true, Decision::allow(Reason::OrgMember)),
+                (false, Decision::deny(Reason::NotAMember)),
+            ] {
+                let request = Request::new(
+                    principal,
+                    Action::CreateApp,
+                    Resource::Org { org_id },
+                    Context::new(member),
+                );
+                assert_eq!(
+                    OrgMemberRule.decide(&request),
+                    want,
+                    "{principal:?} {member}"
+                );
+            }
+        }
     }
 
     #[test]

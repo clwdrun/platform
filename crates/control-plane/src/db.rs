@@ -43,7 +43,12 @@ pub struct User {
 pub struct App {
     pub id: AppId,
     pub org_id: OrgId,
+    /// The display name. Mutable, and never part of the app's URL.
     pub name: String,
+    /// The app's half of `{app}.{org}.<apps domain>`: set at creation, never
+    /// changed, never reused within the org (#108). The database enforces all
+    /// three.
+    pub host_label: String,
     pub runtime: String,
     pub created_at: DateTime<Utc>,
     pub deleted_at: Option<DateTime<Utc>>,
@@ -155,14 +160,15 @@ pub async fn acquire_for(
     acquired
 }
 
-/// Resolve `{app}.{org}` to the live app it names, and the version to run, for
+/// Resolve `{app}.{org}` — the app's host label and the org's slug — to the
+/// live app it names, and the version to run, for
 /// the gateway's host router. `None` when the org or the app does not exist, is
 /// soft-deleted, or the app is not that org's — the three cases the gateway
 /// answers with a 404, deliberately indistinguishable to a caller.
 pub async fn resolve_live_app(
     ex: impl PgExecutor<'_>,
     org_slug: &str,
-    app_name: &str,
+    host_label: &str,
 ) -> sqlx::Result<Option<LiveApp>> {
     sqlx::query_as!(
         LiveApp,
@@ -176,9 +182,9 @@ pub async fn resolve_live_app(
                   limit 1
              ) v on true
             where o.slug = $1 and o.deleted_at is null
-              and a.name = $2 and a.deleted_at is null"#,
+              and a.host_label = $2 and a.deleted_at is null"#,
         org_slug,
-        app_name,
+        host_label,
     )
     .fetch_optional(ex)
     .await
@@ -492,23 +498,99 @@ pub async fn add_org_member(
     .map(|_| ())
 }
 
+/// Insert an app whose host label and display name are both `host_label`.
 pub async fn create_app(
     ex: impl PgExecutor<'_>,
     org_id: OrgId,
-    name: &str,
+    host_label: &str,
     runtime: &str,
 ) -> sqlx::Result<App> {
     sqlx::query_as!(
         App,
-        r#"insert into apps (id, org_id, name, runtime) values ($1, $2, $3, $4)
-           returning id, org_id, name, runtime, created_at, deleted_at"#,
+        r#"insert into apps (id, org_id, name, host_label, runtime) values ($1, $2, $3, $3, $4)
+           returning id, org_id, name, host_label, runtime, created_at, deleted_at"#,
         AppId::new().as_uuid(),
         org_id.as_uuid(),
-        name,
+        host_label,
         runtime,
     )
     .fetch_one(ex)
     .await
+}
+
+/// What creating an app by host label found (#108).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Ensured {
+    /// This call created the app.
+    Created(App),
+    /// A live app already holds the label in this org: that app.
+    Existing(App),
+    /// A deleted app held the label. Labels are never reused, so this is a
+    /// conflict, never a new app under an old URL.
+    Retired,
+    /// The org does not exist, or is deleted.
+    NoOrg,
+}
+
+/// Create the app `host_label` names in `org_id`, or find the one that already
+/// holds it.
+///
+/// The insert decides, not a prior read: two concurrent calls cannot both
+/// create, and the loser reads the winner's row. `on conflict do nothing`
+/// covers both unique keys, because a new app's display name is its label.
+pub async fn ensure_app(
+    pool: &sqlx::PgPool,
+    org_id: OrgId,
+    host_label: &str,
+    runtime: &str,
+) -> sqlx::Result<Ensured> {
+    let inserted = sqlx::query_as!(
+        App,
+        r#"insert into apps (id, org_id, name, host_label, runtime)
+           select $1, $2, $3, $3, $4
+            where exists (select 1 from orgs where id = $2 and deleted_at is null)
+           on conflict do nothing
+           returning id, org_id, name, host_label, runtime, created_at, deleted_at"#,
+        AppId::new().as_uuid(),
+        org_id.as_uuid(),
+        host_label,
+        runtime,
+    )
+    .fetch_optional(pool)
+    .await?;
+    if let Some(app) = inserted {
+        return Ok(Ensured::Created(app));
+    }
+    let held = sqlx::query_as!(
+        App,
+        r#"select id, org_id, name, host_label, runtime, created_at, deleted_at
+             from apps where org_id = $1 and host_label = $2"#,
+        org_id.as_uuid(),
+        host_label,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(match held {
+        Some(app) if app.deleted_at.is_none() => Ensured::Existing(app),
+        // A deleted holder: the label is retired with it.
+        Some(_) => Ensured::Retired,
+        // Nothing holds the label, so the insert's org check failed — or a
+        // live app's display name, not its label, collided. Neither can be
+        // created here; tell the two apart by the org.
+        None => {
+            let org_live = sqlx::query_scalar!(
+                r#"select exists (select 1 from orgs where id = $1 and deleted_at is null) as "live!""#,
+                org_id.as_uuid(),
+            )
+            .fetch_one(pool)
+            .await?;
+            if org_live {
+                Ensured::Retired
+            } else {
+                Ensured::NoOrg
+            }
+        }
+    })
 }
 
 /// The outcome of claiming `(app_id, digest)`.
