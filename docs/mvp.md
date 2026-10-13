@@ -16,8 +16,8 @@ org**, and revokes it. Nobody writes authentication code.
 | # | Step | Delivered by |
 |---|---|---|
 | A1 | The owner scaffolds an app from a template (`clwd init`). | ⬜ clwdrun/clwd#29 |
-| A2 | The owner runs `clwd deploy`: it builds the app, creates it in their org if it is missing, and publishes it. | ⬜ clwdrun/clwd#88, ⬜ clwdrun/clwd#75, ⬜ #108, ✅ clwdrun/clwd#26, ✅ #6, ✅ #7, ✅ #4 |
-| A3 | `clwd deploy` prints the app's URL. | ⬜ clwdrun/clwd#88, ⬜ #108 |
+| A2 | The owner runs `clwd deploy`: it builds the app, creates it in their org if it is missing, and publishes it. | ⬜ clwdrun/clwd#88, ✅ clwdrun/clwd#75, ✅ #108, ✅ clwdrun/clwd#26, ✅ #6, ✅ #7, ✅ #4 |
+| A3 | `clwd deploy` prints the app's URL. | ⬜ clwdrun/clwd#88, ✅ #108 |
 | A4 | The app runs on the platform. | ⬜ #84, ✅ #11 |
 | A5 | It answers at `notes.<org>.<apps-domain>`, over TLS, on the real apps domain. | ⬜ #18, ⬜ #5, ⬜ #57, ⬜ #95, ⬜ #97, ⬜ #73 |
 | A6 | The owner shares it with a colleague in another org. | ⬜ #14, ⬜ #15, ⬜ #16 |
@@ -41,7 +41,7 @@ memory of earlier runs.
 |---|---|---|
 | B1 | The documentation it reads is public, and it holds an API token. | ⬜ clwdrun/clwd#81, ✅ #3, ✅ #4 |
 | B2 | It writes an app from a template. | ⬜ clwdrun/clwd#29 |
-| B3 | It runs `clwd deploy` with the token alone — no browser, no cookie — which creates the app if missing and publishes it. | ⬜ clwdrun/clwd#88, ⬜ clwdrun/clwd#75, ⬜ #108, ✅ clwdrun/clwd#26, ✅ #7 |
+| B3 | It runs `clwd deploy` with the token alone — no browser, no cookie — which creates the app if missing and publishes it. | ⬜ clwdrun/clwd#88, ✅ clwdrun/clwd#75, ✅ #108, ✅ clwdrun/clwd#26, ✅ #7 |
 | B4 | It can find an existing app's id without creating it. | ⬜ #111 |
 | B5 | The app serves at its URL. | ⬜ #84, ⬜ #18, ⬜ #5, ⬜ #73 |
 | B6 | It shares the app with a named person, using the token. | ⬜ #15, ⬜ #16 |
