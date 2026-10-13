@@ -16,8 +16,8 @@ org**, and revokes it. Nobody writes authentication code.
 | # | Step | Delivered by |
 |---|---|---|
 | A1 | The owner scaffolds an app from a template (`clwd init`). | ⬜ clwdrun/clwd#29 |
-| A2 | The owner creates the app in their org. | ⬜ #108, ⬜ clwdrun/clwd#75 |
-| A3 | The owner builds and publishes it (`clwd build`, then `clwd publish`). | ✅ clwdrun/clwd#26, ✅ #6, ✅ #7, ✅ #4 |
+| A2 | The owner runs `clwd deploy`: it builds the app, creates it in their org if it is missing, and publishes it. | ⬜ clwdrun/clwd#88, ⬜ clwdrun/clwd#75, ⬜ #108, ✅ clwdrun/clwd#26, ✅ #6, ✅ #7, ✅ #4 |
+| A3 | `clwd deploy` prints the app's URL. | ⬜ clwdrun/clwd#88, ⬜ #108 |
 | A4 | The app runs on the platform. | ⬜ #84, ✅ #11 |
 | A5 | It answers at `notes.<org>.<apps-domain>`, over TLS, on the real apps domain. | ⬜ #18, ⬜ #5, ⬜ #57, ⬜ #95, ⬜ #97, ⬜ #73 |
 | A6 | The owner shares it with a colleague in another org. | ⬜ #14, ⬜ #15, ⬜ #16 |
@@ -41,18 +41,18 @@ memory of earlier runs.
 |---|---|---|
 | B1 | The documentation it reads is public, and it holds an API token. | ⬜ clwdrun/clwd#81, ✅ #3, ✅ #4 |
 | B2 | It writes an app from a template. | ⬜ clwdrun/clwd#29 |
-| B3 | It creates the app with the token alone — no browser, no cookie. | ⬜ #108, ⬜ clwdrun/clwd#75 |
-| B4 | It builds and publishes the app. | ✅ clwdrun/clwd#26, ✅ #7 |
+| B3 | It runs `clwd deploy` with the token alone — no browser, no cookie — which creates the app if missing and publishes it. | ⬜ clwdrun/clwd#88, ⬜ clwdrun/clwd#75, ⬜ #108, ✅ clwdrun/clwd#26, ✅ #7 |
+| B4 | It can find an existing app's id without creating it. | ⬜ #111 |
 | B5 | The app serves at its URL. | ⬜ #84, ⬜ #18, ⬜ #5, ⬜ #73 |
 | B6 | It shares the app with a named person, using the token. | ⬜ #15, ⬜ #16 |
 | B7 | It reports the URL, and the named person can open it. | ⬜ #18, ✅ #11 |
-| B8 | 8 of 10 cold runs pass. | ⬜ no issue yet — a harness that runs and scores the demo |
+| B8 | 8 of 10 cold runs pass, as scored by the harness. | ⬜ #112 |
 
-## Gaps
+## Notes
 
-- **B8 has no issue.** Nothing yet runs the agent demo repeatedly and scores it.
-  That harness is part of the exit criterion and needs filing before the demo
-  can be called passing.
-- **The deploy command.** Both demos say "deploy". The CLI's commands are
-  `clwd build` followed by `clwd publish`; no `clwd deploy` exists. Either the
-  demos run those two commands, or a single command lands with clwdrun/clwd#75.
+- **App URLs never move.** An app's URL is built from its `host_label`, which is
+  set at creation, never changes, and is never reused, even after the app is
+  deleted (#108). Renaming the app changes its display name only, so a link
+  shared in step A6 can never come to open a different app.
+- **B4 is not on the critical path.** `clwd deploy` already returns the id of
+  an app that exists. #111 lets an agent look an id up without the side effect.
