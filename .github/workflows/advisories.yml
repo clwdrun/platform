@@ -9,6 +9,9 @@ on:
   schedule:
     - cron: "23 5 * * *"
   workflow_dispatch:
+  # DEMO ONLY: this branch is deleted after the demonstration.
+  push:
+    branches: [advisories-report-demo]
 
 permissions:
   contents: read
@@ -36,7 +39,8 @@ jobs:
           tool: cargo-deny
 
       - name: advisories
-        run: cargo deny check --hide-inclusion-graph advisories
+        # DEMO ONLY: a forced failure, to exercise the report job.
+        run: exit 1
 
   # A failing daily check is worth nothing if nobody sees it: this one failed
   # quietly for eight days. On failure, comment on the open tracking issue, or
