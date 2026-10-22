@@ -28,7 +28,6 @@ pingora = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws_lc_rs"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std"] }
-rustls-pemfile = "2"
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["server", "tokio", "service", "http1"] }
 rcgen = "0.14"

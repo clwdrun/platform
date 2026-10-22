@@ -37,3 +37,32 @@ jobs:
 
       - name: advisories
         run: cargo deny check --hide-inclusion-graph advisories
+
+  # A failing daily check is worth nothing if nobody sees it: this one failed
+  # quietly for eight days. On failure, comment on the open tracking issue, or
+  # open one. Closing the issue once `main` is fixed lets the next failure open
+  # a new one.
+  report:
+    needs: advisories
+    if: failure()
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: open or update the tracking issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          TITLE: "advisories: the daily dependency check is failing"
+        run: |
+          set -euo pipefail
+          open=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number,title \
+            --jq "map(select(.title == env.TITLE)) | .[0].number // empty")
+          if [ -n "$open" ]; then
+            gh issue comment "$open" --body "Failed again: $RUN_URL"
+          else
+            gh issue create --title "$TITLE" --body "The daily \`cargo deny check advisories\` run against \`main\` failed: $RUN_URL
+
+          Fix the lockfile or record an accepted advisory in \`deny.toml\` with an owner, then close this issue. Each later failure comments here while it is open."
+          fi

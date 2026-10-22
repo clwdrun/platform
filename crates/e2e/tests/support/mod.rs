@@ -115,12 +115,12 @@ fn certs() -> &'static Certs {
 fn rustls_config() -> Arc<rustls::ServerConfig> {
     control_plane::acme::install_crypto_provider();
     let c = certs();
-    let chain: Vec<_> = rustls_pemfile::certs(&mut c.cert_pem.as_bytes())
+    use rustls::pki_types::pem::PemObject as _;
+    use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+    let chain: Vec<_> = CertificateDer::pem_slice_iter(c.cert_pem.as_bytes())
         .collect::<Result<_, _>>()
         .expect("cert chain");
-    let key = rustls_pemfile::private_key(&mut c.key_pem.as_bytes())
-        .expect("key")
-        .expect("a key");
+    let key = PrivateKeyDer::from_pem_slice(c.key_pem.as_bytes()).expect("a key");
     Arc::new(
         rustls::ServerConfig::builder()
             .with_no_client_auth()
