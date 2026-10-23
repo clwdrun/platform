@@ -72,11 +72,45 @@ fn main() -> anyhow::Result<()> {
                 internal_secret.clone(),
             )?);
             tracing::info!(%socket, worker_uid, "serving apps through the worker");
+            // App log lines (#78): queued without waiting by each request,
+            // shipped in batches by a thread and runtime of their own.
+            let (ship, receiver) = gateway::logship::LogShip::new(gateway::logship::CHANNEL);
+            let sink = gateway::logship::Sink {
+                client: reqwest::Client::builder()
+                    .timeout(std::time::Duration::from_secs(5))
+                    .build()
+                    .context("building the log shipping client")?,
+                url: reqwest::Url::parse(&format!(
+                    "{}/internal/logs",
+                    control_plane.trim_end_matches('/')
+                ))
+                .context("CLWD_CONTROL_PLANE must be a URL")?,
+                secret: Arc::<str>::from(internal_secret.as_str()),
+            };
+            let shipping = ship.clone();
+            std::thread::Builder::new()
+                .name("log-ship".to_owned())
+                .spawn(move || {
+                    match tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                    {
+                        Ok(runtime) => {
+                            runtime.block_on(gateway::logship::ship(receiver, shipping, sink));
+                        }
+                        Err(error) => tracing::error!(
+                            %error,
+                            "no runtime for log shipping; app log lines are dropped"
+                        ),
+                    }
+                })
+                .context("starting the log shipping thread")?;
             let serving = Serving::new(
                 signin,
                 control_plane_domain.clone(),
                 Arc::new(WorkerUpstream::new(socket, worker_uid)),
-            );
+            )
+            .with_logs(ship);
             // The authorization cache's invalidation stream (#12), on a thread
             // and runtime of its own: pingora owns the others. Until it has
             // connected and been granted a lease, every request takes the

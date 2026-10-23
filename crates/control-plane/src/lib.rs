@@ -12,6 +12,7 @@ mod envelope_probe;
 pub mod handshake;
 pub mod http;
 pub mod ids;
+pub mod logs;
 pub mod openapi;
 pub mod orgs;
 pub mod pool;

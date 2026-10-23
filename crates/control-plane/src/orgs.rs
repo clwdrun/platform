@@ -1059,6 +1059,7 @@ pub(crate) fn claim_doc() -> Doc {
                       Nothing is reserved until then, and the claim expires after 72 hours. \
                       `gmail.com` and `googlemail.com` cannot be claimed.",
         params: &[],
+        query: &[],
         request: Some(Body::json::<ClaimRequest>(
             "The domain, the new org's permanent slug, and whether the domain's accounts join automatically (default off).",
             claim_request_example,
@@ -1082,6 +1083,7 @@ pub(crate) fn verify_doc() -> Doc {
                       response's `certificate` says where that stands. A domain already verified \
                       by an org is never moved.",
         params: &[("claim_id", "The claim to verify.")],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::CREATED,
@@ -1107,6 +1109,7 @@ pub(crate) fn auto_join_doc() -> Doc {
                       verified domain join the org automatically. Only the person who verified the \
                       domain may change it.",
         params: &[("org_id", "The org the domain is verified for.")],
+        query: &[],
         request: Some(Body::json::<AutoJoinRequest>(
             "The verified domain and its new setting.",
             auto_join_request_example,

@@ -605,6 +605,7 @@ pub(crate) fn logout_doc() -> Doc {
                       on every gateway (#12). `control-plane.timeout` means the revocation is \
                       committed but not yet confirmed; retry.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::NO_CONTENT,
@@ -629,6 +630,7 @@ pub(crate) fn start_doc() -> Doc {
                       PKCE verifier, and redirects the browser to Google. Takes no redirect-target \
                       parameter: the callback always lands on the control plane's own root.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::SEE_OTHER,
@@ -649,6 +651,7 @@ pub(crate) fn callback_doc() -> Doc {
                       missing or tampered flow cookie, a mismatched `state`, a refused or replayed \
                       code, a failed ID token — is the same `identity.unauthenticated`.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::SEE_OTHER,

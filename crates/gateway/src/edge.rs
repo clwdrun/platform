@@ -22,6 +22,7 @@ use shared::{Envelope, RequestId};
 
 use crate::authz::Authz;
 use crate::host::parse_host;
+use crate::logship::{LogShip, PlatformLine};
 use crate::lookup::{Route, RouteLookup};
 use crate::signin::{
     APP_SESSION_COOKIE, AppSession, COUNTER_COOKIE, COUNTER_WINDOW_SECS, MAX_HANDSHAKES,
@@ -312,9 +313,18 @@ pub struct Serving {
     authz: Arc<Authz>,
     control_plane: ControlPlaneDomain,
     upstream: Arc<dyn AppUpstream>,
+    /// Where app log lines go (#78). `None` ships nothing.
+    logs: Option<Arc<LogShip>>,
 }
 
 impl Serving {
+    /// Ship app log lines through `ship` (#78).
+    #[must_use]
+    pub fn with_logs(mut self, ship: Arc<LogShip>) -> Self {
+        self.logs = Some(ship);
+        self
+    }
+
     /// Assemble the serving side. The authorization cache starts in bypass:
     /// it serves nothing from cache until [`crate::authz::follow`] is running
     /// against [`Self::authz`] and the control plane has granted a lease.
@@ -330,6 +340,7 @@ impl Serving {
             authz,
             control_plane,
             upstream,
+            logs: None,
         }
     }
 
@@ -402,6 +413,7 @@ impl Edge {
         serving: &Serving,
         session: &mut ServerSession,
         target: AppTarget,
+        request_id: &RequestId,
     ) -> Response<Vec<u8>> {
         let head = session.req_header();
         let cookies: Vec<Vec<u8>> = head
@@ -415,13 +427,15 @@ impl Edge {
 
         if path == CALLBACK_PATH {
             let query = head.uri.query().unwrap_or("").to_owned();
-            return self.callback(serving, &target, &query, &cookies).await;
+            return self
+                .callback(serving, &target, &query, &cookies, request_id)
+                .await;
         }
         if path.starts_with(RESERVED_PREFIX) {
-            return render_disposition(Disposition::Reserved);
+            return render_disposition(Disposition::Reserved, request_id);
         }
         let Ok(forwarded_cookie) = shared::cookie::strip_platform(cookie_slices()) else {
-            return render_disposition(Disposition::DuplicateCookie);
+            return render_disposition(Disposition::DuplicateCookie, request_id);
         };
 
         if let Found::One(value) = shared::cookie::find(cookie_slices(), APP_SESSION_COOKIE) {
@@ -434,31 +448,39 @@ impl Edge {
                 // Every reason today is the interim org-member rule's; #14's
                 // reasons get their own dispositions.
                 Ok(Some(checked)) if !checked.decision.is_allow() => {
-                    return render_disposition(Disposition::NotAMember);
+                    return render_disposition(Disposition::NotAMember, request_id);
                 }
                 Ok(Some(checked)) => {
                     return self
-                        .forward(serving, session, &target, checked.caller, forwarded_cookie)
+                        .forward(
+                            serving,
+                            session,
+                            &target,
+                            checked.caller,
+                            forwarded_cookie,
+                            request_id,
+                        )
                         .await;
                 }
                 Ok(None) => {}
                 Err(error) => {
                     tracing::warn!(%error, "app session check failed; refusing");
-                    return render_disposition(Disposition::Unavailable);
+                    return render_disposition(Disposition::Unavailable, request_id);
                 }
             }
         }
 
         let head = session.req_header();
         if head.method != http::Method::GET && head.method != http::Method::HEAD {
-            return render_disposition(Disposition::SignInRequired);
+            return render_disposition(Disposition::SignInRequired, request_id);
         }
         let return_path = head
             .uri
             .path_and_query()
             .and_then(|pq| ReturnPath::parse(pq.as_str()).ok())
             .unwrap_or_else(ReturnPath::root);
-        self.begin(serving, &target, &return_path, &cookies).await
+        self.begin(serving, &target, &return_path, &cookies, request_id)
+            .await
     }
 
     /// Start a handshake: record it, set the state cookie, send the visitor to
@@ -469,6 +491,7 @@ impl Edge {
         target: &AppTarget,
         return_path: &ReturnPath,
         cookies: &[Vec<u8>],
+        request_id: &RequestId,
     ) -> Response<Vec<u8>> {
         let started = match shared::cookie::find(cookies.iter().map(Vec::as_slice), COUNTER_COOKIE)
         {
@@ -476,13 +499,13 @@ impl Edge {
             _ => 0,
         };
         if started >= MAX_HANDSHAKES {
-            return render_disposition(Disposition::SignInLoop);
+            return render_disposition(Disposition::SignInLoop, request_id);
         }
         let state = match serving.signin.begin(target.app_id(), return_path).await {
             Ok(state) => state,
             Err(error) => {
                 tracing::warn!(%error, "could not begin a sign-in handshake");
-                return render_disposition(Disposition::Unavailable);
+                return render_disposition(Disposition::Unavailable, request_id);
             }
         };
         // Wall-clock microseconds, only to tell which handshake is oldest.
@@ -491,7 +514,7 @@ impl Edge {
             .map_or(0, |d| d.as_micros());
         let Some(set_state) = begun_state_cookie(&state, begun_us) else {
             tracing::warn!("the control plane began a handshake with a malformed state");
-            return render_disposition(Disposition::Unavailable);
+            return render_disposition(Disposition::Unavailable, request_id);
         };
         let mut set_cookies = vec![
             set_state,
@@ -535,6 +558,7 @@ impl Edge {
         target: &AppTarget,
         query: &str,
         cookies: &[Vec<u8>],
+        request_id: &RequestId,
     ) -> Response<Vec<u8>> {
         let mut code = None;
         let mut state = None;
@@ -571,10 +595,10 @@ impl Edge {
                 ),
                 // Already used, expired or forged: an answer, never another
                 // redirect — a second callback for one state must not loop.
-                Ok(None) => render_disposition(Disposition::SignInFailed),
+                Ok(None) => render_disposition(Disposition::SignInFailed, request_id),
                 Err(error) => {
                     tracing::warn!(%error, "could not exchange a sign-in code");
-                    render_disposition(Disposition::Unavailable)
+                    render_disposition(Disposition::Unavailable, request_id)
                 }
             };
         }
@@ -592,7 +616,7 @@ impl Edge {
         {
             return redirect("/", Vec::new());
         }
-        self.begin(serving, target, &ReturnPath::root(), cookies)
+        self.begin(serving, target, &ReturnPath::root(), cookies, request_id)
             .await
     }
 
@@ -605,7 +629,9 @@ impl Edge {
         target: &AppTarget,
         caller: Caller,
         cookie: Option<Vec<u8>>,
+        request_id: &RequestId,
     ) -> Response<Vec<u8>> {
+        let started = std::time::Instant::now();
         let mut body = Vec::new();
         loop {
             match session.read_request_body().await {
@@ -626,7 +652,11 @@ impl Edge {
         if let Some(cookie) = cookie.and_then(|c| HeaderValue::from_bytes(&c).ok()) {
             headers.insert(header::COOKIE, cookie);
         }
+        // The app sees the id the gateway minted, never one the client sent:
+        // a client's own id could make its lines read as another request's.
+        set_request_id(&mut headers, request_id);
         let request = UpstreamRequest::new(
+            request_id.clone(),
             caller,
             head.method.clone(),
             head.uri
@@ -635,8 +665,19 @@ impl Edge {
             headers,
             Bytes::from(body),
         );
+        let record = |logs, dropped, platform| {
+            if let Some(ship) = &serving.logs {
+                ship.record(target.app_id(), request_id, logs, dropped, platform);
+            }
+        };
+        let latency = || i32::try_from(started.elapsed().as_millis()).unwrap_or(i32::MAX);
         match serving.upstream.forward(target, request).await {
             Ok(mut upstream) => {
+                record(
+                    std::mem::take(&mut upstream.logs),
+                    upstream.logs_dropped,
+                    None,
+                );
                 // Here, after the hop, never in the worker: the worker runs
                 // untrusted code and its output is filtered as such.
                 drop_platform_set_cookies(&mut upstream.headers);
@@ -648,15 +689,37 @@ impl Edge {
             }
             Err(UpstreamError::Unreachable(detail)) => {
                 tracing::warn!(%detail, "app unreachable");
-                render_disposition(Disposition::AppUnreachable)
+                let spec = spec(Disposition::AppUnreachable);
+                record(
+                    Vec::new(),
+                    0,
+                    Some(platform_line(&spec, None, request_id, latency())),
+                );
+                render_disposition(Disposition::AppUnreachable, request_id)
             }
             // The full code is for the app's author, in the log; the visitor
             // gets the gateway's answer for it. `?` escapes it: the worker's
             // output is untrusted, and a raw code could forge log lines.
-            Err(UpstreamError::Reported(code)) => {
+            Err(UpstreamError::Reported {
+                code,
+                logs,
+                logs_dropped,
+            }) => {
                 let disposition = reported(&code);
-                tracing::warn!(app = %target.app_id(), code = ?code, "the app failed");
-                render_disposition(disposition)
+                tracing::warn!(app = %target.app_id(), request_id = request_id.as_str(),
+                    code = ?code, "the app failed");
+                let spec = spec(disposition);
+                record(
+                    logs,
+                    logs_dropped,
+                    Some(platform_line(
+                        &spec,
+                        Some(known_code(&code)),
+                        request_id,
+                        latency(),
+                    )),
+                );
+                render_disposition(disposition, request_id)
             }
         }
     }
@@ -668,9 +731,68 @@ impl Edge {
     }
 }
 
-/// Render a disposition with a fresh request id, logging which answer it was.
-fn render_disposition(disposition: Disposition) -> Response<Vec<u8>> {
-    let request_id = RequestId::generate();
+/// A code the worker reported, as the platform line may carry it: the pinned
+/// catalogue's own string and hint when it knows the code, and a fixed
+/// placeholder when it does not. The worker's text never reaches a log line.
+fn known_code(reported: &str) -> (&'static str, Option<&'static str>) {
+    const WORKER: &[(&str, &str)] = &[
+        (
+            "worker.egress_not_supported",
+            "Deployed apps cannot make outbound requests yet: remove `egress` from clwd.toml and publish again.",
+        ),
+        (
+            "worker.artifact_unavailable",
+            "The platform could not load this version. This is not your app's fault, and it has been logged.",
+        ),
+    ];
+    clwd_runtime::error::OWNED_HINTS
+        .iter()
+        .chain(WORKER)
+        .find(|(known, _)| *known == reported)
+        .map_or(("worker.unknown_code", None), |(code, hint)| {
+            (*code, Some(*hint))
+        })
+}
+
+/// The gateway's line about a failed request: the visitor's code and status,
+/// the runtime's code and hint, the latency, and the request id. Nothing that
+/// names the visitor, and not the path, which can.
+fn platform_line(
+    spec: &EnvelopeSpec,
+    runtime: Option<(&'static str, Option<&'static str>)>,
+    request_id: &RequestId,
+    latency_ms: i32,
+) -> PlatformLine {
+    let status = spec.status.as_u16();
+    let text = match runtime {
+        Some((code, _)) => format!(
+            "request failed: {} ({code}), {status} in {latency_ms} ms",
+            spec.code
+        ),
+        None => format!("request failed: {}, {status} in {latency_ms} ms", spec.code),
+    };
+    PlatformLine {
+        request_id: Some(request_id.as_str().to_owned()),
+        text,
+        code: Some(spec.code.to_owned()),
+        runtime_code: runtime.map(|(code, _)| code.to_owned()),
+        hint: runtime.and_then(|(_, hint)| hint).map(str::to_owned),
+        status: i16::try_from(status).ok(),
+        latency_ms: Some(latency_ms),
+    }
+}
+
+/// Set `x-request-id` to the gateway's id, replacing any value already there.
+fn set_request_id(headers: &mut http::HeaderMap, request_id: &RequestId) {
+    if let Ok(value) = HeaderValue::from_str(request_id.as_str()) {
+        headers.insert(REQUEST_ID_HEADER, value);
+    }
+}
+
+const REQUEST_ID_HEADER: &str = "x-request-id";
+
+/// Render a disposition under the request's id, logging which answer it was.
+fn render_disposition(disposition: Disposition, request_id: &RequestId) -> Response<Vec<u8>> {
     let spec = spec(disposition);
     tracing::info!(
         code = spec.code,
@@ -678,7 +800,7 @@ fn render_disposition(disposition: Disposition) -> Response<Vec<u8>> {
         request_id = request_id.as_str(),
         "edge response"
     );
-    render(&spec, &request_id)
+    render(&spec, request_id)
 }
 
 #[async_trait]
@@ -706,10 +828,14 @@ impl ServeHttp for Edge {
             // is no version to run, so the app is not ready. Answered before
             // sign-in, so a visitor is not sent through a handshake for it.
             let Some(digest) = digest.as_deref().and_then(|d| d.parse().ok()) else {
-                return render_disposition(Disposition::NotReady);
+                return render_disposition(Disposition::NotReady, &request_id);
             };
             let target = AppTarget::new(app_id.clone(), org_id.clone(), digest);
-            return self.serve_app(serving, session, target).await;
+            let mut response = self.serve_app(serving, session, target, &request_id).await;
+            // Every answer on an app host carries the gateway's id, whatever
+            // the app set: it is the id the author searches the log for.
+            set_request_id(response.headers_mut(), &request_id);
+            return response;
         }
         let disposition = disposition(route, session.req_header().uri.path());
         let spec = spec(disposition);
@@ -730,6 +856,50 @@ impl ServeHttp for Edge {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A code the worker reports reaches the log only as the catalogue's own
+    /// string: an unknown one, or one carrying text of its own, becomes a
+    /// fixed placeholder with no hint.
+    #[test]
+    fn only_a_catalogued_code_reaches_a_platform_line() {
+        let (code, hint) = known_code("runtime.trap");
+        assert_eq!(code, "runtime.trap");
+        assert!(hint.is_some_and(|h| !h.is_empty()));
+        assert!(known_code("worker.egress_not_supported").1.is_some());
+        for forged in [
+            "runtime.trap\n[platform] deploy succeeded",
+            "gateway.ok",
+            "",
+            "runtime.trap ",
+        ] {
+            assert_eq!(
+                known_code(forged),
+                ("worker.unknown_code", None),
+                "{forged:?}"
+            );
+        }
+    }
+
+    /// The platform line names the request, never the visitor or the path.
+    #[test]
+    fn a_platform_line_carries_codes_status_and_latency_only() {
+        let id = RequestId::generate();
+        let line = platform_line(
+            &spec(Disposition::AppFailed),
+            Some(known_code("runtime.trap")),
+            &id,
+            12,
+        );
+        assert_eq!(line.request_id.as_deref(), Some(id.as_str()));
+        assert_eq!(line.code.as_deref(), Some("gateway.app_failed"));
+        assert_eq!(line.runtime_code.as_deref(), Some("runtime.trap"));
+        assert_eq!(line.status, Some(502));
+        assert_eq!(line.latency_ms, Some(12));
+        assert_eq!(
+            line.text,
+            "request failed: gateway.app_failed (runtime.trap), 502 in 12 ms"
+        );
+    }
 
     #[test]
     fn disposition_maps_every_route_and_the_no_host_case() {

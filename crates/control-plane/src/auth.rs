@@ -613,6 +613,7 @@ pub(crate) fn issue_doc() -> Doc {
             "org_id",
             "The org to issue the token in. Must be the requesting token's org.",
         )],
+        query: &[],
         request: Some(Body::json::<IssueRequest>(
             "What the token is called, what it may do, and optionally the one app it is bound to.",
             issue_request_example,
@@ -639,6 +640,7 @@ pub(crate) fn revoke_doc() -> Doc {
             "token_id",
             "The id returned when the token was issued. Must be in the requesting token's org, and bound to the same app if the requesting token is bound to one.",
         )],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::NO_CONTENT,

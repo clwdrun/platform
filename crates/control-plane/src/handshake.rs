@@ -479,6 +479,7 @@ pub(crate) fn authorize_doc() -> Doc {
                       single-use, 60-second code. The app host is taken from the handshake, never \
                       from this request: any other parameter is ignored.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::SEE_OTHER,
@@ -721,6 +722,7 @@ pub(crate) fn begin_doc() -> Doc {
         summary: "Begin an app-host sign-in handshake",
         description: "Gateway only. Records the app and the same-host path to return to, and returns the state to set on the app host and send to /authorize.",
         params: &[],
+        query: &[],
         request: Some(Body::json::<BeginRequest>(
             "The app and the return path.",
             begin_request_example,
@@ -743,6 +745,7 @@ pub(crate) fn exchange_doc() -> Doc {
         summary: "Exchange a handshake code for an app-host session",
         description: "Gateway only, server-to-server. A code works once. Every failure is identity.unauthenticated.",
         params: &[],
+        query: &[],
         request: Some(Body::json::<ExchangeRequest>(
             "The code and the state.",
             exchange_request_example,
@@ -765,6 +768,7 @@ pub(crate) fn check_doc() -> Doc {
         summary: "Check an app-host session",
         description: "Gateway only, on every app request. 200 with the visitor's identity for this app if the session is live for this app and its parent control-plane session is live; identity.unauthenticated otherwise. `decision` is the policy's allow or deny (#12); the gateway runs app code only on allow, and may cache an allow until `ttl_ms` or until the invalidation stream names one of `tags`.",
         params: &[],
+        query: &[],
         request: Some(Body::json::<CheckRequest>(
             "The session and the app requested.",
             check_request_example,

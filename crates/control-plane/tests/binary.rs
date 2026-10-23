@@ -424,7 +424,8 @@ async fn the_internal_router_is_not_on_the_public_port(pool: PgPool) {
             .replace("{app_id}", &uuid::Uuid::now_v7().to_string())
             .replace("{org_id}", &uuid::Uuid::now_v7().to_string())
             .replace("{token_id}", &uuid::Uuid::now_v7().to_string())
-            .replace("{claim_id}", &uuid::Uuid::now_v7().to_string());
+            .replace("{claim_id}", &uuid::Uuid::now_v7().to_string())
+            .replace("{host_label}", "notes");
         assert!(!path.contains('{'), "an unfilled parameter in {path}");
         let wrong = if route.access == Access::Internal {
             cp.public
@@ -1073,5 +1074,69 @@ async fn a_dead_relay_degrades_without_failing_readiness(pool: PgPool) {
         gw.allows(&session, app).await,
         Ok(true),
         "the uncached path serves"
+    );
+}
+
+/// A waiting log follow (#78) is answered as soon as the process starts
+/// stopping, not at the end of its 20 s wait: it closes like the authorization
+/// streams, and the process exits well inside the drain.
+#[sqlx::test(migrations = "../../migrations")]
+async fn sigterm_answers_waiting_log_follows(pool: PgPool) {
+    let org = control_plane::db::create_org(&pool, "acme")
+        .await
+        .expect("org")
+        .id;
+    let app = control_plane::db::create_app(&pool, org, "notes", "wasm")
+        .await
+        .expect("app")
+        .id;
+    let token = control_plane::auth::issue(
+        &pool,
+        org,
+        None,
+        "logs",
+        control_plane::token::Scopes::parse_all(&["read"]).expect("scopes"),
+    )
+    .await
+    .expect("token")
+    .secret
+    .expose()
+    .to_owned();
+
+    let (issuer, _issuer) = issuer().await;
+    let env = Env::new(&database_url(&pool), &issuer).set("CLWD_PRE_STOP_DELAY", "1s");
+    let mut cp = Cp::start(&env);
+    cp.ready().await;
+
+    let follow = tokio::spawn({
+        let url = format!("http://{}/v1/apps/{app}/logs?after=0&wait=20", cp.public);
+        async move {
+            let response = client()
+                .get(url)
+                .bearer_auth(token)
+                .send()
+                .await
+                .expect("the follow is answered");
+            (response.status().as_u16(), Instant::now())
+        }
+    });
+    // Long enough for the request to be admitted and waiting.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    cp.signal(libc::SIGTERM);
+    let signalled = Instant::now();
+    let (status, answered) = tokio::time::timeout(Duration::from_secs(5), follow)
+        .await
+        .expect("the follow was answered within 5 s of SIGTERM, not at its 20 s wait")
+        .expect("joined");
+    assert_eq!(status, 200);
+    assert!(answered - signalled < Duration::from_secs(5));
+
+    let status = cp.exit(Duration::from_secs(30)).await;
+    assert!(status.success(), "exit {status}:\n{}", cp.output());
+    assert!(
+        signalled.elapsed() < Duration::from_secs(8),
+        "took {:?} to stop",
+        signalled.elapsed()
     );
 }

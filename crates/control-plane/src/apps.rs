@@ -226,6 +226,118 @@ fn response(state: &AppState, slug: &str, app: App, created: bool) -> Result<App
     })
 }
 
+/// An app, as looking it up by its label returns it.
+#[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
+pub struct AppSummary {
+    #[schema(value_type = String, format = Uuid)]
+    pub id: AppId,
+    /// The permanent label in the app's URL.
+    pub host_label: String,
+    /// Where the app is served.
+    pub url: String,
+}
+
+struct LabelRow {
+    id: AppId,
+    host_label: String,
+    slug: String,
+    member: bool,
+}
+
+/// `GET /v1/orgs/{org_id}/apps/{host_label}`
+pub(crate) async fn get_route(
+    State(state): State<AppState>,
+    Path((org, label)): Path<(String, String)>,
+    Extension(caller): Extension<Caller>,
+    Extension(request_id): Extension<RequestId>,
+) -> Response {
+    match get(&state, &org, &label, &caller).await {
+        Ok(app) => axum::Json(app).into_response(),
+        Err(error) => render(&error, &request_id),
+    }
+}
+
+/// The live app with this label in this org, if the caller may see it. Who may
+/// is the create pattern: members of the org, or a token of it; a token bound
+/// to one app sees only that one; anyone else gets the 404 a missing app gets.
+async fn get(
+    state: &AppState,
+    org: &str,
+    label: &str,
+    caller: &Caller,
+) -> Result<AppSummary, Error> {
+    let not_found = || Error::NotFound {
+        what: format!("app {label} in org {org}"),
+    };
+    let org_id = org.parse::<OrgId>().map_err(|_| not_found())?;
+    if !valid_label(label) {
+        return Err(not_found());
+    }
+    let row = sqlx::query_as!(
+        LabelRow,
+        r#"select a.id as "id: AppId", a.host_label, o.slug,
+                  exists (select 1 from org_members m
+                           where m.org_id = o.id and m.user_id = $3) as "member!"
+             from apps a
+             join orgs o on o.id = a.org_id
+            where a.org_id = $1 and a.host_label = $2
+              and a.deleted_at is null and o.deleted_at is null"#,
+        org_id.as_uuid(),
+        label,
+        crate::logs::session_user(caller).map(|u| u.as_uuid()),
+    )
+    .fetch_optional(&state.pool)
+    .await
+    .map_err(crate::auth::unavailable)?
+    .ok_or_else(not_found)?;
+    if !crate::logs::allowed(caller, Action::View, row.id, org_id, row.member) {
+        return Err(not_found());
+    }
+    let apps = state.apps_domain.as_ref().ok_or_else(|| Error::Internal {
+        source: anyhow::anyhow!("the apps domain is not configured on this control plane"),
+    })?;
+    let slug = shared::cert::OrgSlug::parse(&row.slug).map_err(|e| Error::Internal {
+        source: anyhow::anyhow!("stored org slug {:?} does not parse: {e}", row.slug),
+    })?;
+    Ok(AppSummary {
+        url: format!("https://{}", apps.app_host(&row.host_label, &slug)),
+        id: row.id,
+        host_label: row.host_label,
+    })
+}
+
+fn summary_example() -> serde_json::Result<serde_json::Value> {
+    serde_json::to_value(AppSummary {
+        id: AppId::from(EXAMPLE_APP),
+        host_label: "notes".to_owned(),
+        url: "https://notes.acme.example-apps.net".to_owned(),
+    })
+}
+
+/// The documentation for `GET /v1/orgs/{org_id}/apps/{host_label}`.
+pub(crate) fn get_doc() -> Doc {
+    Doc {
+        operation_id: "getAppByLabel",
+        summary: "Look up an app by its host label",
+        description: "Returns the app's id and URL. The id is what the other app routes take, such as reading its logs.",
+        params: &[
+            (
+                "org_id",
+                "The app's org. The caller must be a member of it, or present a token of it; a token bound to one app finds only that app. Otherwise the answer is the same 404 as an app that does not exist.",
+            ),
+            ("host_label", "The app's permanent host label."),
+        ],
+        query: &[],
+        request: None,
+        success: vec![Success {
+            status: StatusCode::OK,
+            description: "The app.",
+            body: Some(Body::json::<AppSummary>("The app.", summary_example)),
+        }],
+        errors: &["control-plane.not_found"],
+    }
+}
+
 fn request_example() -> serde_json::Result<serde_json::Value> {
     Ok(serde_json::json!({ "host_label": "notes" }))
 }
@@ -259,6 +371,7 @@ pub(crate) fn create_doc() -> Doc {
             "org_id",
             "The org to create the app in. The caller must be a member of it, or present a token of it; otherwise the answer is the same 404 as an org that does not exist.",
         )],
+        query: &[],
         request: Some(Body::json::<CreateAppRequest>(
             "The app's permanent host label, and optionally its runtime (`wasm`, the only one available).",
             request_example,

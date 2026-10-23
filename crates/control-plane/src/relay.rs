@@ -566,6 +566,7 @@ pub(crate) fn stream_doc() -> Doc {
         summary: "Follow the authorization invalidation stream",
         description: "Gateway only. Newline-delimited JSON: a hello naming the current position, then one event per committed change to a decision input, and a heartbeat every second while the relay is healthy. A gateway serves cached decisions only while this stream is up, in sequence, and its lease is renewed; anything else sends it to the uncached check.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::OK,
@@ -582,6 +583,7 @@ pub(crate) fn ack_doc() -> Doc {
         summary: "Acknowledge the invalidation stream and renew a lease",
         description: "Gateway only. Records how far the gateway has applied the stream, and renews its 3-second lease while the relay is healthy. A revoke returns only once every gateway has applied it or let its lease lapse.",
         params: &[],
+        query: &[],
         request: Some(DocBody::json::<AckDoc>(
             "The gateway and the last position it applied.",
             ack_example,

@@ -29,7 +29,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use clwd_bundle::BundleRef;
 use http::{HeaderMap, Method, StatusCode};
-use shared::hop::Caller;
+use shared::RequestId;
+use shared::hop::{Caller, HopLogLine};
 
 /// The app a request is forwarded to, as the control plane resolved it.
 /// Built only by the gateway; there is no public constructor.
@@ -72,6 +73,9 @@ impl AppTarget {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub struct UpstreamRequest {
+    /// The id the gateway minted for this request: in the hop, in every log
+    /// line it produces, and in the visitor's response.
+    pub request_id: RequestId,
     /// Who is calling, from the gateway's session check. Never a header.
     pub caller: Caller,
     pub method: Method,
@@ -83,6 +87,7 @@ pub struct UpstreamRequest {
 
 impl UpstreamRequest {
     pub(crate) fn new(
+        request_id: RequestId,
         caller: Caller,
         method: Method,
         path_and_query: String,
@@ -90,6 +95,7 @@ impl UpstreamRequest {
         body: Bytes,
     ) -> Self {
         Self {
+            request_id,
             caller,
             method,
             path_and_query,
@@ -106,6 +112,10 @@ pub struct UpstreamResponse {
     pub status: StatusCode,
     pub headers: HeaderMap,
     pub body: Bytes,
+    /// What the app wrote while answering. Untrusted text.
+    pub logs: Vec<HopLogLine>,
+    /// Lines it wrote that are not in `logs`.
+    pub logs_dropped: u64,
 }
 
 impl UpstreamResponse {
@@ -116,6 +126,8 @@ impl UpstreamResponse {
             status,
             headers,
             body,
+            logs: Vec::new(),
+            logs_dropped: 0,
         }
     }
 }
@@ -127,11 +139,16 @@ pub enum UpstreamError {
     /// or no answer in time.
     #[error("the app could not be reached: {0}")]
     Unreachable(String),
-    /// The worker answered, reporting a failure by its code. Only the code
-    /// crosses: it is matched against the pinned catalogues and never shown to
-    /// a visitor, and no other worker text is carried at all (#11, #103).
-    #[error("the worker reported {0}")]
-    Reported(String),
+    /// The worker answered, reporting a failure by its code. The code is
+    /// matched against the pinned catalogues and never shown to a visitor
+    /// (#11, #103). The app's own lines come with it, for its owner's log
+    /// only (#78).
+    #[error("the worker reported {code}")]
+    Reported {
+        code: String,
+        logs: Vec<HopLogLine>,
+        logs_dropped: u64,
+    },
 }
 
 /// Delivers a request to the app named by an [`AppTarget`].

@@ -73,7 +73,7 @@ impl WorkerUpstream {
 
         let head = RequestHead {
             v: hop::VERSION,
-            request_id: HopRequestId::new(shared::RequestId::generate().as_str()),
+            request_id: HopRequestId::new(request.request_id.as_str()),
             app_id: AppId::new(target.app_id()),
             org_id: OrgId::new(target.org_id()),
             digest: *target.digest(),
@@ -96,7 +96,11 @@ impl WorkerUpstream {
             })?;
 
         if let Some(code) = answer.error {
-            return Err(UpstreamError::Reported(code));
+            return Err(UpstreamError::Reported {
+                code,
+                logs: answer.logs,
+                logs_dropped: answer.logs_dropped,
+            });
         }
         let status = StatusCode::from_u16(answer.status).map_err(|_| {
             UpstreamError::Unreachable(format!("the worker sent status {}", answer.status))
@@ -112,7 +116,10 @@ impl WorkerUpstream {
                 headers.append(name, value);
             }
         }
-        Ok(UpstreamResponse::new(status, headers, Bytes::from(body)))
+        let mut response = UpstreamResponse::new(status, headers, Bytes::from(body));
+        response.logs = answer.logs;
+        response.logs_dropped = answer.logs_dropped;
+        Ok(response)
     }
 }
 
@@ -166,6 +173,7 @@ mod tests {
             clwd_bundle::BundleRef::of_stream(b"x"),
         );
         let request = UpstreamRequest::new(
+            shared::RequestId::generate(),
             Caller::new(
                 AppSubject::new("s"),
                 Some("ada@example.com".into()),

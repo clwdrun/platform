@@ -16,6 +16,7 @@ path = "src/lib.rs"
 control-plane = { version = "0.1.0", path = "../control-plane" }
 gateway = { version = "0.1.0", path = "../gateway" }
 worker = { workspace = true }
+clwd-runtime = { workspace = true }
 clwd-bundle = { workspace = true }
 shared = { workspace = true }
 identity = { workspace = true }

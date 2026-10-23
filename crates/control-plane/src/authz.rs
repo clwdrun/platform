@@ -95,6 +95,8 @@ pub enum Action {
     View,
     /// Create an app in an org (#108).
     CreateApp,
+    /// Read an app's logs (#78).
+    ReadLogs,
 }
 
 /// What they want to do it to.
@@ -156,18 +158,22 @@ pub trait Authorize: Send + Sync {
     fn decide(&self, request: &Request) -> Decision;
 }
 
-/// The interim rule until #14: members of the org may view its apps and create
-/// apps in it.
+/// The interim rule until #14: members of the org may view its apps, create
+/// apps in it, and read its apps' logs.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OrgMemberRule;
 
 impl Authorize for OrgMemberRule {
     fn decide(&self, request: &Request) -> Decision {
         match request.action {
-            Action::View | Action::CreateApp if request.context.member_of_org => {
+            Action::View | Action::CreateApp | Action::ReadLogs
+                if request.context.member_of_org =>
+            {
                 Decision::allow(Reason::OrgMember)
             }
-            Action::View | Action::CreateApp => Decision::deny(Reason::NotAMember),
+            Action::View | Action::CreateApp | Action::ReadLogs => {
+                Decision::deny(Reason::NotAMember)
+            }
         }
     }
 }

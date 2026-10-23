@@ -200,6 +200,8 @@ pub(crate) struct Doc {
     pub(crate) description: &'static str,
     /// A description for each path parameter, by name.
     pub(crate) params: &'static [(&'static str, &'static str)],
+    /// A description for each query parameter, by name. All are optional.
+    pub(crate) query: &'static [(&'static str, &'static str)],
     pub(crate) request: Option<Body>,
     pub(crate) success: Vec<Success>,
     /// Error codes particular to this route. Those every route or every
@@ -480,13 +482,30 @@ pub fn document() -> Result<OpenApi, SpecError> {
                     route: route.path,
                     name: (*name).to_owned(),
                 })?;
+            // Every path parameter is an id, except an app's host label.
+            let schema = if *name == "host_label" {
+                string_schema()
+            } else {
+                uuid_schema()
+            };
             operation = operation.parameter(
                 ParameterBuilder::new()
                     .name(*name)
                     .parameter_in(ParameterIn::Path)
                     .required(Required::True)
                     .description(Some(*text))
-                    .schema(Some(uuid_schema()))
+                    .schema(Some(schema))
+                    .build(),
+            );
+        }
+        for (name, text) in doc.query {
+            operation = operation.parameter(
+                ParameterBuilder::new()
+                    .name(*name)
+                    .parameter_in(ParameterIn::Query)
+                    .required(Required::False)
+                    .description(Some(*text))
+                    .schema(Some(string_schema()))
                     .build(),
             );
         }
@@ -721,6 +740,7 @@ pub(crate) fn doc() -> Doc {
         summary: "This document",
         description: "The OpenAPI document describing every operation, the scope each needs, and every error each can return. Public, so a caller can learn how to authenticate before it holds a token.",
         params: &[],
+        query: &[],
         request: None,
         success: vec![Success {
             status: StatusCode::OK,
