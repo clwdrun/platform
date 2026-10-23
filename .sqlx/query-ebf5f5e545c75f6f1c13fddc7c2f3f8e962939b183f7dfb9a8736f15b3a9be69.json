@@ -1,0 +1,151 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select seq, ts, source, stream, request_id, text, code, runtime_code,\n                          hint, status, latency_ms\n                     from app_logs\n                    where app_id = $1\n                      and ($2::text is null or request_id = $2)\n                      and ($3::float8 is null or ts > now() - make_interval(secs => $3))\n                    order by seq desc\n                    limit $4",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "seq",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "seq"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "ts",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "ts"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "source",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "source"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "stream",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "stream"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "request_id",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "request_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "text",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "text"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "code",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "code"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "runtime_code",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "runtime_code"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "hint",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "hint"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "status",
+        "type_info": "Int2",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "status"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "latency_ms",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "app_logs",
+            "name": "latency_ms"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "ebf5f5e545c75f6f1c13fddc7c2f3f8e962939b183f7dfb9a8736f15b3a9be69"
+}

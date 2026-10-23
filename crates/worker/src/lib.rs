@@ -48,7 +48,7 @@ use clwd_runtime::wasm::{
 use clwd_runtime::{Deadline, InvokeOptions, RequestId, Sandbox, SpawnOptions};
 use futures::FutureExt as _;
 use futures::StreamExt as _;
-use shared::hop::{self, RequestHead, ResponseHead};
+use shared::hop::{self, HopLogLine, LogStream, RequestHead, ResponseHead};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Mutex;
 
@@ -216,28 +216,42 @@ impl Worker {
             }
         };
 
-        let result = self.invoke(&handle, head, body).await;
+        let (result, logs) = self.invoke(&handle, head, body).await;
         if let Err(error) = self.sandbox.stop(handle).await {
             tracing::warn!(%error, "stop failed");
         }
-        match result {
+        let (mut answer, body) = match result {
             Ok(answer) => answer,
             Err(error) => {
                 tracing::info!(app_id = %app_id, request_id = %request_id, code = error.code(),
                     error = %error, "app failed");
                 (ResponseHead::failed(error.code()), Vec::new())
             }
-        }
+        };
+        // On failure too: what the app wrote before it failed is what its
+        // author most needs to read.
+        (answer.logs, answer.logs_dropped) = logs;
+        (answer, body)
     }
 
+    /// Invoke the app, returning its answer and what it wrote, capped.
     async fn invoke(
         &self,
         handle: &clwd_runtime::Handle,
         head: RequestHead,
         body: Vec<u8>,
-    ) -> Result<(ResponseHead, Vec<u8>), clwd_runtime::Error> {
-        let request = request(&head, body)?;
-        let mut logs = self.sandbox.logs_stream(handle).await?;
+    ) -> (
+        Result<(ResponseHead, Vec<u8>), clwd_runtime::Error>,
+        (Vec<HopLogLine>, u64),
+    ) {
+        let request = match request(&head, body) {
+            Ok(request) => request,
+            Err(error) => return (Err(error), (Vec::new(), 0)),
+        };
+        let mut logs = match self.sandbox.logs_stream(handle).await {
+            Ok(logs) => logs,
+            Err(error) => return (Err(error), (Vec::new(), 0)),
+        };
         let mut opts = InvokeOptions::default();
         opts.deadline = Some(Deadline::after(INVOKE_DEADLINE));
         opts.request_id = Some(RequestId::new(head.request_id.as_str()));
@@ -246,9 +260,14 @@ impl Worker {
         let response = self.sandbox.invoke(handle, request, opts).await;
 
         // App output is attacker-controlled: structured fields only, never
-        // part of a format string. Its volume is capped per invocation by the
-        // runtime (256 KiB a stream, then one marker line).
-        while let Some(Some(Ok(line))) = logs.next().now_or_never() {
+        // part of a format string. The runtime caps it per invocation (256 KiB
+        // a stream, then one marker line); the hop carries less, see
+        // [`capped`].
+        let mut lines = Vec::new();
+        // `unconstrained`: these are lines already buffered, and tokio's
+        // cooperative budget would otherwise report `Pending` after about 128
+        // of them, ending the loop with the rest unread and uncounted.
+        while let Some(Some(Ok(line))) = tokio::task::unconstrained(logs.next()).now_or_never() {
             tracing::info!(
                 target: "app",
                 app_id = %head.app_id,
@@ -256,8 +275,18 @@ impl Worker {
                 stream = ?line.stream,
                 message = %line.message,
             );
+            let stream = match line.stream {
+                Some(clwd_runtime::LogStreamKind::Stderr) => LogStream::Stderr,
+                _ => LogStream::Stdout,
+            };
+            lines.push(HopLogLine::new(stream, line.message));
         }
+        (Self::answer(response), capped(lines))
+    }
 
+    fn answer(
+        response: Result<clwd_runtime::Response, clwd_runtime::Error>,
+    ) -> Result<(ResponseHead, Vec<u8>), clwd_runtime::Error> {
         let response = response?;
         let headers = response
             .headers()
@@ -284,6 +313,26 @@ impl Worker {
         self.grants_egress.lock().await.insert(*digest, grants);
         Ok(grants)
     }
+}
+
+/// The first lines that fit in [`hop::MAX_LOG_BYTES`], and how many did not.
+///
+/// Whole lines, in order: a line that would cross the cap is dropped rather
+/// than cut, and so is everything after it, so what arrives is a prefix of
+/// what the app wrote rather than a sample of it.
+fn capped(lines: Vec<HopLogLine>) -> (Vec<HopLogLine>, u64) {
+    let mut kept = Vec::new();
+    let mut bytes = 0usize;
+    let mut dropped = 0u64;
+    for line in lines {
+        if dropped == 0 && bytes + line.text.len() <= hop::MAX_LOG_BYTES {
+            bytes += line.text.len();
+            kept.push(line);
+        } else {
+            dropped += 1;
+        }
+    }
+    (kept, dropped)
 }
 
 /// The request as the app receives it: the client's headers as the gateway
@@ -372,6 +421,25 @@ fn unavailable() -> clwd_runtime::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A chatty app's lines are cut to a prefix that fits the hop, and the
+    /// rest are counted, never silently lost.
+    #[test]
+    fn log_lines_are_capped_to_a_prefix_and_the_rest_counted() {
+        let line = |n: usize| HopLogLine::new(LogStream::Stdout, "x".repeat(n));
+        let quarter = hop::MAX_LOG_BYTES / 4;
+        let (kept, dropped) = capped(vec![line(quarter); 10]);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(dropped, 6);
+
+        // A short line after one that did not fit is dropped too: the kept
+        // lines are a prefix, not a sample.
+        let (kept, dropped) = capped(vec![line(quarter * 3), line(quarter * 2), line(1)]);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(dropped, 2);
+
+        assert_eq!(capped(Vec::new()), (Vec::new(), 0));
+    }
     use tokio::io::AsyncReadExt as _;
 
     fn my_uid() -> u32 {

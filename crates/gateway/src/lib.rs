@@ -9,6 +9,7 @@ pub mod authz;
 pub mod cert;
 pub mod edge;
 pub mod host;
+pub mod logship;
 pub mod lookup;
 pub mod signin;
 pub mod tls;

@@ -39,12 +39,14 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-/// The protocol version this build speaks.
-pub const VERSION: u16 = 1;
+/// The protocol version this build speaks. 2 added the app's log lines to
+/// [`ResponseHead`].
+pub const VERSION: u16 = 2;
 /// The largest head, in bytes. Header values travel as JSON arrays of numbers,
-/// so this leaves room for [`MAX_HEADER_BYTES`] of raw headers several times
-/// over and nothing more.
-pub const MAX_HEAD: u32 = 512 * 1024;
+/// at most four bytes per raw byte, so [`MAX_HEADER_BYTES`] of headers is at
+/// most 256 KiB; [`MAX_LOG_BYTES`] of log text JSON-escapes to at most six
+/// bytes per raw byte, 384 KiB. Both together, with the rest of the head, fit.
+pub const MAX_HEAD: u32 = 1024 * 1024;
 /// The largest body, in bytes: the gateway's request cap and the runtime's
 /// response cap, both 16 MiB.
 pub const MAX_BODY: u64 = 16 * 1024 * 1024;
@@ -52,6 +54,11 @@ pub const MAX_BODY: u64 = 16 * 1024 * 1024;
 pub const MAX_HEADERS: usize = 128;
 /// The most header bytes, names and values together, a head may carry.
 pub const MAX_HEADER_BYTES: usize = 64 * 1024;
+/// The most log text, in bytes, one answer may carry. The runtime keeps
+/// 256 KiB a stream; the worker sends at most this much of it and counts the
+/// rest in [`ResponseHead::logs_dropped`], so a chatty app's answer still fits
+/// in [`MAX_HEAD`].
+pub const MAX_LOG_BYTES: usize = 64 * 1024;
 
 /// An app, by the id the control plane gave it.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -155,6 +162,51 @@ pub struct RequestHead {
     pub headers: Vec<Header>,
 }
 
+/// Which of the app's output streams a line came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LogStream {
+    Stdout,
+    Stderr,
+}
+
+impl LogStream {
+    /// The name stored and shown.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
+/// One line the app wrote. The text is the app's: untrusted, and possibly a
+/// visitor's data, so `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct HopLogLine {
+    pub stream: LogStream,
+    pub text: String,
+}
+
+impl HopLogLine {
+    /// A line.
+    #[must_use]
+    pub fn new(stream: LogStream, text: String) -> Self {
+        Self { stream, text }
+    }
+}
+
+impl fmt::Debug for HopLogLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HopLogLine")
+            .field("stream", &self.stream)
+            .field("text", &format_args!("<{} bytes>", self.text.len()))
+            .finish()
+    }
+}
+
 /// What the worker sends back.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -166,6 +218,12 @@ pub struct ResponseHead {
     /// the gateway's log, such as `worker.egress_not_supported`. The status is
     /// then 502 and the body empty.
     pub error: Option<String>,
+    /// What the app wrote while it ran, at most [`MAX_LOG_BYTES`] of text.
+    /// Which app wrote it is not the worker's to say: the gateway labels it
+    /// with the app it sent this request to.
+    pub logs: Vec<HopLogLine>,
+    /// Lines the app wrote that are not in `logs`.
+    pub logs_dropped: u64,
 }
 
 impl ResponseHead {
@@ -177,6 +235,8 @@ impl ResponseHead {
             status,
             headers,
             error: None,
+            logs: Vec::new(),
+            logs_dropped: 0,
         }
     }
 
@@ -188,6 +248,8 @@ impl ResponseHead {
             status: 502,
             headers: Vec::new(),
             error: Some(code.into()),
+            logs: Vec::new(),
+            logs_dropped: 0,
         }
     }
 }
@@ -196,6 +258,10 @@ impl ResponseHead {
 pub trait Head: Serialize + DeserializeOwned {
     fn version(&self) -> u16;
     fn headers(&self) -> &[Header];
+    /// The log text this head carries, in bytes.
+    fn log_bytes(&self) -> usize {
+        0
+    }
 }
 
 impl Head for RequestHead {
@@ -213,6 +279,9 @@ impl Head for ResponseHead {
     }
     fn headers(&self) -> &[Header] {
         &self.headers
+    }
+    fn log_bytes(&self) -> usize {
+        self.logs.iter().map(|line| line.text.len()).sum()
     }
 }
 
@@ -287,6 +356,7 @@ pub async fn read_frame<R: AsyncRead + Unpin, H: Head>(
         .map(|(name, value)| name.len() + value.len())
         .sum();
     check("header bytes", header_bytes as u64, MAX_HEADER_BYTES as u64)?;
+    check("log bytes", head.log_bytes() as u64, MAX_LOG_BYTES as u64)?;
 
     let body_len = reader.read_u64().await?;
     check("body", body_len, MAX_BODY)?;
@@ -439,5 +509,58 @@ mod tests {
             .await
             .expect_err("refused");
         assert!(matches!(err, HopError::Version(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn log_text_over_the_cap_is_refused() {
+        let mut head = ResponseHead::answer(200, Vec::new());
+        head.logs = vec![HopLogLine::new(
+            LogStream::Stdout,
+            "x".repeat(MAX_LOG_BYTES + 1),
+        )];
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &head, b"").await.expect("written");
+        let err = read_frame::<_, ResponseHead>(&mut wire.as_slice())
+            .await
+            .expect_err("over the cap");
+        assert!(
+            matches!(
+                err,
+                HopError::TooLarge {
+                    what: "log bytes",
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    /// The worst case still fits: every header byte and every log byte the
+    /// caps allow, each in the encoding that expands it most.
+    #[tokio::test]
+    async fn the_largest_answer_the_caps_allow_fits_in_a_head() {
+        let mut head =
+            ResponseHead::answer(200, vec![("h".into(), vec![0xff; MAX_HEADER_BYTES - 1])]);
+        head.logs = vec![HopLogLine::new(
+            LogStream::Stderr,
+            "\u{1}".repeat(MAX_LOG_BYTES),
+        )];
+        head.logs_dropped = u64::MAX;
+        let mut wire = Vec::new();
+        write_frame(&mut wire, &head, b"")
+            .await
+            .expect("fits under MAX_HEAD");
+        let (read, _) = read_frame::<_, ResponseHead>(&mut wire.as_slice())
+            .await
+            .expect("and reads back");
+        assert_eq!(read.logs, head.logs);
+    }
+
+    #[test]
+    fn a_log_lines_text_is_redacted_in_debug() {
+        let line = HopLogLine::new(LogStream::Stdout, "visitor@example.com".to_owned());
+        let shown = format!("{line:?}");
+        assert!(!shown.contains("visitor"), "{shown}");
+        assert!(shown.contains("19 bytes"), "{shown}");
     }
 }

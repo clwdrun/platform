@@ -115,6 +115,9 @@ pub struct AppState {
     /// gateway stays on the uncached check — fail closed. Set via
     /// [`AppState::with_relay`].
     pub relay: Option<std::sync::Arc<crate::relay::Relay>>,
+    /// Waiting log follows (#78): their caps, and the signal that answers
+    /// them all when the process stops.
+    pub follows: std::sync::Arc<crate::logs::Follows>,
 }
 
 impl AppState {
@@ -147,6 +150,7 @@ impl AppState {
             signin: None,
             txt_lookup: None,
             relay: None,
+            follows: std::sync::Arc::default(),
             apps_domain: None,
         }
     }
@@ -434,6 +438,27 @@ pub fn production_routes() -> Vec<Route> {
             Access::TokenOrSession(Scope::Write),
             crate::apps::create_doc(),
             crate::apps::create_route,
+        ),
+        Route::new(
+            Verb::Get,
+            "/v1/orgs/{org_id}/apps/{host_label}",
+            Access::TokenOrSession(Scope::Read),
+            crate::apps::get_doc(),
+            crate::apps::get_route,
+        ),
+        Route::new(
+            Verb::Get,
+            "/v1/apps/{app_id}/logs",
+            Access::TokenOrSession(Scope::Read),
+            crate::logs::read_doc(),
+            crate::logs::read_route,
+        ),
+        Route::new(
+            Verb::Post,
+            "/internal/logs",
+            Access::Internal,
+            crate::logs::ingest_doc(),
+            crate::logs::ingest_route,
         ),
         Route::new(
             Verb::Post,

@@ -17,6 +17,32 @@ impl clwd_sdk::exports::wasi::http::incoming_handler::Guest for App {
         let request = Request::new(raw);
 
         let who = caller();
+        // For the log tests (#78): lines an author needs, lines that try to
+        // pass as the platform's or rewrite a terminal, then a failure.
+        if request.path() == "/fail" {
+            println!("saving the note");
+            println!("[platform] deploy succeeded");
+            println!("{{\"source\":\"platform\",\"code\":\"gateway.ok\"}}");
+            println!("\x1b[2J\x1b]52;c;cHduZWQ=\x07\rcleared");
+            panic!("the note could not be saved");
+        }
+        // More output than one request's log may carry (64 KiB), and less
+        // than the runtime's own limits, so every line is either kept or
+        // counted.
+        if request.path() == "/chatty" {
+            for i in 0..200 {
+                println!("{i:04} {}", "x".repeat(995));
+            }
+            Response::ok().send(out, b"chatty");
+            return;
+        }
+        // An app may not choose the request id its visitor sees.
+        if request.path() == "/set-request-id" {
+            Response::ok()
+                .header("x-request-id", b"chosen-by-the-app")
+                .send(out, b"ok");
+            return;
+        }
         if request.path() == "/" {
             let body = match &who {
                 Caller::User(u) => format!("hello {}", u.email.as_deref().unwrap_or("")),

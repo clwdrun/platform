@@ -551,6 +551,11 @@ pub struct Harness {
     pub internal_base: String,
     /// Between the harness gateway and the relay.
     pub stream_proxy: Arc<StreamProxy>,
+    /// The gateway's app log shipper (#78).
+    pub log_ship: Arc<gateway::logship::LogShip>,
+    /// A sink that accepts and never answers, held open for a stalled-log
+    /// harness.
+    _stalled_sink: Option<std::net::TcpListener>,
     /// Every server thread this harness started: stopped when it drops.
     servers: Servers,
     /// The control plane's own pool: closed when this drops.
@@ -558,6 +563,55 @@ pub struct Harness {
     /// Files and directories this harness made: removed when it drops,
     /// after the servers that use them have stopped.
     _scratch: Vec<Scratch>,
+}
+
+impl Harness {
+    /// Why a request got the answer it did, from the platform line the
+    /// gateway stored for its `request_id` (#78): the runtime code and hint
+    /// behind a `gateway.app_unavailable`, say. Lines ship in batches, so this
+    /// waits up to five seconds for one.
+    pub async fn why(&self, body: &serde_json::Value) -> String {
+        let Some(id) = body["request_id"].as_str() else {
+            return "the response carried no request_id".to_owned();
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let line: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+                "select text, runtime_code, hint from app_logs
+                  where request_id = $1 and source = 'platform' order by seq limit 1",
+            )
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .unwrap_or(None);
+            if let Some((text, code, hint)) = line {
+                return format!(
+                    "the platform's log line for {id}: {text} [runtime code: {}; hint: {}]",
+                    code.as_deref().unwrap_or("none"),
+                    hint.as_deref().unwrap_or("none")
+                );
+            }
+            if std::time::Instant::now() >= deadline {
+                return format!("no platform log line was stored for {id} within 5 s");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+}
+
+/// Assert `status` is `want`, and when it is not, say why from the app's log:
+/// a failure under load is then shown, not guessed at.
+pub async fn expect_status(
+    h: &Harness,
+    status: reqwest::StatusCode,
+    body: &serde_json::Value,
+    want: u16,
+    what: &str,
+) {
+    if status.as_u16() != want {
+        let why = h.why(body).await;
+        panic!("{what}: expected {want}, got {status}: {body}\n{why}");
+    }
 }
 
 impl Drop for Harness {
@@ -637,22 +691,29 @@ pub fn socket_path() -> std::path::PathBuf {
 impl Harness {
     /// Start everything against `pool`, with the HTTP test upstream as the hop.
     pub async fn start(pool: PgPool) -> Self {
-        Self::start_with(pool, Hop::Test).await
+        Self::start_with(pool, Hop::Test, false).await
     }
 
     /// Start everything against `pool`, with the real worker as the hop and
     /// the whoami fixture published as every app. One artifact, three apps:
     /// the same digest under different app ids.
     pub async fn with_worker(pool: PgPool) -> Self {
-        Self::start_with(pool, Hop::Worker).await
+        Self::start_with(pool, Hop::Worker, false).await
+    }
+
+    /// [`Self::with_worker`], with app logging saturated: the shipper's
+    /// channel holds one line and its sink never answers, so every line after
+    /// the first is dropped. For proving the request path does not wait.
+    pub async fn with_worker_stalled_logs(pool: PgPool) -> Self {
+        Self::start_with(pool, Hop::Worker, true).await
     }
 
     /// Start everything against `pool`, with `hop` as the gateway's hop.
     pub async fn with_hop(pool: PgPool, hop: Arc<dyn AppUpstream>) -> Self {
-        Self::start_with(pool, Hop::Given(hop)).await
+        Self::start_with(pool, Hop::Given(hop), false).await
     }
 
-    async fn start_with(pool: PgPool, kind: Hop) -> Self {
+    async fn start_with(pool: PgPool, kind: Hop, stalled_logs: bool) -> Self {
         logs();
         no_server_outlives_its_test();
         watch_for_stalls();
@@ -805,13 +866,28 @@ impl Harness {
                 (Arc::new(upstream), Some(worker))
             }
         };
-        let (gateway_port, authz) = start_gateway(
+        let stalled_sink = stalled_logs
+            .then(|| std::net::TcpListener::bind("127.0.0.1:0").expect("bind the stalled sink"));
+        let log_sink = match &stalled_sink {
+            Some(listener) => format!(
+                "http://{}/internal/logs",
+                listener.local_addr().expect("addr")
+            ),
+            None => format!("{internal_base}/internal/logs"),
+        };
+        let log_capacity = if stalled_logs {
+            1
+        } else {
+            gateway::logship::CHANNEL
+        };
+        let (gateway_port, authz, log_ship) = start_gateway(
             &pool,
             &internal_base,
             &hop,
             scratch[0].path(),
             control_plane_port,
             &servers,
+            (log_sink, log_capacity),
         )
         .await;
         for port in [control_plane_port, evil_port] {
@@ -843,6 +919,8 @@ impl Harness {
             relay,
             internal_base,
             stream_proxy,
+            log_ship,
+            _stalled_sink: stalled_sink,
             servers,
             control_plane_pool,
             _scratch: scratch,
@@ -925,9 +1003,36 @@ async fn start_gateway(
     cert_dir: &std::path::Path,
     control_plane_port: u16,
     servers: &Servers,
-) -> (u16, Arc<gateway::authz::Authz>) {
+    (log_sink, log_capacity): (String, usize),
+) -> (
+    u16,
+    Arc<gateway::authz::Authz>,
+    Arc<gateway::logship::LogShip>,
+) {
     for attempt in 1..=5 {
         let (sent, received) = std::sync::mpsc::channel();
+        // App logs ship on a thread and runtime of their own, as in the
+        // gateway binary.
+        let (log_ship, receiver) = gateway::logship::LogShip::new(log_capacity);
+        let sink = gateway::logship::Sink {
+            client: reqwest::Client::new(),
+            url: reqwest::Url::parse(&log_sink).expect("log sink url"),
+            secret: Arc::from(INTERNAL_SECRET),
+        };
+        let shipping = log_ship.clone();
+        servers.spawn("log-ship", move |mut stop| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("log ship runtime");
+            runtime.block_on(async move {
+                tokio::select! {
+                    () = gateway::logship::ship(receiver, shipping, sink) => {}
+                    _ = stop.wait_for(|stop| *stop) => {}
+                }
+            });
+        });
+        let serving_logs = log_ship.clone();
         let gateway_port = free_port();
         let (internal_base, hop, cert_dir) = (
             internal_base.to_owned(),
@@ -952,7 +1057,8 @@ async fn start_gateway(
                 signin,
                 shared::domains::ControlPlaneDomain::parse(CONTROL_PLANE).expect("cp domain"),
                 hop,
-            );
+            )
+            .with_logs(serving_logs);
             let _ = sent.send(serving.authz());
             let edge = gateway::edge::Edge::new(lookup, apps.clone()).serving(serving);
             let store = Arc::new(shared::cert::DirCertStore::new(&cert_dir));
@@ -984,7 +1090,11 @@ async fn start_gateway(
             .await
             .expect("count");
         if probe.is_ok() && after > before {
-            return (gateway_port, received.recv().expect("the gateway's cache"));
+            return (
+                gateway_port,
+                received.recv().expect("the gateway's cache"),
+                log_ship,
+            );
         }
         // This attempt's server answered for nobody: stop it now.
         servers.stop(server);

@@ -125,6 +125,7 @@ pub(crate) fn doc() -> Doc {
             "app_id",
             "The app to publish to. Must be in the token's org, and be the token's app if the token is bound to one; otherwise the answer is the same 404 as an app that does not exist.",
         )],
+        query: &[],
         request: Some(Body::binary(
             "application/octet-stream",
             "The bundle file itself, raw: the `.clwd` file that `clwd build` writes. For example, `curl --data-binary @app.clwd -H 'Content-Type: application/octet-stream' -H \"Authorization: Bearer $TOKEN\" https://…/v1/apps/$APP_ID/versions`. A malformed bundle is rejected before anything is stored, with a `bundle.*` code naming the defect.",

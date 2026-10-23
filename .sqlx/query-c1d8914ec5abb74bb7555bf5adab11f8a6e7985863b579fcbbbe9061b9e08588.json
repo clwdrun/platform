@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "delete from app_logs\n                where (app_id, seq) in (select app_id, seq from app_logs\n                                         where ts < now() - make_interval(secs => $1)\n                                         limit $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Float8",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c1d8914ec5abb74bb7555bf5adab11f8a6e7985863b579fcbbbe9061b9e08588"
+}

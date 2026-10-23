@@ -11,8 +11,8 @@
 mod support;
 
 use support::{
-    ATTACKER_APP, CONTROL_PLANE, Chrome, EVIL, Harness, NOTES, WIKI, app_name, cookie_key, logs,
-    text, url, wait_to_leave,
+    ATTACKER_APP, CONTROL_PLANE, Chrome, EVIL, Harness, NOTES, WIKI, app_name, cookie_key,
+    expect_status, logs, text, url, wait_to_leave,
 };
 
 use std::sync::Arc;
@@ -1077,7 +1077,7 @@ async fn a_forged_identity_header_changes_nothing(pool: PgPool) {
         ("cf-connecting-ip", "6.6.6.6"),
     ];
     let (status, json) = on_notes(&h.http(), "/whoami", &real.cookie, forged).await;
-    assert_eq!(status, 200, "{json}");
+    expect_status(&h, status, &json, 200, "the app answers").await;
     assert_eq!(json["caller"]["subject"], real.subject.as_str());
     assert_eq!(json["caller"]["email"], "real@example.com");
     let headers = echoed_headers(&json);
@@ -1104,7 +1104,7 @@ async fn no_platform_cookie_reaches_the_wasm_boundary(pool: PgPool) {
         v.cookie
     );
     let (status, json) = on_notes(&h.http(), "/whoami", &cookies, &[]).await;
-    assert_eq!(status, 200, "{json}");
+    expect_status(&h, status, &json, 200, "the app answers").await;
     let cookie: String = echoed_headers(&json)
         .into_iter()
         .filter(|(n, _)| n == "cookie")
@@ -1154,7 +1154,7 @@ async fn concurrent_visitors_each_see_only_themselves(pool: PgPool) {
         support::explain_refusals(&pool).await;
     }
     for (v, (status, json)) in answers {
-        assert_eq!(status, 200, "{json}");
+        expect_status(&h, status, &json, 200, "the app answers").await;
         assert_eq!(json["caller"]["subject"], v.subject.as_str(), "{json}");
         assert_eq!(json["caller_after"], json["caller"], "{json}");
     }
@@ -1166,8 +1166,15 @@ async fn a_revoked_session_runs_nothing(pool: PgPool) {
     let h = Harness::with_worker(pool.clone()).await;
     let v = visitor(&pool, "v@example.com", true).await;
     let client = h.http();
-    let (status, _) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
-    assert_eq!(status, 200, "positive control: the session works");
+    let (status, json) = on_notes(&client, "/whoami", &v.cookie, &[]).await;
+    expect_status(
+        &h,
+        status,
+        &json,
+        200,
+        "positive control: the session works",
+    )
+    .await;
     // The API revoke path, whose bound is zero: the next request is refused
     // with no wait of the test's own. (A raw SQL revoke's 3-second bound has
     // its own test.)
@@ -1421,10 +1428,10 @@ fn hits(h: &Harness) -> u64 {
 /// Two requests as `v`; the second must be a cache hit.
 async fn warm(h: &Harness, client: &reqwest::Client, v: &Visitor, host: &str) {
     let (status, json) = on_app(client, host, "/whoami", &v.cookie, &[]).await;
-    assert_eq!(status, 200, "positive control: the session works: {json}");
+    expect_status(h, status, &json, 200, "positive control: the session works").await;
     let before = hits(h);
     let (status, json) = on_app(client, host, "/whoami", &v.cookie, &[]).await;
-    assert_eq!(status, 200, "{json}");
+    expect_status(h, status, &json, 200, "the warm request").await;
     assert_eq!(hits(h), before + 1, "the warm request was not a cache hit");
 }
 
@@ -1547,7 +1554,7 @@ async fn every_decision_input_invalidates_a_warm_cache(pool: PgPool) {
             Expect::Refused => refused(&h, &client, &v, host, table).await,
             Expect::Changed(field) => {
                 let (status, after) = on_app(&client, host, "/whoami", &v.cookie, &[]).await;
-                assert_eq!(status, 200, "{table}: {after}");
+                expect_status(&h, status, &after, 200, table).await;
                 assert_ne!(
                     after["caller"][field], before["caller"][field],
                     "{table}: the cached {field} was served after it changed"
@@ -1794,7 +1801,7 @@ async fn warm_concurrent_visitors_each_see_only_themselves(pool: PgPool) {
             support::explain_refusals(&pool).await;
         }
         for (v, (status, json)) in answers {
-            assert_eq!(status, 200, "{json}");
+            expect_status(&h, status, &json, 200, "the app answers").await;
             assert_eq!(json["caller"]["subject"], v.subject.as_str(), "{json}");
             assert_eq!(json["caller_after"], json["caller"], "{json}");
         }
@@ -1831,4 +1838,309 @@ async fn a_sql_revocation_takes_effect_within_the_lease(pool: PgPool) {
         );
     }
     eprintln!("SQLREVOKE took effect after {:?}", committed.elapsed());
+}
+
+// ------------------------------------------------------------ app logs (#78)
+
+/// A response body as JSON, for [`expect_status`]: an error's envelope, or
+/// the app's own text when it answered.
+fn body_json(text: &str) -> serde_json::Value {
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_owned()))
+}
+
+/// `N` from the platform's "N log lines dropped: ..." line.
+fn dropped_count(text: &str) -> Option<u64> {
+    let (n, rest) = text.split_once(' ')?;
+    rest.starts_with("log lines dropped")
+        .then(|| n.parse().ok())?
+}
+
+/// A `read` token of `acme`, the org `notes` is in.
+async fn log_reader(pool: &PgPool) -> String {
+    let org: uuid::Uuid = sqlx::query_scalar("select id from orgs where slug = 'acme'")
+        .fetch_one(pool)
+        .await
+        .expect("acme");
+    control_plane::auth::issue(
+        pool,
+        control_plane::ids::OrgId::from(org),
+        None,
+        "logs",
+        control_plane::token::Scopes::parse_all(&["read"]).expect("scopes"),
+    )
+    .await
+    .expect("token")
+    .secret
+    .expose()
+    .to_owned()
+}
+
+/// `notes`'s log lines for one request, once at least `want` of them are
+/// stored: lines ship in batches, a flush at most every half second.
+async fn lines_for(
+    h: &Harness,
+    token: &str,
+    app: uuid::Uuid,
+    request_id: &str,
+    want: impl Fn(&[serde_json::Value]) -> bool,
+) -> Vec<serde_json::Value> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let page: serde_json::Value = h
+            .http()
+            .get(format!(
+                "https://{}/v1/apps/{app}/logs?request_id={request_id}&limit=1000",
+                support::CONTROL_PLANE
+            ))
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("the control plane answers")
+            .json()
+            .await
+            .expect("a page");
+        let lines = page["lines"].as_array().cloned().unwrap_or_default();
+        if want(&lines) {
+            return lines;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the log never had what was expected: {lines:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// End to end: a request to an app that fails gets `gateway.app_failed` and a
+/// request id; the app's log, read by that id, has the platform's line with
+/// the runtime's real code and hint, and the app's own lines, every one of
+/// them marked as the app's whatever it claims to be.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_failed_request_is_explained_in_the_apps_log(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let visitor = visitor(&pool, "real@example.com", true).await;
+    let reader = log_reader(&pool).await;
+
+    let response = h
+        .http()
+        .get(format!("https://{NOTES}/fail"))
+        .header(reqwest::header::COOKIE, &visitor.cookie)
+        .send()
+        .await
+        .expect("the gateway answers");
+    let status = response.status();
+    let header_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("an x-request-id")
+        .to_owned();
+    let envelope: serde_json::Value = response.json().await.expect("an envelope");
+    expect_status(&h, status, &envelope, 502, "the failing app").await;
+    assert_eq!(envelope["code"], "gateway.app_failed");
+    let request_id = envelope["request_id"].as_str().expect("a request id");
+    assert_eq!(request_id, header_id, "one id, in the body and the header");
+
+    let lines = lines_for(&h, &reader, visitor.app_id, request_id, |lines| {
+        lines.iter().any(|l| l["source"] == "platform")
+    })
+    .await;
+    let platform: Vec<_> = lines.iter().filter(|l| l["source"] == "platform").collect();
+    assert_eq!(platform.len(), 1, "{lines:?}");
+    let platform = platform[0];
+    assert_eq!(platform["code"], "gateway.app_failed");
+    assert_eq!(platform["runtime_code"], "runtime.trap");
+    let trap_hint = clwd_runtime::error::OWNED_HINTS
+        .iter()
+        .find(|(code, _)| *code == "runtime.trap")
+        .map(|(_, hint)| *hint)
+        .expect("the catalogue knows runtime.trap");
+    assert_eq!(platform["hint"], trap_hint);
+    assert_eq!(platform["status"], 502);
+    assert!(platform["latency_ms"].as_i64().is_some());
+
+    let app: Vec<&str> = lines
+        .iter()
+        .filter(|l| l["source"] == "app")
+        .map(|l| l["text"].as_str().unwrap_or(""))
+        .collect();
+    for expected in [
+        "saving the note",
+        "[platform] deploy succeeded",
+        r#"{"source":"platform","code":"gateway.ok"}"#,
+        "\u{1b}[2J\u{1b}]52;c;cHduZWQ=\u{7}\rcleared",
+    ] {
+        assert!(app.contains(&expected), "{expected:?} not in {app:?}");
+    }
+    for line in &lines {
+        assert!(
+            !line.to_string().contains("real@example.com"),
+            "a visitor's email reached the log: {line}"
+        );
+    }
+}
+
+/// The visitor cannot choose the request id, and neither can the app: every
+/// answer on an app host carries the gateway's.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_request_id_is_the_gateways_alone(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let visitor = visitor(&pool, "real@example.com", true).await;
+
+    let response = h
+        .http()
+        .get(format!("https://{NOTES}/set-request-id"))
+        .header(reqwest::header::COOKIE, &visitor.cookie)
+        .header("x-request-id", "chosen-by-the-client")
+        .send()
+        .await
+        .expect("answers");
+    let status = response.status();
+    let id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("an id")
+        .to_owned();
+    let text = response.text().await.expect("body");
+    expect_status(&h, status, &body_json(&text), 200, "the app answers").await;
+    assert_ne!(id, "chosen-by-the-client");
+    assert_ne!(id, "chosen-by-the-app");
+    assert!(uuid::Uuid::parse_str(&id).is_ok(), "{id}");
+
+    // What the app itself was sent is the gateway's id too.
+    let (status, json) = on_notes(
+        &h.http(),
+        "/whoami",
+        &visitor.cookie,
+        &[("x-request-id", "chosen-by-the-client")],
+    )
+    .await;
+    expect_status(&h, status, &json, 200, "the app answers").await;
+    let sent: Vec<_> = echoed_headers(&json)
+        .into_iter()
+        .filter(|(name, _)| name == "x-request-id")
+        .collect();
+    assert_eq!(sent.len(), 1, "{sent:?}");
+    assert_ne!(sent[0].1, "chosen-by-the-client");
+}
+
+/// An app that writes far more than one request's log may carry still gets
+/// its answer to the visitor; what reached the log is a prefix under the cap,
+/// and the rest is counted in a platform line.
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_chatty_app_still_answers_and_its_overflow_is_counted(pool: PgPool) {
+    let h = Harness::with_worker(pool.clone()).await;
+    let visitor = visitor(&pool, "real@example.com", true).await;
+    let reader = log_reader(&pool).await;
+
+    let response = h
+        .http()
+        .get(format!("https://{NOTES}/chatty"))
+        .header(reqwest::header::COOKIE, &visitor.cookie)
+        .send()
+        .await
+        .expect("answers");
+    let status = response.status();
+    let id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|v| v.to_str().ok())
+        .expect("an id")
+        .to_owned();
+    let text = response.text().await.expect("body");
+    expect_status(&h, status, &body_json(&text), 200, "the chatty app").await;
+    assert_eq!(text, "chatty");
+
+    let lines = lines_for(&h, &reader, visitor.app_id, &id, |lines| !lines.is_empty()).await;
+    let kept = lines.len();
+    let bytes: usize = lines
+        .iter()
+        .map(|l| l["text"].as_str().map_or(0, str::len))
+        .sum();
+    assert!(kept > 0 && kept < 200, "{kept}");
+    assert!(bytes <= shared::hop::MAX_LOG_BYTES, "{bytes}");
+
+    // The count arrives as a platform line of its own, with no request id:
+    // every line the app wrote is either in the log or in the count.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let page: serde_json::Value = h
+            .http()
+            .get(format!(
+                "https://{}/v1/apps/{}/logs?limit=1000",
+                support::CONTROL_PLANE,
+                visitor.app_id
+            ))
+            .bearer_auth(&reader)
+            .send()
+            .await
+            .expect("answers")
+            .json()
+            .await
+            .expect("page");
+        let dropped = page["lines"].as_array().and_then(|lines| {
+            lines.iter().find_map(|l| {
+                let text = l["text"].as_str()?;
+                let n = dropped_count(text)?;
+                (l["source"] == "platform" && l["request_id"].is_null()).then_some(n)
+            })
+        });
+        if let Some(n) = dropped {
+            assert_eq!(n as usize + kept, 200, "{n} dropped, {kept} kept");
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no dropped-lines line: {page}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+}
+
+/// With logging saturated — a one-line channel and a sink that never answers —
+/// requests are answered as fast as ever and the overflow is counted. A
+/// request path that waited for room would never answer.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_request_path_never_waits_for_logging(pool: PgPool) {
+    let h = Harness::with_worker_stalled_logs(pool.clone()).await;
+    let visitor = visitor(&pool, "real@example.com", true).await;
+    let client = h.http();
+    let mut latencies = Vec::new();
+    for _ in 0..10 {
+        let started = std::time::Instant::now();
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            client
+                .get(format!("https://{NOTES}/chatty"))
+                .header(reqwest::header::COOKIE, &visitor.cookie)
+                .send(),
+        )
+        .await
+        .expect("answered while logging is saturated")
+        .expect("answers");
+        let status = response.status();
+        let text = response.text().await.expect("body");
+        expect_status(&h, status, &body_json(&text), 200, "with logging saturated").await;
+        latencies.push(started.elapsed());
+    }
+    latencies.sort();
+    let median = latencies[latencies.len() / 2];
+    eprintln!(
+        "chatty latency with logging saturated: median {median:?}, max {:?}",
+        latencies[latencies.len() - 1]
+    );
+    // Unsaturated, this route takes about a second in a debug build: the
+    // bound is for a request path that does not wait, with room for a loaded
+    // machine. One that waited for the stalled sink would never answer.
+    assert!(
+        median < std::time::Duration::from_secs(3),
+        "median {median:?} with logging saturated"
+    );
+    // Each request's lines beyond the first are dropped, and counted.
+    assert!(
+        h.log_ship.dropped_total() >= 10 * 60,
+        "{}",
+        h.log_ship.dropped_total()
+    );
 }

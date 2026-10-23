@@ -76,6 +76,7 @@ pub(crate) fn doc() -> Doc {
             ),
             ("app", "The app name — the `{app}` label."),
         ],
+        query: &[],
         request: None,
         success: vec![Success {
             status: axum::http::StatusCode::OK,

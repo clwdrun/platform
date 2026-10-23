@@ -196,6 +196,7 @@ async fn serve() -> anyhow::Result<()> {
         stopped,
         serving::DRAIN,
     ));
+    let follows = running.state.follows.clone();
     drop(running.state);
     health.pools_open(running.serving.clone(), running.probe.clone());
     let log_task = tokio::spawn(serving::log_changes(health.clone(), background_stopped));
@@ -228,6 +229,8 @@ async fn serve() -> anyhow::Result<()> {
     if let Some(relay) = &running.relay {
         relay.shut();
     }
+    // Waiting log follows answer now rather than holding the drain (#78).
+    follows.shut();
     let (public, internal) = tokio::select! {
         drained = async { tokio::join!(public_task, internal_task) } => drained,
         () = &mut second => unreachable_exit(),
@@ -399,6 +402,10 @@ async fn start(
     if let Some(relay) = &relay {
         state = state.with_relay(relay.clone());
     }
+    tokio::spawn(control_plane::logs::prune_forever(
+        serving.clone(),
+        state.follows.clone(),
+    ));
 
     Ok(Running {
         state,

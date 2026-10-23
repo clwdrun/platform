@@ -1,0 +1,36 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "select a.org_id as \"org_id: OrgId\",\n                  exists (select 1 from org_members m\n                           where m.org_id = a.org_id and m.user_id = $2) as \"member!\"\n             from apps a\n             join orgs o on o.id = a.org_id\n            where a.id = $1 and a.deleted_at is null and o.deleted_at is null",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "org_id: OrgId",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "apps",
+            "name": "org_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "member!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "daea8bb211f8a69847540e7872b6f6e30c1ee3708f9a6eca67f76f86c28b1b00"
+}
