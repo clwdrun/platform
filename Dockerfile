@@ -4,7 +4,7 @@
 # which binary comes out, so two near-identical Dockerfiles would be two places
 # to forget the same fix.
 
-ARG RUST_VERSION=1.97.1
+ARG RUST_VERSION=1.99.1
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 ARG BIN
