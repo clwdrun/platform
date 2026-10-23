@@ -141,10 +141,9 @@ mimalloc = "0.1.52"
 dashmap = "6.2.1"
 parking_lot = "0.12.1"
 
-# app-data — libsql or redb per app, plus a secret broker
-libsql = "0.9.30"
-redb = "4.2.0"
-age = "0.12.1"
+# app-data — the per-app store and secret broker. The backend is #21's to
+# choose; nothing is declared until it is, so an unused tree carries no
+# advisories into the lock.
 object_store = "0.14.1"
 
 # The public repo, via a tag-pinned git dependency — never a path dependency.
