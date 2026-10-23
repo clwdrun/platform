@@ -995,8 +995,8 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "clwd-bundle"
-version = "0.0.3"
-source = "git+https://github.com/clwdrun/clwd?tag=v0.0.3#1df7f5e69ccef7095ffdb656c26572a054854dbd"
+version = "0.0.4"
+source = "git+https://github.com/clwdrun/clwd?tag=v0.0.4#d296539c939d963148d7b57fdbe1a33970173995"
 dependencies = [
  "blake3",
  "serde",
@@ -1007,8 +1007,8 @@ dependencies = [
 
 [[package]]
 name = "clwd-runtime"
-version = "0.0.3"
-source = "git+https://github.com/clwdrun/clwd?tag=v0.0.3#1df7f5e69ccef7095ffdb656c26572a054854dbd"
+version = "0.0.4"
+source = "git+https://github.com/clwdrun/clwd?tag=v0.0.4#d296539c939d963148d7b57fdbe1a33970173995"
 dependencies = [
  "async-trait",
  "bytes",

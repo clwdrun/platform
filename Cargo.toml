@@ -174,7 +174,7 @@ object_store = "0.14.1"
 # That is what `0.1.0` did here, and it stayed hidden only because Cargo.lock
 # still pinned the tag's previous commit. When bumping the tag, run
 # `cargo update -p clwd-bundle` so any mismatch surfaces now, not in CI.
-clwd-bundle = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag = "v0.0.3" }
+clwd-bundle = { version = "0.0.4", git = "https://github.com/clwdrun/clwd", tag = "v0.0.4" }
 # The runtime, for the worker that runs app code (#11). A deliberate widening
 # of the seam: what crosses it is `Sandbox`/`WasmSandbox`, `IdentityCtx` and
 # its caller types, the store traits (`BundleStore`, `SecretStore`,
@@ -186,7 +186,7 @@ clwd-bundle = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag 
 # The gateway depends on the crate too, for its error-code tables (#103), and
 # with no backend feature that pulls no wasmtime — `just seam` asserts the
 # gateway and the control plane link none.
-clwd-runtime = { version = "0.0.3", git = "https://github.com/clwdrun/clwd", tag = "v0.0.3", default-features = false }
+clwd-runtime = { version = "0.0.4", git = "https://github.com/clwdrun/clwd", tag = "v0.0.4", default-features = false }
 
 # Debug info is most of `target/`: a full-debuginfo gate run left ~19 GB, every
 # test binary ~290 MB with 44% of it DWARF, and the CI runner ran out of disk
