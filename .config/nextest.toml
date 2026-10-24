@@ -8,3 +8,12 @@
 # letting a stuck test run on.
 [profile.default]
 slow-timeout = { period = "60s", terminate-after = 5 }
+
+# The envelope probe sends some 3,500 requests and fails if any route but its
+# deliberately slow one exceeds a 10 s budget: a measurement, so it gets the
+# machine to itself. Beside the browser tests (a full stack and Chrome each,
+# on a 4-core runner) one of its requests was once slower than that, which
+# under `cargo test` it never ran beside.
+[[profile.default.overrides]]
+filter = 'package(control-plane) & test(every_error_response_from_every_route)'
+threads-required = "num-test-threads"
