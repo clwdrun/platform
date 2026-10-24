@@ -2,10 +2,12 @@
 //!
 //! In one process, on loopback:
 //!
-//! - the control plane's **public** router over TLS at `api.clwd.test`, and its
-//!   **internal** router over plain HTTP on a port only the gateway is told;
-//! - the gateway (pingora, TLS, per-org certificates) serving
-//!   `*.clwd-apps.test`, with the **test upstream** as its app hop;
+//! - the control plane's **public** router and its **internal** router, both
+//!   over plain HTTP on loopback, as in production;
+//! - the gateway (pingora, TLS) serving `*.clwd-apps.test` with per-org
+//!   certificates and the **test upstream** as its app hop, and forwarding
+//!   `api.clwd.test` to the public router over the platform certificate (#95):
+//!   the browser reaches the control plane only through the gateway;
 //! - a mock OIDC issuer, so sign-in runs end to end in the browser;
 //! - `evil.clwd.test`, a sibling host *of the control plane*, for the negative
 //!   control: it is what an app served under the control plane's own domain —
@@ -540,7 +542,6 @@ pub struct Harness {
     /// The store's raw backend, for tampering with an artifact.
     pub operator: opendal::Operator,
     pub pool: PgPool,
-    pub control_plane_port: u16,
     pub gateway_port: u16,
     pub evil_port: u16,
     /// The gateway's authorization cache (#12).
@@ -551,6 +552,8 @@ pub struct Harness {
     pub internal_base: String,
     /// Between the harness gateway and the relay.
     pub stream_proxy: Arc<StreamProxy>,
+    /// Every path and query the control plane's internal listener was asked for.
+    pub internal_paths: Arc<Mutex<Vec<String>>>,
     /// The gateway's app log shipper (#78).
     pub log_ship: Arc<gateway::logship::LogShip>,
     /// A sink that accepts and never answers, held open for a stalled-log
@@ -800,12 +803,35 @@ impl Harness {
                 .with_signin(signin)
                 .with_internal_secret(INTERNAL_SECRET)
                 .with_apps_domain(shared::domains::AppsDomain::parse(APPS).expect("apps domain"));
-        let control_plane_port = serve_tls(control_plane::http::router(state.clone())).await;
+        // Plain HTTP, as `CLWD_PUBLIC_LISTEN` is: TLS ends at the gateway.
+        let public = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind public");
+        let control_plane_port = public.local_addr().expect("addr").port();
+        let public_router = control_plane::http::router(state.clone());
+        tokio::spawn(async move {
+            let _ = axum::serve(public, public_router).await;
+        });
         let internal = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind internal");
         let internal_port = internal.local_addr().expect("addr").port();
-        let internal_router = control_plane::http::internal_router(state);
+        // Every path the internal listener is asked for, so a test can show a
+        // request on the public host never reached it.
+        let internal_paths = Arc::new(Mutex::new(Vec::new()));
+        let recording = internal_paths.clone();
+        let internal_router =
+            control_plane::http::internal_router(state).layer(axum::middleware::from_fn(
+                move |request: axum::extract::Request, next: axum::middleware::Next| {
+                    recording.lock().expect("internal paths").push(
+                        request
+                            .uri()
+                            .path_and_query()
+                            .map_or_else(String::new, |pq| pq.as_str().to_owned()),
+                    );
+                    next.run(request)
+                },
+            ));
         tokio::spawn(async move {
             let _ = axum::serve(internal, internal_router).await;
         });
@@ -912,13 +938,13 @@ impl Harness {
             artifacts,
             operator,
             pool,
-            control_plane_port,
             gateway_port,
             evil_port,
             authz,
             relay,
             internal_base,
             stream_proxy,
+            internal_paths,
             log_ship,
             _stalled_sink: stalled_sink,
             servers,
@@ -953,7 +979,7 @@ impl Harness {
     fn resolver_rules(&self) -> String {
         format!(
             "MAP {CONTROL_PLANE} 127.0.0.1:{}, MAP {EVIL} 127.0.0.1:{}, MAP *.{APPS} 127.0.0.1:{}",
-            self.control_plane_port, self.evil_port, self.gateway_port
+            self.gateway_port, self.evil_port, self.gateway_port
         )
     }
 
@@ -976,7 +1002,7 @@ impl Harness {
             .add_root_certificate(root)
             .redirect(reqwest::redirect::Policy::none());
         for (host, port) in [
-            (CONTROL_PLANE, self.control_plane_port),
+            (CONTROL_PLANE, self.gateway_port),
             (NOTES, self.gateway_port),
             (WIKI, self.gateway_port),
             (ATTACKER_APP, self.gateway_port),
@@ -1060,9 +1086,25 @@ async fn start_gateway(
             )
             .with_logs(serving_logs);
             let _ = sent.send(serving.authz());
-            let edge = gateway::edge::Edge::new(lookup, apps.clone()).serving(serving);
+            let control_plane =
+                shared::domains::ControlPlaneDomain::parse(CONTROL_PLANE).expect("cp domain");
+            let edge = gateway::edge::Edge::new(lookup, apps.clone())
+                .serving(serving)
+                .control_plane(
+                    control_plane.clone(),
+                    gateway::control_plane::ControlPlaneHop::new(&format!(
+                        "http://127.0.0.1:{control_plane_port}"
+                    ))
+                    .expect("the control plane's public listener"),
+                );
             let store = Arc::new(shared::cert::DirCertStore::new(&cert_dir));
-            let resolver = gateway::cert::CertResolver::new(store, apps);
+            let resolver = gateway::cert::CertResolver::new(store, apps).with_platform(
+                control_plane,
+                shared::cert::StoredCert {
+                    cert_pem: certs().cert_pem.clone().into_bytes(),
+                    key_pem: certs().key_pem.clone().into_bytes(),
+                },
+            );
             let tls = TlsSettings::with_callbacks(gateway::tls::DynamicCert::callbacks(resolver))
                 .expect("tls");
             let mut server = Server::new(None).expect("pingora");
@@ -1081,7 +1123,7 @@ async fn start_gateway(
             .fetch_one(pool)
             .await
             .expect("count");
-        let probe = probe_client(gateway_port, control_plane_port)
+        let probe = probe_client(gateway_port)
             .get(format!("https://{NOTES}/__probe"))
             .send()
             .await;
@@ -1105,7 +1147,7 @@ async fn start_gateway(
     panic!("could not start a gateway on a port this harness owns");
 }
 
-fn probe_client(gateway_port: u16, control_plane_port: u16) -> reqwest::Client {
+fn probe_client(gateway_port: u16) -> reqwest::Client {
     let root = reqwest::Certificate::from_pem(certs().cert_pem.as_bytes()).expect("cert");
     reqwest::Client::builder()
         .add_root_certificate(root)
@@ -1113,7 +1155,7 @@ fn probe_client(gateway_port: u16, control_plane_port: u16) -> reqwest::Client {
         .resolve(NOTES, SocketAddr::from(([127, 0, 0, 1], gateway_port)))
         .resolve(
             CONTROL_PLANE,
-            SocketAddr::from(([127, 0, 0, 1], control_plane_port)),
+            SocketAddr::from(([127, 0, 0, 1], gateway_port)),
         )
         .build()
         .expect("client")

@@ -8,12 +8,25 @@
 //! is not `{app}.{org}.<apps domain>`, or an org with no issued certificate, fails the
 //! handshake rather than being served a wrong certificate. This is binary-edge
 //! glue, so `anyhow`; the library crates use `thiserror`.
+//!
+//! Requests for the control-plane domain are forwarded to the control plane's
+//! public listener (#95), over a platform certificate for that name.
+//!
+//! # Variables (besides those read below for the app path)
+//!
+//! | variable | required | meaning |
+//! |---|---|---|
+//! | `CLWD_CONTROL_PLANE_PUBLIC` | yes | the control plane's public listener (`CLWD_PUBLIC_LISTEN`) as a URL; never its internal or ops listener |
+//! | `CLWD_PLATFORM_CERT`, `CLWD_PLATFORM_KEY` | together, or neither | PEM certificate chain and key served for the control-plane domain (#57 issues them); without them that name fails the handshake |
+//! | `CLWD_GATEWAY_BODY_BUDGET` | no, 256 MiB | bytes of request bodies held at once, across all requests; at least 16 MiB |
 
 use std::env;
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use gateway::budget::GATEWAY_BODY_BUDGET;
 use gateway::cert::CertResolver;
+use gateway::control_plane::ControlPlaneHop;
 use gateway::edge::{Edge, Serving};
 use gateway::lookup::RouteLookup;
 use gateway::signin::SigninClient;
@@ -23,7 +36,7 @@ use pingora::apps::http_app::HttpServer;
 use pingora::listeners::tls::TlsSettings;
 use pingora::server::Server;
 use pingora::services::listening::Service;
-use shared::cert::DirCertStore;
+use shared::cert::{DirCertStore, StoredCert};
 use shared::domains::{AppsDomain, ControlPlaneDomain};
 
 fn main() -> anyhow::Result<()> {
@@ -45,18 +58,57 @@ fn main() -> anyhow::Result<()> {
         .context("CLWD_CONTROL_PLANE must be the internal control-plane base URL")?;
     let internal_secret =
         env::var("CLWD_INTERNAL_SECRET").context("CLWD_INTERNAL_SECRET must be set")?;
+    let control_plane_public = env::var("CLWD_CONTROL_PLANE_PUBLIC")
+        .context("CLWD_CONTROL_PLANE_PUBLIC must be the control plane's public listener URL")?;
+    let hop = ControlPlaneHop::new(&control_plane_public)?;
+    let platform_cert = match (
+        env::var("CLWD_PLATFORM_CERT"),
+        env::var("CLWD_PLATFORM_KEY"),
+    ) {
+        (Ok(cert), Ok(key)) => Some(StoredCert {
+            cert_pem: std::fs::read(&cert)
+                .with_context(|| format!("reading CLWD_PLATFORM_CERT ({cert})"))?,
+            key_pem: std::fs::read(&key)
+                .with_context(|| format!("reading CLWD_PLATFORM_KEY ({key})"))?,
+        }),
+        (Err(_), Err(_)) => {
+            tracing::warn!(
+                "CLWD_PLATFORM_CERT is unset; the control-plane domain fails the TLS handshake"
+            );
+            None
+        }
+        _ => anyhow::bail!("set CLWD_PLATFORM_CERT and CLWD_PLATFORM_KEY together, or neither"),
+    };
+    let body_budget = match env::var("CLWD_GATEWAY_BODY_BUDGET") {
+        Ok(raw) => {
+            let bytes: usize = raw
+                .parse()
+                .context("CLWD_GATEWAY_BODY_BUDGET must be a number of bytes")?;
+            anyhow::ensure!(
+                bytes >= shared::MAX_BUNDLE_BYTES,
+                "CLWD_GATEWAY_BODY_BUDGET must hold at least one body of {} bytes",
+                shared::MAX_BUNDLE_BYTES
+            );
+            bytes
+        }
+        Err(_) => GATEWAY_BODY_BUDGET,
+    };
+
     // One `{org}/cert.pem` + `{org}/key.pem` per org under this directory. #22's
     // secret broker replaces this file store behind the CertStore trait.
     let cert_dir = env::var("CLWD_CERT_DIR")
         .context("CLWD_CERT_DIR must name the per-org certificate directory")?;
 
-    tracing::info!(%listen, %apps, control_plane = control_plane_domain.as_str(), %cert_dir, "gateway serving");
+    tracing::info!(%listen, %apps, control_plane = control_plane_domain.as_str(), %cert_dir,
+        %control_plane_public, platform_cert = platform_cert.is_some(), body_budget, "gateway serving");
 
     let lookup = Arc::new(RouteLookup::new(
         control_plane.clone(),
         internal_secret.clone(),
     )?);
-    let mut edge = Edge::new(lookup, apps.clone());
+    let mut edge = Edge::new(lookup, apps.clone())
+        .control_plane(control_plane_domain.clone(), hop)
+        .with_body_budget(body_budget);
     // Apps are served when a worker is configured; without one a live app
     // answers `gateway.not_ready`, as before #11. The worker is a separate
     // process and user: app code never runs in this one, which holds every
@@ -142,7 +194,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let store = Arc::new(DirCertStore::new(&cert_dir));
-    let resolver = CertResolver::new(store, apps);
+    let mut resolver = CertResolver::new(store, apps);
+    if let Some(cert) = platform_cert {
+        resolver = resolver.with_platform(control_plane_domain, cert);
+    }
     let tls = TlsSettings::with_callbacks(DynamicCert::callbacks(resolver))
         .map_err(|e| anyhow::anyhow!("TLS settings: {e}"))?;
 
