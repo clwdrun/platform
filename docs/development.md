@@ -77,11 +77,16 @@ Two traps when running tests by hand rather than through `just check`:
   `DATABASE_URL` at *runtime*, and fail ("DATABASE_URL must be set") unless it
   is exported in the shell. `export DATABASE_URL=...`, don't rely on `.env`.
 - **`PEBBLE_CA` must be absolute.** The ACME tests default it to
-  `.pebble/pebble.minica.pem`, which `cargo test` resolves from the *crate*
+  `.pebble/pebble.minica.pem`, which a test resolves from the *crate*
   directory, not the workspace root — so it is not found even with Pebble up.
   `just` sets it (and `PEBBLE_DIR`, `CHALLTESTSRV`) to CI's values for every
-  recipe, so `just gate` needs nothing exported; a bare `cargo test` still
-  needs the absolute path `just pebble-up` prints.
+  recipe, so `just gate` needs nothing exported; a bare `cargo nextest run`
+  still needs the absolute path `just pebble-up` prints.
+
+Tests run under [cargo-nextest](https://nexte.st) (`cargo install cargo-nextest
+--locked`, or the version CI pins): one process per test, and a time limit on
+each (`.config/nextest.toml`), so a hung test fails the run and is named. Doc
+tests, which nextest cannot run, keep `cargo test --doc`.
 
 `sqlx` macros are compile-time checked, and `.sqlx/` is what lets CI build with no
 database at all. After changing any query or migration, run `just prepare` and

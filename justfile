@@ -7,7 +7,7 @@
 set shell := ["bash", "-uc"]
 
 # The ACME tests' servers, exactly as CI sets them. `PEBBLE_CA` must be absolute:
-# `cargo test` runs each test from its crate's directory, so the tests' relative
+# each test runs from its crate's directory, so the tests' relative
 # default is never found from the workspace root. A value already in the
 # environment wins.
 export PEBBLE_DIR := env_var_or_default("PEBBLE_DIR", "https://localhost:14000/dir")
@@ -67,13 +67,17 @@ clippy:
 
 # Needs a database: the schema tests run against a real Postgres, because a
 # CHECK constraint that is only asserted in Rust is not a constraint.
-[doc('cargo test --workspace (needs a database)')]
+# Every test under nextest, each under the time limit in .config/nextest.toml.
+# Doc tests, which nextest cannot run, keep `cargo test`, under a limit on the
+# whole step instead.
+[doc('every test, under nextest, plus the doc tests (needs a database)')]
 test:
-    cargo test --workspace
+    cargo nextest run --workspace
+    timeout 900 cargo test --workspace --doc
 
 # The envelope probe's counts, printed where a reader of the gate sees them.
 #
-# The probe already runs and asserts inside `test`, but `cargo test` hides a
+# The probe already runs and asserts inside `test`, but the runner hides a
 # passing test's output — so the count that proves every error response is an
 # envelope was asserted and invisible. That is a check reporting its colour
 # instead of its count. This runs the probe again with output shown and fails
@@ -86,7 +90,7 @@ test:
 envelope-probe:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! out=$(cargo test --workspace --lib every_error_response_from_every_route -- --nocapture 2>&1); then
+    if ! out=$(cargo nextest run --workspace --lib --no-capture every_error_response_from_every_route 2>&1); then
       printf '%s\n' "$out" | tail -60
       echo "error: the envelope probe failed"
       exit 1
@@ -109,7 +113,7 @@ envelope-probe:
 openapi-check:
     #!/usr/bin/env bash
     set -uo pipefail
-    if ! out=$(cargo test --workspace --lib openapi::tests -- --nocapture --test-threads=1 2>&1); then
+    if ! out=$(cargo nextest run --workspace --lib --no-capture openapi::tests 2>&1); then
       printf '%s\n' "$out" | tail -60
       echo "error: the OpenAPI checks failed"
       exit 1
@@ -382,12 +386,11 @@ authz-soak runs="300":
     set -uo pipefail
     dir="target/soak/$(date +%Y%m%dT%H%M%S)"
     mkdir -p "$dir"
-    cargo test -q -p control-plane --test authz --no-run
+    cargo nextest run -p control-plane --test authz --no-run
     failed=0
     for i in $(seq 1 {{runs}}); do
       out="$dir/run-$i.log"
-      if cargo test -q -p control-plane --test authz > "$out" 2>&1 \
-         && grep -q '^test result: ok' "$out"; then
+      if cargo nextest run -p control-plane --test authz --no-tests=fail > "$out" 2>&1; then
         rm "$out"
       else
         failed=$((failed + 1))
