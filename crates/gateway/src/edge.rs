@@ -7,6 +7,12 @@
 //! "not ready" rather than reaching anything. That is deliberate — no
 //! unauthenticated request ever reaches an app.
 //!
+//! A request for the control-plane domain is forwarded to the control plane's
+//! public listener instead (#95, [`crate::control_plane`]), and every request
+//! is first refused unless its TLS server name and its host match
+//! ([`misdirected`]). Request bodies, to either hop, count against one
+//! gateway-wide budget ([`crate::budget`]).
+//!
 //! The routing decision ([`disposition`]) and its rendering ([`spec`]) are
 //! separated from the pingora plumbing so both are unit-testable without a
 //! socket or a handshake.
@@ -21,6 +27,8 @@ use shared::domains::AppsDomain;
 use shared::{Envelope, RequestId};
 
 use crate::authz::Authz;
+use crate::budget::{BodyBudget, GATEWAY_BODY_BUDGET, Refused, Reservation};
+use crate::control_plane::{ControlPlaneHop, HopError as ControlPlaneHopError};
 use crate::host::parse_host;
 use crate::logship::{LogShip, PlatformLine};
 use crate::lookup::{Route, RouteLookup};
@@ -29,6 +37,7 @@ use crate::signin::{
     MAX_IN_FLIGHT, STATE_COOKIE_PREFIX, STATE_ID_LEN, SigninClient, begun_state_cookie,
     constant_time_eq, counter_cookie, parse_state_cookie_value, state_cookie, state_cookie_name,
 };
+use crate::tls::Sni;
 use crate::upstream::{
     AppTarget, AppUpstream, UpstreamError, UpstreamRequest, drop_platform_set_cookies,
     strip_client_identity, strip_hop_by_hop,
@@ -79,6 +88,14 @@ enum Disposition {
     /// Signed in, but not a member of the app's org: the interim access rule
     /// until #12. No app code runs.
     NotAMember,
+    /// The TLS server name and the `Host` name different hosts (#95).
+    Misdirected,
+    /// The request body is larger than one request may send.
+    TooLarge,
+    /// The gateway holds too many request bodies at once to take this one.
+    Busy,
+    /// The control plane did not answer a request for its domain (#95).
+    ControlPlaneUnavailable,
 }
 
 /// The path prefix the platform reserves on every app host for its own
@@ -243,6 +260,38 @@ fn spec(disposition: Disposition) -> EnvelopeSpec {
             retryable: false,
             retry_after: None,
         },
+        Disposition::Misdirected => EnvelopeSpec {
+            status: StatusCode::MISDIRECTED_REQUEST,
+            code: "gateway.misdirected_request",
+            message: "this request names a different host than the connection it was sent on",
+            hint: "open a new connection to the host in the request; the TLS server name and the Host header must match",
+            retryable: false,
+            retry_after: None,
+        },
+        Disposition::TooLarge => EnvelopeSpec {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "gateway.body_too_large",
+            message: "the request body is larger than the platform accepts",
+            hint: "send a body of at most 16 MiB",
+            retryable: false,
+            retry_after: None,
+        },
+        Disposition::Busy => EnvelopeSpec {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "gateway.busy",
+            message: "the platform is receiving too many uploads at once to take this one",
+            hint: "retry shortly",
+            retryable: true,
+            retry_after: Some("1"),
+        },
+        Disposition::ControlPlaneUnavailable => EnvelopeSpec {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "gateway.control_plane_unavailable",
+            message: "the platform's API could not be reached",
+            hint: "a platform service is unreachable; retry shortly",
+            retryable: true,
+            retry_after: None,
+        },
         Disposition::Unavailable => EnvelopeSpec {
             status: StatusCode::SERVICE_UNAVAILABLE,
             code: "gateway.unavailable",
@@ -298,10 +347,60 @@ fn requested_host(head: &pingora::http::RequestHeader) -> Option<String> {
         .map(|value| value.split(':').next().unwrap_or(value).to_owned())
 }
 
+/// Whether a request must be refused as misdirected (#95): unless the TLS
+/// server name and the requested host name the same host — case-insensitive,
+/// the port already dropped — the request is answered 421 and goes nowhere.
+/// A missing name on either side is a mismatch. Pure, so it is tested directly.
+fn misdirected(sni: Option<&str>, host: Option<&str>) -> bool {
+    !matches!((sni, host), (Some(sni), Some(host)) if sni.eq_ignore_ascii_case(host))
+}
+
 /// The callback path of the app-host sign-in handshake.
 pub const CALLBACK_PATH: &str = "/__clwd/callback";
-/// The largest request body forwarded to an app.
-const MAX_BODY: usize = 16 * 1024 * 1024;
+/// The largest request body forwarded, to an app or to the control plane: the
+/// control plane's own limit for a published bundle.
+const MAX_BODY: usize = shared::MAX_BUNDLE_BYTES;
+
+/// Read the request body whole, counting it against the gateway-wide budget.
+/// The reservation is returned with the bytes and must be held until the
+/// request is answered.
+async fn read_body(
+    session: &mut ServerSession,
+    budget: &BodyBudget,
+) -> Result<(Vec<u8>, Reservation), Disposition> {
+    let mut held = budget.reserve(MAX_BODY);
+    let mut body = Vec::new();
+    loop {
+        match session.read_request_body().await {
+            Ok(Some(chunk)) => match held.grow(chunk.len()) {
+                Ok(()) => body.extend_from_slice(&chunk),
+                Err(Refused::TooLarge) => return Err(Disposition::TooLarge),
+                Err(Refused::Busy) => {
+                    // Give the bytes back now, then read the rest without
+                    // keeping it: answered mid-upload, a client sees a broken
+                    // pipe, not the retryable answer it can act on.
+                    let seen = held.len() + chunk.len();
+                    drop((held, body));
+                    discard_rest(session, seen).await;
+                    return Err(Disposition::Busy);
+                }
+            },
+            Ok(None) => return Ok((body, held)),
+            Err(_) => return Err(Disposition::Unknown),
+        }
+    }
+}
+
+/// Read and drop the rest of a refused body, `seen` bytes in, up to the
+/// per-body cap. Past the cap the connection is left to close.
+async fn discard_rest(session: &mut ServerSession, mut seen: usize) {
+    while seen <= MAX_BODY {
+        match session.read_request_body().await {
+            Ok(Some(chunk)) => seen += chunk.len(),
+            Ok(None) | Err(_) => return,
+        }
+    }
+}
 
 /// What the edge needs to serve an app: the sign-in client, where the control
 /// plane is, and the hop to the app. Absent in production until #11 provides
@@ -356,6 +455,10 @@ pub struct Edge {
     lookup: Arc<RouteLookup>,
     apps: AppsDomain,
     serving: Option<Serving>,
+    /// The control-plane domain and the hop to its public listener (#95).
+    control_plane: Option<(ControlPlaneDomain, ControlPlaneHop)>,
+    /// Request bodies held at once, across every request (#95).
+    budget: BodyBudget,
 }
 
 /// A response the edge builds itself: a status, its headers, a body.
@@ -394,6 +497,81 @@ impl Edge {
             lookup,
             apps,
             serving: None,
+            control_plane: None,
+            budget: BodyBudget::new(GATEWAY_BODY_BUDGET, MAX_BODY),
+        }
+    }
+
+    /// Forward requests for `domain` to the control plane through `hop` (#95).
+    #[must_use]
+    pub fn control_plane(mut self, domain: ControlPlaneDomain, hop: ControlPlaneHop) -> Self {
+        self.control_plane = Some((domain, hop));
+        self
+    }
+
+    /// Count request bodies against `bytes` in all, instead of
+    /// [`GATEWAY_BODY_BUDGET`].
+    ///
+    /// # Panics
+    ///
+    /// If `bytes` cannot hold one body of the largest size accepted.
+    #[must_use]
+    pub fn with_body_budget(mut self, bytes: usize) -> Self {
+        self.budget = BodyBudget::new(bytes, MAX_BODY);
+        self
+    }
+
+    /// A request for the control-plane domain: forwarded to its public
+    /// listener with its cookies untouched, under the gateway's request id.
+    async fn serve_control_plane(
+        &self,
+        hop: &ControlPlaneHop,
+        session: &mut ServerSession,
+        request_id: &RequestId,
+    ) -> Response<Vec<u8>> {
+        let (body, _held) = match read_body(session, &self.budget).await {
+            Ok(read) => read,
+            Err(Disposition::Unknown) => {
+                return answer(StatusCode::BAD_REQUEST, Vec::new(), Vec::new());
+            }
+            Err(refused) => return render_disposition(refused, request_id),
+        };
+        let head = session.req_header();
+        let path_and_query = head
+            .uri
+            .path_and_query()
+            .map_or("/", |pq| pq.as_str())
+            .to_owned();
+        match hop
+            .forward(
+                head.method.clone(),
+                &path_and_query,
+                &head.headers,
+                Bytes::from(body),
+                request_id,
+            )
+            .await
+        {
+            Ok(answer) => {
+                tracing::info!(
+                    status = answer.status.as_u16(),
+                    request_id = request_id.as_str(),
+                    "control-plane request"
+                );
+                let mut response = Response::new(answer.body);
+                *response.status_mut() = answer.status;
+                *response.headers_mut() = answer.headers;
+                set_request_id(response.headers_mut(), request_id);
+                response
+            }
+            Err(ControlPlaneHopError::Unreachable(detail)) => {
+                tracing::warn!(%detail, request_id = request_id.as_str(), "control plane unreachable");
+                render_disposition(Disposition::ControlPlaneUnavailable, request_id)
+            }
+            Err(error @ ControlPlaneHopError::TooLarge) => {
+                tracing::error!(%error, request_id = request_id.as_str(), "control plane answer refused");
+                render_disposition(Disposition::PlatformFailed, request_id)
+            }
         }
     }
 
@@ -632,19 +810,14 @@ impl Edge {
         request_id: &RequestId,
     ) -> Response<Vec<u8>> {
         let started = std::time::Instant::now();
-        let mut body = Vec::new();
-        loop {
-            match session.read_request_body().await {
-                Ok(Some(chunk)) => {
-                    if body.len() + chunk.len() > MAX_BODY {
-                        return answer(StatusCode::PAYLOAD_TOO_LARGE, Vec::new(), Vec::new());
-                    }
-                    body.extend_from_slice(&chunk);
-                }
-                Ok(None) => break,
-                Err(_) => return answer(StatusCode::BAD_REQUEST, Vec::new(), Vec::new()),
+        // Held until the app has answered: the body is in memory until then.
+        let (body, _held) = match read_body(session, &self.budget).await {
+            Ok(read) => read,
+            Err(Disposition::Unknown) => {
+                return answer(StatusCode::BAD_REQUEST, Vec::new(), Vec::new());
             }
-        }
+            Err(refused) => return render_disposition(refused, request_id),
+        };
         let head = session.req_header();
         let mut headers = head.headers.clone();
         strip_client_identity(&mut headers);
@@ -807,8 +980,20 @@ fn render_disposition(disposition: Disposition, request_id: &RequestId) -> Respo
 impl ServeHttp for Edge {
     async fn response(&self, session: &mut ServerSession) -> Response<Vec<u8>> {
         let request_id = RequestId::generate();
+        let host = requested_host(session.req_header());
 
-        let route = match requested_host(session.req_header()) {
+        // Before anything else: a request on a connection opened for another
+        // host goes nowhere, for app hosts and the control plane alike.
+        if misdirected(Sni::of(session), host.as_deref()) {
+            return render_disposition(Disposition::Misdirected, &request_id);
+        }
+        if let (Some((domain, hop)), Some(host)) = (&self.control_plane, &host)
+            && host.eq_ignore_ascii_case(domain.as_str())
+        {
+            return self.serve_control_plane(hop, session, &request_id).await;
+        }
+
+        let route = match host {
             Some(host) => self.route(&host).await,
             None => None,
         };
@@ -951,6 +1136,47 @@ mod tests {
             );
         }
         assert_eq!(spec(Disposition::Reserved).code, "gateway.reserved_path");
+    }
+
+    /// Mutation: `misdirected` returning `false` turns this red.
+    #[test]
+    fn a_request_is_misdirected_unless_sni_and_host_name_the_same_host() {
+        let app = "notes.acme.clwd-apps.test";
+        let cp = "api.clwd.test";
+        assert!(!misdirected(Some(app), Some(app)));
+        assert!(
+            !misdirected(Some(cp), Some("API.Clwd.Test")),
+            "case-insensitive"
+        );
+        for (sni, host) in [
+            (Some(app), Some(cp)),
+            (Some(cp), Some(app)),
+            (Some(app), Some("wiki.acme.clwd-apps.test")),
+            (None, Some(cp)),
+            (Some(cp), None),
+            (None, None),
+        ] {
+            assert!(misdirected(sni, host), "{sni:?} / {host:?}");
+        }
+        let s = spec(Disposition::Misdirected);
+        assert_eq!(s.status, StatusCode::MISDIRECTED_REQUEST);
+        assert_eq!(s.code, "gateway.misdirected_request");
+        assert!(!s.retryable);
+    }
+
+    #[test]
+    fn busy_is_retryable_with_a_retry_after_and_too_large_is_not() {
+        let busy = spec(Disposition::Busy);
+        assert_eq!(busy.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(busy.code, "gateway.busy");
+        assert!(busy.retryable);
+        assert_eq!(busy.retry_after, Some("1"));
+        let large = spec(Disposition::TooLarge);
+        assert_eq!(large.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(!large.retryable);
+        let cp = spec(Disposition::ControlPlaneUnavailable);
+        assert_eq!(cp.code, "gateway.control_plane_unavailable");
+        assert!(cp.retryable);
     }
 
     #[test]

@@ -16,8 +16,8 @@ Three listeners, plain HTTP, each on its own address:
 | ops (`CLWD_OPS_LISTEN`) | `GET /livez`, `GET /readyz` | loopback or private only |
 
 - **TLS terminates at the gateway.** The control plane never holds a
-  certificate. The gateway forwards the apex and `api` hosts to the public
-  listener (#95, which needs #57's platform certificate).
+  certificate. The gateway forwards the control-plane domain to the public
+  listener (#95, decision 0006), over the platform certificate #57 issues.
 - **The internal router is never mounted on the public listener**, by
   construction: both are built from the one route table, filtered by
   `Listener`, and a binary test requests every internal path on the public
@@ -230,6 +230,8 @@ logged none).
 
 ## What #84 inherits
 
+- The gateway's `CLWD_CONTROL_PLANE_PUBLIC`, `CLWD_PLATFORM_CERT` and
+  `CLWD_PLATFORM_KEY` (0006).
 - Three addresses to assign: public (reached by the gateway, #95), internal
   (reached by the gateways only), ops (reached by the orchestrator only), all
   three on private addresses, never `0.0.0.0`.

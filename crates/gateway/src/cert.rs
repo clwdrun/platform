@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use shared::cert::{CertStore, StoredCert};
-use shared::domains::AppsDomain;
+use shared::domains::{AppsDomain, ControlPlaneDomain};
 
 use crate::host::parse_host;
 
@@ -63,6 +63,8 @@ impl HandshakeMetrics {
 pub struct CertResolver {
     store: Arc<dyn CertStore>,
     apps: AppsDomain,
+    /// The control-plane domain and its certificate (#95), when configured.
+    platform: Option<(ControlPlaneDomain, StoredCert)>,
     metrics: Arc<HandshakeMetrics>,
 }
 
@@ -73,8 +75,18 @@ impl CertResolver {
         Self {
             store,
             apps,
+            platform: None,
             metrics: Arc::new(HandshakeMetrics::default()),
         }
+    }
+
+    /// Also serve `cert` for the control-plane domain, which the gateway
+    /// forwards to the control plane (#95). Without it, that SNI fails the
+    /// handshake like any other host that is not an app's.
+    #[must_use]
+    pub fn with_platform(mut self, domain: ControlPlaneDomain, cert: StoredCert) -> Self {
+        self.platform = Some((domain, cert));
+        self
     }
 
     /// The shared metrics, for export and for asserting a miss was counted.
@@ -91,6 +103,13 @@ impl CertResolver {
             tracing::warn!("TLS handshake with no SNI; no per-org certificate applies");
             return Selection::NotAppHost;
         };
+
+        if let Some((domain, cert)) = &self.platform
+            && sni.eq_ignore_ascii_case(domain.as_str())
+        {
+            self.metrics.served.fetch_add(1, Ordering::Relaxed);
+            return Selection::Serve(cert.clone());
+        }
 
         let org = match parse_host(sni, self.apps.as_str()) {
             Ok(app_host) => app_host.org,
@@ -212,6 +231,39 @@ mod tests {
         ));
         assert!(matches!(r.select(None).await, Selection::NotAppHost));
         assert_eq!(HandshakeMetrics::get(&r.metrics().not_app_host), 2);
+    }
+
+    /// The control-plane domain gets the platform certificate, in any case,
+    /// and only that exact name: a sibling or a suffix of it does not.
+    #[tokio::test]
+    async fn the_control_plane_domain_is_served_the_platform_certificate() {
+        let platform = StoredCert {
+            cert_pem: b"platform".to_vec(),
+            key_pem: b"platform-key".to_vec(),
+        };
+        let r = resolver(false, &["acme"]).with_platform(
+            ControlPlaneDomain::parse("api.clwd.test").expect("domain"),
+            platform,
+        );
+        for sni in ["api.clwd.test", "API.clwd.TEST"] {
+            match r.select(Some(sni)).await {
+                Selection::Serve(cert) => assert_eq!(cert.cert_pem, b"platform", "{sni}"),
+                other => panic!("{sni}: {other:?}"),
+            }
+        }
+        for sni in ["evil.clwd.test", "xapi.clwd.test", "api.clwd.test.evil"] {
+            assert!(
+                matches!(r.select(Some(sni)).await, Selection::NotAppHost),
+                "{sni}"
+            );
+        }
+        // Unconfigured, the control-plane domain is just another non-app host.
+        assert!(matches!(
+            resolver(false, &["acme"])
+                .select(Some("api.clwd.test"))
+                .await,
+            Selection::NotAppHost
+        ));
     }
 
     #[tokio::test]

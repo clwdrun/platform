@@ -138,6 +138,7 @@ fn sni_selects_each_orgs_own_certificate_and_a_missing_cert_fails_the_handshake(
         .env("CLWD_APPS_DOMAIN", APEX)
         .env("CLWD_CONTROL_PLANE_DOMAIN", "api.clwd.test")
         .env("CLWD_CONTROL_PLANE", "http://127.0.0.1:1") // unreachable; HTTP body is a gateway envelope regardless
+        .env("CLWD_CONTROL_PLANE_PUBLIC", "http://127.0.0.1:1")
         .env("CLWD_INTERNAL_SECRET", "unused")
         .env("CLWD_CERT_DIR", &dir)
         .stdout(Stdio::null())

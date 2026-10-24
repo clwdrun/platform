@@ -6,7 +6,9 @@
 //! listener.
 
 pub mod authz;
+pub mod budget;
 pub mod cert;
+pub mod control_plane;
 pub mod edge;
 pub mod host;
 pub mod logship;

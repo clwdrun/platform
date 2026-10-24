@@ -2144,3 +2144,49 @@ async fn the_request_path_never_waits_for_logging(pool: PgPool) {
         h.log_ship.dropped_total()
     );
 }
+
+/// #95: the control plane is reached through the gateway, and only its public
+/// router: the OpenAPI document comes back under the gateway's request id,
+/// and an internal path asked for on the public host gets the public router's
+/// 404 without the internal listener ever seeing it. Sign-in through the
+/// gateway is every sign-in test above: the browser has no other route.
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_control_plane_is_served_through_the_gateway_and_only_its_public_router(pool: PgPool) {
+    let h = Harness::start(pool).await;
+    let http = h.http();
+
+    let spec = http
+        .get(format!("https://{CONTROL_PLANE}/openapi.json"))
+        .send()
+        .await
+        .expect("the OpenAPI document, through the gateway");
+    assert_eq!(spec.status(), 200);
+    assert!(
+        spec.headers().contains_key("x-request-id"),
+        "the request id the gateway minted is echoed"
+    );
+    let document: serde_json::Value = spec.json().await.expect("JSON");
+    assert!(document["openapi"].is_string(), "{document}");
+
+    for path in [
+        "/internal/logs",
+        "/internal/authz/stream",
+        "/internal/signin/check",
+    ] {
+        let probe = format!("{path}?e2e-95-probe");
+        let response = http
+            .get(format!("https://{CONTROL_PLANE}{probe}"))
+            .send()
+            .await
+            .expect("an answer");
+        assert_eq!(response.status(), 404, "{path} on the public host");
+        assert!(
+            !h.internal_paths
+                .lock()
+                .expect("internal paths")
+                .iter()
+                .any(|seen| seen.ends_with("e2e-95-probe")),
+            "{path} reached the internal listener"
+        );
+    }
+}

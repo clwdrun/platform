@@ -18,6 +18,9 @@
 //! warn log (done inside [`CertResolver::select`]). A cleaner client-facing
 //! alert waits on pingora exposing a return path (or the rustls backend).
 
+use std::any::Any;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use pingora::listeners::{TlsAccept, TlsAcceptCallbacks};
 use pingora::tls::error::ErrorStack;
@@ -29,6 +32,26 @@ use pingora::tls::x509::X509;
 use shared::cert::StoredCert;
 
 use crate::cert::{CertResolver, Selection};
+
+/// The SNI a connection's handshake named, kept with the connection so each
+/// request on it can be checked against its `Host` (#95). Read back from the
+/// session's TLS digest with [`Sni::of`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Sni(pub String);
+
+impl Sni {
+    /// The SNI recorded for `session`'s connection, if it was TLS and named one.
+    #[must_use]
+    pub fn of(session: &pingora::protocols::http::ServerSession) -> Option<&str> {
+        session
+            .digest()?
+            .ssl_digest
+            .as_ref()?
+            .extension
+            .get::<Self>()
+            .map(|sni| sni.0.as_str())
+    }
+}
 
 /// A pingora `TlsAccept` callback that serves each org its own certificate.
 pub struct DynamicCert {
@@ -64,6 +87,16 @@ impl TlsAccept for DynamicCert {
         // Every non-serve outcome leaves no certificate set, which fails the
         // handshake. `select` has already counted and logged which outcome it
         // was (NotAppHost / NoCert / Unavailable).
+    }
+
+    /// Keep the SNI with the connection. A handshake only completes when a
+    /// certificate was chosen for an SNI, so every request has one to check.
+    async fn handshake_complete_callback(
+        &self,
+        ssl: &SslRef,
+    ) -> Option<Arc<dyn Any + Send + Sync>> {
+        ssl.servername(NameType::HOST_NAME)
+            .map(|sni| Arc::new(Sni(sni.to_owned())) as Arc<dyn Any + Send + Sync>)
     }
 }
 
