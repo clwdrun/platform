@@ -427,6 +427,14 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
     .expect("backdate the renewal window");
 
     let report = control_plane::reconcile::reconcile_once(&pool, &issuer).await;
+    // A failed renewal says why: the reconciler records the error on the row.
+    // Unchecked SQL so the diagnostic needs no `.sqlx` entry of its own.
+    let why: Option<String> =
+        sqlx::query_scalar("select last_renewal_error from certificates where org_id = $1")
+            .bind(org.id.as_uuid())
+            .fetch_one(&pool)
+            .await
+            .unwrap_or_else(|e| Some(format!("(could not read it: {e})")));
     assert_eq!(
         report,
         control_plane::reconcile::ReconcileReport {
@@ -436,7 +444,7 @@ async fn the_reconciler_renews_a_due_certificate(pool: PgPool) {
             released: 0,
             claim_failed: false,
         },
-        "one due row claimed and renewed, reported as counts"
+        "one due row claimed and renewed, reported as counts; last_renewal_error: {why:?}"
     );
 
     let renewed = cert_store
