@@ -31,9 +31,19 @@ const DB_PASSWORD_MARKER: &str = "binary-test-never-printed";
 // ------------------------------------------------------------- harness ----
 
 fn free_addr() -> SocketAddr {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|l| l.local_addr())
-        .expect("a free port")
+    let [addr] = free_addrs();
+    addr
+}
+
+/// `N` free loopback addresses, all different: every listener is held until
+/// all are read. Bound and released one at a time, the kernel could hand the
+/// same port out twice, and the control plane refuses a configuration whose
+/// listeners share one.
+fn free_addrs<const N: usize>() -> [SocketAddr; N] {
+    let held: Vec<std::net::TcpListener> = (0..N)
+        .map(|_| std::net::TcpListener::bind("127.0.0.1:0").expect("a free port"))
+        .collect();
+    std::array::from_fn(|i| held[i].local_addr().expect("its address"))
 }
 
 fn database_url(pool: &PgPool) -> String {
@@ -62,7 +72,7 @@ struct Env {
 
 impl Env {
     fn new(database_url: &str, issuer: &str) -> Self {
-        let (public, internal, ops) = (free_addr(), free_addr(), free_addr());
+        let [public, internal, ops] = free_addrs();
         let vars = [
             ("DATABASE_URL", database_url.to_owned()),
             ("CLWD_PUBLIC_LISTEN", public.to_string()),
