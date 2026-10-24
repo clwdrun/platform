@@ -160,10 +160,13 @@ jobs:
           fi
           echo "ok: every dependency fetched, including the private seam"
 
-      - name: Install just and cargo-deny
+      # cargo-nextest runs every test (`just test`): each under the time limit
+      # in .config/nextest.toml, named when it hangs. Pinned, and checked by
+      # the action against the release's own checksum.
+      - name: Install just, cargo-deny and cargo-nextest
         uses: taiki-e/install-action@742a3317eac7bd62f91cd888b4eead5e784ba833 # v2.87.1
         with:
-          tool: just,cargo-deny
+          tool: just,cargo-deny,cargo-nextest@0.9.143
 
       # sqlx-cli has no prebuilt release, so it is built once and cached on its
       # version. `--locked` so a transitive bump cannot change what the gate

@@ -1,0 +1,10 @@
+# Every test runs under nextest (`just test`, and CI through `just gate`), and
+# every test has a time limit: one that runs past it is killed, the run fails,
+# and the report names it. A hang costs five minutes, not CI's job limit.
+#
+# The slowest tests take about 70 s on a developer machine under the suite's
+# own load (the sign-in tests in `control-plane::signin`, then the browser
+# tests at about 45 s); 300 s leaves room for a slower CI runner without
+# letting a stuck test run on.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }

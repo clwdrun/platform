@@ -716,6 +716,11 @@ impl Harness {
     async fn start_with(pool: PgPool, kind: Hop, stalled_logs: bool) -> Self {
         logs();
         no_server_outlives_its_test();
+        let database: String = sqlx::query_scalar("select current_database()")
+            .fetch_one(&pool)
+            .await
+            .expect("the test database's name");
+        OWN_DATABASES.lock().expect("own databases").push(database);
         watch_for_stalls();
         control_plane::acme::install_crypto_provider();
 
@@ -1569,11 +1574,21 @@ async fn control_plane_pool(test_pool: &PgPool) -> PgPool {
     pool
 }
 
-/// After the suite: no connection to any test database is left open. Polls
-/// for up to ten seconds, since a closed connection's backend takes a moment
-/// to exit. `None` when there is no database to ask.
+/// The test databases this process's harnesses ran against. The exit check
+/// looks at these alone: other test processes (nextest runs one per test)
+/// hold connections to their own databases at the same moment, and those are
+/// theirs to account for.
+static OWN_DATABASES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+/// After the suite: no connection to a test database this process used is
+/// left open. Polls for up to ten seconds, since a closed connection's backend
+/// takes a moment to exit. `None` when there is no database to ask.
 fn connections_left_to_test_databases() -> Option<Vec<String>> {
     let url = std::env::var("DATABASE_URL").ok()?;
+    let own = OWN_DATABASES.lock().ok()?.clone();
+    if own.is_empty() {
+        return Some(Vec::new());
+    }
     std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -1586,8 +1601,9 @@ fn connections_left_to_test_databases() -> Option<Vec<String>> {
             loop {
                 let left: Vec<String> = sqlx::query_scalar(
                     "select datname::text from pg_stat_activity
-                      where datname like '\\_sqlx\\_test%' and pid <> pg_backend_pid()",
+                      where datname = any($1) and pid <> pg_backend_pid()",
                 )
+                .bind(&own)
                 .fetch_all(&mut connection)
                 .await
                 .ok()?;
